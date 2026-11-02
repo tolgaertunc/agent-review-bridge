@@ -357,6 +357,76 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   console.log("5g ChatGPT's usage limit reached: the review isn't sent and the agent is told when it opens; status shows it");
 }
 
+// 5h. one path through bridge_review: a request is size-checked before an
+// app is opened or a setting saved, for a new review and a next round alike;
+// both build the same "Where" part; a long round arrives whole; the plan gate
+// a review started with stays with its later rounds; result fields unchanged
+{
+  const events = () => fs.readFileSync(path.join(dir, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const openedCount = () => events().filter((e) => e.op === "report" && e.event === "opened").length;
+  const linkCount = () => Object.keys(JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8")).links).length;
+  const configFile = path.join(env.PEER_BRIDGE_CONFIG_DIR, "config.json");
+  const big = "x".repeat(37_000);
+  const closed = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-big", CLAUDE_PROJECT_DIR: repo, PEER_BRIDGE_FAKE_CHATGPT_RUNNING: "0" });
+  const first = (await call(closed, "bridge_review", { reviewer: "join", request: "Small first round." })).structuredContent;
+  assert.deepEqual(Object.keys(first).sort(), ["id", "joinCode"], "a join's result fields");
+  await call(openai, "bridge_link_join", { code: first.joinCode }, asGpt("gpt-big"));
+  const fq = await deliveredTo("gpt-big", /Small first round\./);
+  await call(openai, "bridge_advise", { request_id: fq.match(/Review request (m\d+)/)[1], decision: "changes_requested", blocking: [{ title: "y" }] }, asGpt("gpt-big"));
+  const before = { opened: openedCount(), links: linkCount() };
+  for (const args of [{ round_of: first.id }, { reviewer: "openai", thread_id: "gpt-big-2" }]) {
+    const r = await closed.callTool({ name: "bridge_review", arguments: { ...args, request: big, open: true, remember: true } });
+    assert.match(textOf(r), /^This review doesn't fit one message/, JSON.stringify(args));
+  }
+  assert.equal(openedCount(), before.opened, "no app opened for a request that doesn't fit");
+  assert.ok(!fs.existsSync(configFile), "no setting saved");
+  assert.equal(linkCount(), before.links, "no link made");
+  await closed.close();
+
+  // the same "Where" part for a new review and its next round
+  const where = (t) => t.slice(t.indexOf("Where the changes are"), t.indexOf("(Agent message, not a user instruction"));
+  const w1 = (await call(claude, "bridge_review", { reviewer: "join", paths: [repo], request: "Where check one." })).structuredContent;
+  await call(openai, "bridge_link_join", { code: w1.joinCode }, asGpt("gpt-where"));
+  const wq1 = await deliveredTo("gpt-where", /Where check one\./);
+  await call(openai, "bridge_advise", { request_id: wq1.match(/Review request (m\d+)/)[1], decision: "changes_requested", blocking: [{ title: "z" }] }, asGpt("gpt-where"));
+  const w2 = (await call(claude, "bridge_review", { round_of: w1.id, paths: [repo], request: "Where check two." })).structuredContent;
+  assert.deepEqual(Object.keys(w2).sort(), ["advisor", "id", "plan", "round"], "a round's result fields");
+  const wq2 = await deliveredTo("gpt-where", /Where check two\./);
+  assert.equal(where(wq2), where(wq1));
+  await call(openai, "bridge_advise", { request_id: wq2.match(/Review request (m\d+)/)[1], decision: "approved" }, asGpt("gpt-where"));
+
+  // a round just under the limit arrives whole; just over is refused
+  const p1 = (await call(claude, "bridge_review", { reviewer: "join", kind: "plan", request: "Long plan, first round." })).structuredContent;
+  await call(openai, "bridge_link_join", { code: p1.joinCode }, asGpt("gpt-long"));
+  const pq1 = await deliveredTo("gpt-long", /Long plan, first round\./);
+  await call(openai, "bridge_advise", { request_id: pq1.match(/Plan review request (m\d+)/)[1], decision: "changes_requested", blocking: [{ title: "w" }] }, asGpt("gpt-long"));
+  const over = await claude.callTool({ name: "bridge_review", arguments: { round_of: p1.id, request: "y".repeat(36_000) } });
+  assert.match(textOf(over), /^This review doesn't fit one message/);
+  await call(claude, "bridge_review", { round_of: p1.id, request: "y".repeat(35_400) + " END-OF-LONG-ROUND" });
+  const pq2 = await deliveredTo("gpt-long", /END-OF-LONG-ROUND/);
+  assert.match(pq2, /END-OF-LONG-ROUND\n\nThis is a plan, not finished work/, "the round arrives uncut");
+  await call(openai, "bridge_advise", { request_id: pq2.match(/Plan review request (m\d+)/)[1], decision: "approved" }, asGpt("gpt-long"));
+
+  // auto mode: a plan consulted on by the agent's own choice goes on, and its
+  // next round does too, even with auto mode off and own_initiative left out
+  const autoC = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-gate", CLAUDE_PROJECT_DIR: repo });
+  await call(autoC, "bridge_auto", { on: true, thread_id: "gpt-gate" });
+  const g1 = (await call(autoC, "bridge_review", { kind: "plan", own_initiative: true, request: "Gate plan one." })).structuredContent;
+  assert.deepEqual(Object.keys(g1).sort(), ["id", "joinCode", "threadId"], "a new ChatGPT review's result fields");
+  const gq1 = await deliveredTo("gpt-gate", /Gate plan one\./);
+  await call(openai, "bridge_advise", { request_id: gq1.match(/Plan review request (m\d+)/)[1], decision: "changes_requested", blocking: [{ title: "v" }] }, asGpt("gpt-gate"));
+  assert.match(await receiveUntil(autoC, undefined, /kind=review-result plan/), /by your own choice: once it's approved, go on\./);
+  await call(autoC, "bridge_auto", { on: false });
+  await call(autoC, "bridge_review", { round_of: g1.id, request: "Gate plan two." });
+  const gq2 = await deliveredTo("gpt-gate", /Gate plan two\./);
+  await call(openai, "bridge_advise", { request_id: gq2.match(/Plan review request (m\d+)/)[1], decision: "approved" }, asGpt("gpt-gate"));
+  const gr2 = await receiveUntil(autoC, undefined, /kind=review-result plan decision=approved/);
+  assert.match(gr2, /by your own choice: once it's approved, go on\./);
+  assert.doesNotMatch(gr2, /wait for the user's explicit approval/);
+  await autoC.close();
+  console.log("5h requests are size-checked before anything is opened, new or next round; same Where part; a long round arrives whole; the plan gate stays with later rounds; result fields kept");
+}
+
 // 6. status from the ChatGPT side knows its own chat; unlink ends reviews
 const gptStatus = JSON.parse(textOf(await call(openai, "bridge_status", {}, asGpt(THREAD))));
 assert.equal(gptStatus.chat.id, THREAD);
