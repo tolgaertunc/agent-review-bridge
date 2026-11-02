@@ -27,7 +27,7 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.PEER_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 14);
+export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 15);
 
 export const SIDES = ["claude", "openai"];
 // Claude Desktop's session ids, as claude://code/continue?session= accepts them
@@ -133,7 +133,10 @@ export const PLAN_GATE =
 // review request, so it is answered with bridge_send, never bridge_advise.
 export function nextStep(m) {
   if (m.kind === "failed")
-    return "Tell the user, and don't wait for that answer: it isn't coming. Ask again only if the user wants to (after the reset time, if one is given).";
+    return (
+      "Tell the user, and don't wait for that answer: it isn't coming. Ask again only if the user wants to (after the reset time, if one is given)" +
+      (m.retry ? `: to ask the same reviewer, use bridge_review(round_of="${m.retry}").` : ".")
+    );
   if (m.kind === "review-request") return `Review ${m.plan ? "the plan" : "it"}, then answer once with bridge_advise (request_id ${m.id}).`;
   if (m.kind === "advisory")
     return "Fix what holds up; if a finding is wrong, say why instead of complying. Your next turn is reviewed again. If you're going in circles or the rest needs a decision, stop and ask the user.";
@@ -152,6 +155,15 @@ export function nextStep(m) {
   }
   return `It is a message, not a review request: if it needs a reply, send one with bridge_send and reply_to "${m.id}" (not bridge_advise).`;
 }
+
+// The reviewer's role in short, with every one-off review request and when a
+// Claude reviewer's session starts again: either side may have compacted its
+// context and lost the brief it got once
+export const REVIEWER_ROLE =
+  "As the reviewer: read-only, don't change the project. Answer once with bridge_advise: approved, or changes_requested with each must-fix item in blocking; " +
+  "minor points go in nits and never block. If the requester disagrees with a finding, accept or hold it and say why; in a later round, judge against your earlier findings " +
+  "and don't add new blocking points on parts you accepted unless serious. If you can't see your earlier findings or the request, say so instead of guessing. " +
+  "Then write the text bridge_advise returns as your reply.";
 
 // Heads an approval that answers an earlier [CHANGES REQUESTED]
 export const LOOP_DONE_NOTE = "Your advisor approved the fix: the earlier [CHANGES REQUESTED] is resolved.";
@@ -498,7 +510,7 @@ class BrokerState {
     const who = m.toEndpoint.app === "openai" ? `The ChatGPT chat ${m.toEndpoint.id}` : `The Claude Code session ${m.toEndpoint.id}`;
     const what = m.kind === "review-request" ? "review result" : "reply";
     const text = `${who} can't answer ${m.id}: ${why}. No ${what} was received.`;
-    this.post({ from: "bridge", toEndpoint: to, kind: "failed", linkId: m.linkId, text, about: m.id });
+    this.post({ from: "bridge", toEndpoint: to, kind: "failed", linkId: m.linkId, text, about: m.id, retry: m.kind === "review-request" ? link.id : undefined });
     logEvent({ op: "failed", id: m.id, why });
   }
 
@@ -708,30 +720,52 @@ class BrokerState {
     if (!prev || prev.mode !== "review" || !sameEndpoint(prev.primary, primary)) throw new Error(`${linkId} is not a review this chat asked for`);
     if (prev.active) throw new Error(`${linkId} is still waiting for its answer`);
     if (prev.decision === "approved") throw new Error(`${linkId} was approved; there is nothing to re-review`);
-    if (prev.decision !== "changes_requested") throw new Error(`${linkId} didn't end with changes requested, so it can't be continued`);
+    // a review that got no answer can be asked again, as a retry of its round
+    if (!["changes_requested", "failed"].includes(prev.decision)) throw new Error(`${linkId} didn't end with changes requested or a failure, so it can't be continued`);
     if (prev.continuedBy) throw new Error(`${linkId} was already continued by ${prev.continuedBy}`);
     if (!prev.advisor) throw new Error(`${linkId} has no reviewer`);
     return prev;
   }
 
+  // The reviewer's last real answer in a chain of rounds (a failed attempt
+  // has none): the reviewer may have compacted its context since. "missing"
+  // when an earlier round is no longer kept.
+  lastAnswer(link) {
+    for (let l = link; ; ) {
+      if (l.advisories?.length) return { linkId: l.id, text: l.advisories.at(-1).text };
+      if (!l.roundOf) return { none: true };
+      l = this.s.links[l.roundOf];
+      if (!l) return { missing: true };
+    }
+  }
+
+  // The next round, or a retry of a round that got no answer (it keeps its
+  // number: a failure isn't a verdict and doesn't count toward the cap)
+  nextRound(prev) {
+    const retry = prev.decision === "failed";
+    return { retry, round: retry ? (prev.round ?? 1) : (prev.round ?? 1) + 1 };
+  }
+
   // What the requester needs to build the next round's request
   op_round_info({ primary, roundOf }) {
     const prev = this.roundToContinue(primary, roundOf);
-    return { plan: !!prev.plan, round: (prev.round ?? 1) + 1, advisor: prev.advisor };
+    return { plan: !!prev.plan, ...this.nextRound(prev), advisor: prev.advisor, previous: this.lastAnswer(prev) };
   }
 
-  // The next round of a review: same reviewer, same kind, round + 1. One
-  // continuation per round (checked and set in this one op), and none past
-  // the emergency cap.
+  // The next round of a review: same reviewer, same kind, round + 1 (a retry
+  // keeps the round). One continuation per round (checked and set in this one
+  // op), and none past the emergency cap.
   op_link_continue({ primary, roundOf, request, plan, threadId, reqPaths }) {
     const prev = this.roundToContinue(primary, roundOf);
     if (plan !== undefined && !!plan !== !!prev.plan) throw new Error(`${roundOf} was a ${prev.plan ? "plan" : "code"} review; continue it as one`);
     if (threadId && !(prev.advisor.app === "openai" && prev.advisor.id === threadId)) throw new Error(`${roundOf} was reviewed in another chat; continue it there`);
-    const round = (prev.round ?? 1) + 1;
+    const { retry, round } = this.nextRound(prev);
     if (round > MAX_ROUNDS()) throw new Error(`${round - 1} rounds without approval: stop and ask the user how to proceed`);
     const id = "L" + ++this.s.linkSeq;
     prev.continuedBy = id;
-    const heading = `Round ${round} of review ${roundOf} (earlier rounds ended with [CHANGES REQUESTED]). Answer each point the requester disagrees with: accept it or hold, and say why.`;
+    const heading = retry
+      ? `Retry of round ${round} of review ${this.firstRound(prev).id}: the previous attempt (${roundOf}) got no answer.`
+      : `Round ${round} of review ${roundOf} (earlier rounds ended with [CHANGES REQUESTED]). Answer each point the requester disagrees with: accept it or hold, and say why.`;
     const link = { id, mode: "review", name: prev.name ?? null, active: true, createdAt: Date.now(), primary, advisor: prev.advisor, reviews: 0, advisories: [], round, roundOf };
     if (prev.plan) link.plan = true;
     if (prev.noGate) link.noGate = true;
@@ -740,9 +774,16 @@ class BrokerState {
     link.request = `${heading}\n\n${request}`;
     this.s.links[id] = link;
     this.registerPaths(primary, reqPaths);
-    logEvent({ op: "link_continue", id, roundOf, round });
+    logEvent({ op: "link_continue", id, roundOf, round, ...(retry && { retry }) });
     this.sendReviewRequest(link);
-    return { id, round, advisor: prev.advisor, plan: !!prev.plan };
+    return { id, round, advisor: prev.advisor, plan: !!prev.plan, ...(retry && { retry: true }) };
+  }
+
+  // the first link of a chain of rounds (as far as it is still kept)
+  firstRound(link) {
+    let l = link;
+    while (l.roundOf && this.s.links[l.roundOf]) l = this.s.links[l.roundOf];
+    return l;
   }
 
   op_link_close({ endpoint, linkId }) {
@@ -952,13 +993,13 @@ class BrokerState {
     return { ok: true };
   }
 
-  post({ from, toEndpoint, kind, linkId, text, decision, lastRound, generation, about }) {
+  post({ from, toEndpoint, kind, linkId, text, decision, lastRound, generation, about, retry }) {
     const msg = { id: "m" + ++this.s.seq, from, to: toEndpoint.app, toEndpoint, kind, linkId, text: text.slice(0, MAX_TEXT), ts: Date.now(), readAt: null };
     // a review's request and result say whether it is a plan, and whether
     // its plan waits for the user, as its link decided (each message is
     // rendered on its own later, by the hooks too)
     const link = ["review-request", "review-result"].includes(kind) ? this.s.links[linkId] : null;
-    Object.assign(msg, link?.plan && { plan: true }, link?.plan && link.noGate && { noGate: true }, decision && { decision }, lastRound && { lastRound: true }, generation !== undefined && { generation }, about && { about });
+    Object.assign(msg, link?.plan && { plan: true }, link?.plan && link.noGate && { noGate: true }, decision && { decision }, lastRound && { lastRound: true }, generation !== undefined && { generation }, about && { about }, retry && { retry });
     this.s.messages.push(msg);
     logEvent({ op: "send", id: msg.id, from, to: toEndpoint, kind, linkId, len: msg.text.length });
     return { id: msg.id };
@@ -1038,7 +1079,7 @@ class BrokerState {
     logEvent({ op: "receive", side, endpoint, ids: out.map((m) => m.id) });
     // everything nextStep reads goes along, so the instruction is the same as in a wake
     return {
-      messages: out.map(({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about }) => ({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about })),
+      messages: out.map(({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about, retry }) => ({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about, retry })),
     };
   }
 }

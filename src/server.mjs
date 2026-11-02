@@ -13,7 +13,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import path from "node:path";
-import { call, keepOwner, SIDES, MAX_DIFF, MAX_TEXT, HOST_ID, nextStep } from "./broker.mjs";
+import { call, keepOwner, SIDES, MAX_DIFF, MAX_TEXT, HOST_ID, REVIEWER_ROLE, nextStep } from "./broker.mjs";
 import { identify, endpointOf } from "./caller.mjs";
 import { pathInfo, usableBase, reviewSummary, pathDiff, fingerprint } from "./git.mjs";
 import { AUTO_RULES, AUTO_REVIEWER } from "./auto.mjs";
@@ -267,7 +267,7 @@ function projectDir(extra) {
 // auto mode a path is compared from the commit it was last approved on (or
 // entered on), and its content at this moment is recorded, so an approval
 // covers exactly what was asked about.
-function reviewRequest({ request, plan, paths, includeDiff, extra, auto }) {
+function reviewRequest({ request, plan, paths, includeDiff, extra, auto, previous }) {
   const { list, focus } = reviewPaths({ paths, plan, extra, auto });
   // pasted diffs share the room a message has
   const diffRoom = Math.floor(MAX_DIFF / Math.max(1, list.length));
@@ -286,7 +286,7 @@ function reviewRequest({ request, plan, paths, includeDiff, extra, auto }) {
         (focus.length ? `Focus on ${focus.join(", ")}; the rest of the folder's changes are listed too, since an approval covers them.\n\n` : "") +
         (lists ? "" : "(The file lists are left out to fit one message; the commands show everything.)\n\n") +
         sections.map((x) => [x.head, lists && x.list, x.how, x.command, diffs && x.diff].filter(Boolean).join("\n")).join("\n\n");
-    return [plan ? `Plan review requested by ${SIDE}:` : `Review requested by ${SIDE}:`, request.trim(), plan && PLAN_GUIDE, auto && AUTO_REVIEWER, where]
+    return [plan ? `Plan review requested by ${SIDE}:` : `Review requested by ${SIDE}:`, request.trim(), REVIEWER_ROLE, earlier(previous), plan && PLAN_GUIDE, auto && AUTO_REVIEWER, where]
       .filter(Boolean)
       .join("\n\n");
   };
@@ -366,6 +366,22 @@ function describePath(p, { auto, includeDiff, diffRoom }) {
   };
 }
 
+// A round carries the reviewer's last real answer in this review, since its
+// chat may have been compacted since
+const EARLIER_ROOM = 3_000;
+function earlier(previous) {
+  if (!previous) return null;
+  if (previous.none) return "No earlier answer in this review.";
+  if (previous.missing) return "The bridge no longer keeps the earlier answers in this review; if you can't see them, say so.";
+  const cut = previous.text.length > EARLIER_ROOM;
+  return (
+    `Your answer to the previous round (${previous.linkId}):\n` +
+    (cut
+      ? `${previous.text.slice(0, EARLIER_ROOM)}\n… (cut here: the rest isn't shown. Don't assume points you can't see were resolved; ask the requester if you need them.)`
+      : previous.text)
+  );
+}
+
 // this chat's auto mode, if on
 async function autoOf(endpoint) {
   const st = await call("status", { endpoint });
@@ -403,7 +419,8 @@ server.registerTool(
       "Write in `request` the goal, what to review and anything that deviated from what was agreed; don't argue for your solution (if changes are requested and you disagree, give your reasons in the next round). " +
       "The reviewer reads the changes itself: `paths` names the folders or files (git or not; default: this chat's folder), and the request tells it where and how to look. " +
       "For a plan (before implementing), use kind='plan': no paths unless you name some, and once it's reviewed you show the user the plan and verdict and wait for their approval (in auto mode, a plan you consult on by your own choice goes on once approved: own_initiative). " +
-      "After [CHANGES REQUESTED], ask for the next round with round_of (the previous review's link id): same reviewer and kind, and say what you changed and where you disagree. " +
+      "After [CHANGES REQUESTED], ask for the next round with round_of (the previous review's link id): same reviewer and kind, and say what you changed and where you disagree; " +
+      "after a review that got no answer, round_of asks the same reviewer again. " +
       (SIDE === "claude"
         ? `reviewer='openai' opens a new ChatGPT thread for it (pick the model and effort; ${MODEL_CHOICE}), or continues in an earlier one (thread_id), which keeps that chat's context; `
         : "") +
@@ -411,7 +428,7 @@ server.registerTool(
     inputSchema: {
       request: z.string().describe("What to review and what you want to know"),
       reviewer: z.enum(SIDE === "claude" ? ["openai", "join"] : ["join"]).optional().describe("Where the reviewer runs (not needed with round_of)"),
-      round_of: z.string().optional().describe("Link id of the previous round (e.g. L7) to ask the same reviewer for the next round"),
+      round_of: z.string().optional().describe("Link id of the previous round (e.g. L7) to ask the same reviewer for the next round, or again after it got no answer"),
       model: z.string().optional().describe("Model for a new ChatGPT reviewer thread, as ChatGPT lists it (id or name)"),
       effort: z.string().optional().describe("Reasoning effort for a new ChatGPT reviewer thread, e.g. low, medium, high"),
       kind: z.enum(["code", "plan"]).optional().describe("What is reviewed: code (default) or a plan before implementing it"),
@@ -452,7 +469,7 @@ server.registerTool(
     // the round's kind comes from the earlier one; the broker refuses a mismatch
     const plan = round && !kind ? round.plan : kind === "plan";
     // 2. The request, built and size-checked before anything is opened or made
-    const req = reviewRequest({ request, plan, paths, includeDiff: include_diff, extra, auto });
+    const req = reviewRequest({ request, plan, paths, includeDiff: include_diff, extra, auto, previous: round?.previous });
     if (req.error) return text(req.error);
     // 3. The reviewer's app open and able to answer; checked before a round is used up
     if (target) {
@@ -462,7 +479,10 @@ server.registerTool(
     // 4. Sent
     if (round) {
       const r = await call("link_continue", { primary, roundOf: round_of, request: req.text, plan: kind ? plan : undefined, threadId: thread_id, reqPaths: req.reqPaths });
-      return withRules(`Round ${r.round} (${r.id}) sent to the reviewer of ${round_of} (${r.advisor.app} chat ${r.advisor.id}). The answer arrives as a new turn when it's ready. ${WAIT}`, r);
+      return withRules(
+        `${r.retry ? `Retry of round ${r.round}` : `Round ${r.round}`} (${r.id}) sent to the reviewer of ${round_of} (${r.advisor.app} chat ${r.advisor.id}). The answer arrives as a new turn when it's ready. ${WAIT}`,
+        r,
+      );
     }
     // a plan auto mode consults on by its own choice goes on once approved
     const noGate = plan && !!own_initiative && !!auto;

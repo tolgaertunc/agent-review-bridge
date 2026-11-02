@@ -887,5 +887,26 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   console.log("33 auto mode rules: in full at session start, short with each prompt; a deleted folder named as gone until its deletion is approved");
 }
 
+// 34. a Claude chat reviewing for others gets, when its session starts again,
+// the reviews still waiting for its answer and its role; with auto mode on,
+// its full rules too; with nothing open, nothing
+{
+  const C = { app: "claude", id: "claude-reviewing" };
+  const asker = { app: "openai", id: "gpt-asker-34" };
+  const a = await call("link_create", { primary: asker, advisor: C, mode: "review", request: "first" });
+  const b = await call("link_create", { primary: asker, advisor: C, mode: "review", request: "second" });
+  const idOf = (linkId) => state().messages.find((m) => m.linkId === linkId && m.kind === "review-request").id;
+  await call("auto_set", { endpoint: C, on: true });
+  const out = JSON.parse((await runHook("claude", "start", { session_id: C.id, source: "compact" })).out).hookSpecificOutput.additionalContext;
+  assert.match(out, /not at every small step/, "auto mode's full rules");
+  assert.match(out, new RegExp(`Reviews waiting for your answer: ${idOf(a.id)} from openai chat gpt-asker-34 \\(link ${a.id}\\); ${idOf(b.id)} from openai chat gpt-asker-34 \\(link ${b.id}\\)`));
+  assert.match(out, /read it again with bridge_receive and its id\. As the reviewer: read-only/);
+  await call("auto_set", { endpoint: C, on: false });
+  await call("advise", { endpoint: C, requestId: idOf(a.id), decision: "approved" });
+  await call("advise", { endpoint: C, requestId: idOf(b.id), decision: "approved" });
+  assert.equal((await runHook("claude", "start", { session_id: C.id, source: "resume" })).out, "", "nothing waiting, auto mode off: nothing");
+  console.log("34 a Claude reviewer's session start lists the reviews waiting for it with its role, plus auto mode's rules when on");
+}
+
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));
 process.exit(0);
