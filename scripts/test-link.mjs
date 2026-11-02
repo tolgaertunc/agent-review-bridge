@@ -743,5 +743,99 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   console.log("30 mid-turn: messages typed during a turn join its task, notices are ignored, the baseline holds; new or missing ids start a turn");
 }
 
+// 31. auto mode in the broker and the hooks: approvals cover the request's
+// content; plan approvals don't approve code; the end-of-turn check stops
+// unreviewed changes once, not while a review waits; the reminder counts
+// the user's turns only; an own-initiative plan doesn't wait for the user
+{
+  const { execFileSync } = await import("node:child_process");
+  const { fingerprint } = await import("../src/git.mjs");
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-auto-"));
+  try {
+    const g = (...a) => execFileSync("git", ["-C", work, "-c", "user.name=t", "-c", "user.email=t@t", ...a], { encoding: "utf8" });
+    g("init", "-q");
+    fs.writeFileSync(path.join(work, "a.js"), "1\n");
+    g("add", ".");
+    g("commit", "-qm", "init");
+    const head = g("rev-parse", "HEAD").trim();
+    const A = { app: "claude", id: "claude-auto-1" };
+    const R = { app: "openai", id: "gpt-auto-1" };
+    const fpNow = () => fingerprint(work).hash;
+    await call("auto_set", { endpoint: A, on: true, paths: [{ path: work, fp: fpNow(), head }] });
+    const stop = async (extra = {}) => {
+      const r = await runHook("claude", "stop", { session_id: A.id, cwd: work, ...extra });
+      return r.out ? JSON.parse(r.out) : null;
+    };
+    assert.equal(await stop(), null, "nothing changed: the turn ends");
+    fs.writeFileSync(path.join(work, "a.js"), "2\n");
+    const blocked = await stop();
+    assert.equal(blocked.decision, "block");
+    assert.match(blocked.reason, /hasn't approved the current changes in .*peer-bridge-auto-/);
+    assert.equal(await stop({ stop_hook_active: true }), null, "stopping again over the same changes goes through");
+    // a turn the bridge's own wake started (stop_hook_active set) is still checked
+    fs.writeFileSync(path.join(work, "a.js"), "2b\n");
+    assert.ok(await stop({ stop_hook_active: true }), "new changes stop a woken turn too");
+    fs.writeFileSync(path.join(work, "a.js"), "2\n");
+    await stop();
+    // a review asked about this content: the check waits, then the approval covers it
+    const fpAsked = fpNow();
+    const l = await call("link_create", { primary: A, mode: "review", advisor: R, request: "check", reqPaths: [{ path: work, fp: fpAsked, head }] });
+    assert.equal(await stop(), null, "a review is waiting: the turn may end");
+    fs.writeFileSync(path.join(work, "a.js"), "3\n"); // changed while the review ran
+    const reqId = state().messages.find((m) => m.linkId === l.id).id;
+    await call("advise", { endpoint: R, requestId: reqId, decision: "approved" });
+    assert.equal(state().auto[`claude:${A.id}`].paths[work].approved, fpAsked, "the approval covers what was asked about");
+    assert.ok(await stop(), "content changed during the review stays unreviewed");
+    fs.writeFileSync(path.join(work, "a.js"), "2\n");
+    assert.equal(await stop(), null, "back to the approved content");
+    // committing approved content isn't new work
+    g("commit", "-qam", "two");
+    assert.equal(await stop(), null, "a commit of the approved content keeps it approved");
+    // a plan approval doesn't approve code
+    fs.writeFileSync(path.join(work, "a.js"), "4\n");
+    const pl = await call("link_create", { primary: A, mode: "review", advisor: R, request: "plan", plan: true, noGate: true, reqPaths: [{ path: work, fp: fpNow(), head }] });
+    await call("advise", { endpoint: R, requestId: state().messages.find((m) => m.linkId === pl.id).id, decision: "approved" });
+    assert.ok(await stop(), "a plan approval doesn't approve the code");
+    const planResult = state().messages.find((m) => m.kind === "review-result" && m.linkId === pl.id);
+    assert.match(nextStep(planResult), /by your own choice: once it's approved, go on/);
+    assert.doesNotMatch(nextStep(planResult), /wait for the user's explicit approval/);
+    // the prompt hook: the instruction always, the reminder after five user turns
+    const ctx = async (prompt, turn) => {
+      const r = await runHook("claude", "prompt", { session_id: A.id, cwd: work, prompt, prompt_id: turn });
+      return r.out ? JSON.parse(r.out).hookSpecificOutput.additionalContext : "";
+    };
+    assert.match(await ctx("go", "u1"), /Auto mode is on/);
+    await until(() => state().auto[`claude:${A.id}`].turns === 1);
+    await ctx("<task-notification>\n<task-id>x</task-id>\n</task-notification>", "u1b");
+    await ctx("faster", "u1");
+    for (const t of ["u2", "u3", "u4", "u5"]) await ctx("more", t);
+    await until(() => state().auto[`claude:${A.id}`].turns === 5);
+    assert.match(await ctx("and more", "u6"), /you haven't consulted the reviewer for a few turns/);
+    // a file that can't be reached is said so, not taken as deleted
+    fs.mkdirSync(path.join(work, "sub"));
+    fs.writeFileSync(path.join(work, "sub", "f.js"), "f\n");
+    g("add", ".");
+    g("commit", "-qm", "sub");
+    if (process.platform !== "win32" && process.getuid?.() !== 0) {
+      fs.chmodSync(path.join(work, "sub"), 0);
+      try {
+        assert.match((await stop()).reason, /couldn't check .*peer-bridge-auto-.*can't read .*f\.js \(EACCES\)/);
+      } finally {
+        fs.chmodSync(path.join(work, "sub"), 0o755);
+      }
+    }
+    await call("auto_set", { endpoint: A, on: false });
+    assert.equal(await stop(), null, "off: no check");
+    console.log("31 auto mode: approvals cover the request, plans don't approve code, the turn check and reminder behave, own-initiative plans go on");
+  } finally {
+    try {
+      fs.chmodSync(path.join(work, "sub"), 0o755);
+    } catch {
+      // not made
+    }
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+}
+
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));
 process.exit(0);

@@ -78,7 +78,8 @@ const openai = await connect("openai");
 const expected = ["bridge_advise", "bridge_link", "bridge_link_join", "bridge_receive", "bridge_review", "bridge_send", "bridge_status", "bridge_unlink"];
 for (const c of [claude, openai]) {
   const { tools } = await c.listTools();
-  assert.deepEqual(tools.map((t) => t.name).sort(), expected);
+  // auto mode runs from Claude, with a ChatGPT reviewer
+  assert.deepEqual(tools.map((t) => t.name).sort(), (c === claude ? [...expected, "bridge_auto"] : expected).sort());
   for (const t of tools) assert.equal(t.annotations?.destructiveHint, false, `${t.name} must be marked non-destructive`);
 }
 console.log("1 both servers expose the same 8 tools, all marked non-destructive");
@@ -125,7 +126,12 @@ const rev = (await call(claude, "bridge_review", { reviewer: "join", request: "I
 assert.match(textOf(await call(openai, "bridge_link_join", { code: rev.joinCode }, asGpt(REVIEWER))), /Its request arrives as the next message/);
 const revReq = await deliveredTo(REVIEWER, /Is the trim change safe/);
 assert.match(revReq, /Is the trim change safe for quoted CSV\?/);
-assert.match(revReq, /Uncommitted changes in .*:/);
+assert.match(revReq, /Where the changes are: read them yourself/);
+assert.match(revReq, /Run each command whole first/, "the reviewer is told not to narrow a cut list");
+assert.match(revReq, /\(git: uncommitted changes against HEAD\)/);
+assert.match(revReq, /git -C '.*' diff --no-ext-diff --no-textconv [0-9a-f]+ -- '\.'/);
+assert.match(revReq, /parser\.js/);
+assert.doesNotMatch(revReq, /^[-+]export const parse/m, "the diff isn't pasted");
 assert.doesNotMatch(revReq, /super-secret/);
 const revId = revReq.match(/Review request (m\d+)/)[1];
 await call(openai, "bridge_advise", { request_id: revId, decision: "approved", nits: [{ title: "Quoted fields with commas will still split." }] }, asGpt(REVIEWER));
@@ -151,7 +157,7 @@ assert.match(textOf(await call(openai, "bridge_link_join", { code: planRev.joinC
 const planReq = await deliveredTo("gpt-thread-planner", /add trim/);
 assert.match(planReq, /^CLAUDE: Plan review request (m\d+)/);
 assert.match(planReq, /This is a plan, not finished work/);
-assert.doesNotMatch(planReq, /Uncommitted changes/, "a plan review attaches no diff by default");
+assert.doesNotMatch(planReq, /Where the changes are/, "a plan review names no paths by default");
 await call(openai, "bridge_advise", { request_id: planReq.match(/Plan review request (m\d+)/)[1], decision: "changes_requested", blocking: [{ title: "Tests first." }] }, asGpt("gpt-thread-planner"));
 const planRes = await receiveUntil(claude, undefined, /kind=review-result plan/);
 assert.match(planRes, /Tests first\./);
@@ -220,7 +226,7 @@ console.log("5b bridge_send reaches the linked chat, bridge_advise on it points 
 const gptRev = (await call(openai, "bridge_review", { reviewer: "join", request: "Sanity-check my plan." }, asGpt(THREAD))).structuredContent;
 await call(claude, "bridge_link_join", { code: gptRev.joinCode });
 const gptReq = await receiveUntil(claude, undefined, /kind=review-request/);
-assert.match(gptReq, /not attached: this chat's project folder is unknown/);
+assert.doesNotMatch(gptReq, /Where the changes are/, "no folder known on the ChatGPT side: no paths");
 assert.doesNotMatch(gptReq, /parser\.js/);
 await call(claude, "bridge_advise", { request_id: gptReq.match(/id=(m\d+) kind=review-request/)[1], decision: "approved" });
 console.log("5c ChatGPT-side review without a known project folder attaches no diff");
@@ -279,6 +285,62 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   assert.match(textOf(await openai.callTool({ name: "bridge_send", arguments: { text: "hi", open: true }, _meta: asGpt("gpt-sends-to-nohost") })), /doesn't know how to open the Claude Code session claude-no-host/);
   await noHost.close();
   console.log("5d closed side: nothing sent, agent told to ask; open=true opens then sends; remember sets always; failed open sends nothing; rounds not used up; Claude opened by its own host id, else by hand");
+}
+
+// 5e. auto mode: one reviewer chat for every review, the instruction in
+// the tool result, the request's content recorded for the approval
+{
+  const autoClaude = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-auto", CLAUDE_PROJECT_DIR: repo });
+  const on = textOf(await call(autoClaude, "bridge_auto", { on: true, thread_id: "gpt-auto-reviewer" }));
+  assert.match(on, /Auto mode is on, with ChatGPT chat gpt-auto-reviewer as the reviewer/);
+  assert.match(on, /Auto mode is on: you work with a second model as your reviewer/);
+  const st = JSON.parse(textOf(await call(autoClaude, "bridge_status")));
+  assert.ok(st.auto.on && Object.keys(st.auto.paths).length === 1, "the chat's folder is tracked from now");
+  const r1 = (await call(autoClaude, "bridge_review", { request: "Goal: trim fields. Step: parse trims." })).structuredContent;
+  assert.equal(r1.threadId, "gpt-auto-reviewer", "auto mode picks its reviewer chat");
+  const q = await deliveredTo("gpt-auto-reviewer", /Goal: trim fields/);
+  assert.match(q, /Auto mode: review the work against its goal/);
+  assert.match(q, /Where the changes are/);
+  await call(openai, "bridge_advise", { request_id: q.match(/Review request (m\d+)/)[1], decision: "approved" }, asGpt("gpt-auto-reviewer"));
+  const approved = JSON.parse(textOf(await call(autoClaude, "bridge_status"))).auto;
+  const p = Object.values(approved.paths)[0];
+  assert.ok(p.approved && p.base, "the approval recorded the content and commit of the request");
+  // reviewer="openai" or a single file doesn't leave the reviewer chat or the tracked folder
+  const r2 = (await call(autoClaude, "bridge_review", { reviewer: "openai", paths: [path.join(repo, "parser.js")], request: "Goal: trim fields. Step: one more case." })).structuredContent;
+  assert.equal(r2.threadId, "gpt-auto-reviewer", "reviewer=openai still uses auto mode's chat");
+  const q2 = await deliveredTo("gpt-auto-reviewer", /one more case/);
+  assert.match(q2, /Focus on .*parser\.js; the rest of the folder's changes are listed too/);
+  assert.match(q2, /diff --no-ext-diff --no-textconv [0-9a-f]+ -- '\.'/, "the folder is reviewed as a whole");
+  await call(openai, "bridge_advise", { request_id: q2.match(/Review request (m\d+)/)[1], decision: "approved" }, asGpt("gpt-auto-reviewer"));
+  assert.match(textOf(await call(autoClaude, "bridge_auto", { on: false })), /Auto mode is off/);
+  await autoClaude.close();
+  console.log("5e auto mode: same reviewer chat, reviewer told to watch the direction, approval recorded per path");
+}
+
+// 5f. one message per request: with many paths the file lists go first,
+// never a scope line or a command; past that the request is refused
+{
+  const many = (n) =>
+    Array.from({ length: n }, (_, i) => {
+      const d = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-many-"));
+      execFileSync("git", ["-C", d, "init", "-q"]);
+      // names long enough that nine full lists can't fit one message
+      for (let j = 0; j < 60; j++) fs.writeFileSync(path.join(d, `${"n".repeat(200)}-${i}-${j}.txt`), "x\n");
+      return d;
+    });
+  const nine = many(9);
+  await call(claude, "bridge_review", { reviewer: "openai", thread_id: "gpt-many", paths: nine, request: "Nine folders." });
+  const big = await deliveredTo("gpt-many", /Nine folders\./);
+  assert.ok(big.length < 40_000, `fits one message (${big.length})`);
+  assert.match(big, /The file lists are left out to fit one message/);
+  for (const d of nine) assert.ok(big.includes(`-C '${fs.realpathSync(d)}' diff`), `command for ${d}`); // git gives the real path
+  // each path's scope line and command alone take over 1,000 characters, so
+  // 40 of them can't fit the 36,000 a request may take
+  const forty = many(40);
+  const refused = await claude.callTool({ name: "bridge_review", arguments: { reviewer: "openai", thread_id: "gpt-many", paths: forty, request: "Forty folders." } });
+  assert.match(textOf(refused), /doesn't fit one message \(40 paths\)\. Split it/);
+  for (const d of [...nine, ...forty]) fs.rmSync(d, { recursive: true, force: true });
+  console.log(`5f a 9-folder request fits one message with every command (${big.length} chars); 40 folders are refused`);
 }
 
 // 6. status from the ChatGPT side knows its own chat; unlink ends reviews

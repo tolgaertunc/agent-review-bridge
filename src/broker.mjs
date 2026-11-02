@@ -15,6 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { dataDir } from "./platform.mjs";
+import { autoKey } from "./auto.mjs";
 
 export const DATA_DIR = dataDir();
 export const STATE_FILE = path.join(DATA_DIR, "state.json");
@@ -26,7 +27,7 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.PEER_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 11);
+export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 12);
 
 export const SIDES = ["claude", "openai"];
 // Claude Desktop's session ids, as claude://code/continue?session= accepts them
@@ -84,7 +85,7 @@ export function pendingFor(state, endpoint) {
 export const listenerFile = (endpoint) => path.join(LISTENERS_DIR, `${safeName(endpoint)}.json`);
 export const turnFile = (endpoint) => path.join(TURNS_DIR, `${safeName(endpoint)}.json`);
 
-const OUTBOX_OPS = new Set(["turn_start", "turn_end", "notes_ack", "wake_ack"]);
+const OUTBOX_OPS = new Set(["turn_start", "turn_end", "notes_ack", "wake_ack", "auto_prompt"]);
 
 function token() {
   try {
@@ -97,7 +98,7 @@ function token() {
 }
 
 function freshState() {
-  return { seq: 0, messages: [], links: {}, linkSeq: 0, notes: [] };
+  return { seq: 0, messages: [], links: {}, linkSeq: 0, notes: [], auto: {} };
 }
 
 function logEvent(event) {
@@ -135,7 +136,8 @@ export function nextStep(m) {
           : m.decision === "changes_requested"
             ? `Fix what holds up; if a finding is wrong, say why instead of complying. Then ask for the next round with bridge_review(round_of="${m.linkId}"), saying what you changed and where you disagree. If you're going in circles or the rest needs a decision, stop and ask the user.`
             : "Weigh it, act on what holds up, and tell the user what you changed or why you didn't.";
-    return m.plan ? `${step} ${PLAN_GATE}` : step;
+    if (!m.plan) return step;
+    return m.noGate ? `${step} This was a plan you consulted on in auto mode by your own choice: once it's approved, go on.` : `${step} ${PLAN_GATE}`;
   }
   return `It is a message, not a review request: if it needs a reply, send one with bridge_send and reply_to "${m.id}" (not bridge_advise).`;
 }
@@ -353,7 +355,75 @@ class BrokerState {
           listening: Object.fromEntries(["primary", "advisor"].filter((r) => l[r]?.app === "claude").map((r) => [r, !!listenerAlive(l[r])])),
         })),
       pendingNotes: s.notes.filter((n) => !n.deliveredAt && (!endpoint || sameEndpoint(n.to, endpoint))).length,
+      ...(endpoint && s.auto?.[autoKey(endpoint)] && { auto: s.auto[autoKey(endpoint)] }),
     };
+  }
+
+  // ------------------------------------------------------------ auto mode
+  // Per chat: on/off, the reviewer chat it keeps using, and per path the
+  // content last approved and the commit to compare from. A path enters when
+  // auto mode is turned on (the chat's folder, as it is then) or when a
+  // review names it.
+
+  op_auto_set({ endpoint, on, thread, model, effort, paths }) {
+    if (!endpoint?.app || !endpoint?.id) throw new Error("this chat is unknown");
+    const key = autoKey(endpoint);
+    if (!on) {
+      if (this.s.auto?.[key]) this.s.auto[key].on = false;
+      return { on: false };
+    }
+    const prev = this.s.auto?.[key];
+    const entry = { ...(prev ?? { paths: {}, turns: 0 }), on: true, since: prev?.on ? prev.since : Date.now() };
+    if (thread !== undefined) entry.thread = thread;
+    if (model !== undefined) entry.model = model;
+    if (effort !== undefined) entry.effort = effort;
+    // paths named when turning it on start from their state at that moment
+    for (const p of paths ?? []) entry.paths[p.path] ??= { approved: p.fp, base: p.head ?? null };
+    this.s.auto = { ...(this.s.auto ?? {}), [key]: entry };
+    return entry;
+  }
+
+  // the reviewer chat auto mode keeps using, once it exists
+  op_auto_thread({ endpoint, thread }) {
+    const entry = this.s.auto?.[autoKey(endpoint)];
+    if (entry?.on) entry.thread = thread;
+    return { ok: true };
+  }
+
+  // A path first named in a review enters at the commit it is on: work
+  // committed there before is the requester's to name
+  registerPaths(endpoint, reqPaths) {
+    const entry = this.s.auto?.[autoKey(endpoint)];
+    if (!entry?.on) return;
+    for (const p of reqPaths ?? []) entry.paths[p.path] ??= { approved: null, base: p.head ?? null };
+  }
+
+  approvePaths(link) {
+    const entry = this.s.auto?.[autoKey(link.primary)];
+    if (!entry?.on) return;
+    for (const p of link.reqPaths ?? []) {
+      // content changed while the review ran, or couldn't be read: nothing new is approved
+      if (!p.fp) continue;
+      entry.paths[p.path] = { approved: p.fp, base: p.head ?? entry.paths[p.path]?.base ?? null };
+    }
+  }
+
+  // a review was asked for: the reminder count starts over
+  consulted(endpoint) {
+    const entry = this.s.auto?.[autoKey(endpoint)];
+    if (entry?.on) entry.turns = 0;
+  }
+
+  // From the prompt hook: a new user turn in auto mode. The bridge's own
+  // queued prompts and prompts within the running turn don't count.
+  op_auto_prompt({ endpoint, turnId, prompt }) {
+    const entry = this.s.auto?.[autoKey(endpoint)];
+    if (!entry?.on || typeof prompt !== "string") return { skipped: "off" };
+    if (turnId && entry.lastTurn === turnId) return { skipped: "same turn" };
+    if (HOST_NOTICE.test(prompt) || this.looksFromBridge(endpoint, prompt)) return { skipped: "not the user" };
+    entry.lastTurn = turnId ?? null;
+    entry.turns = (entry.turns ?? 0) + 1;
+    return { turns: entry.turns };
   }
 
   op_ping() {
@@ -381,7 +451,7 @@ class BrokerState {
   // mode "advisor": every turn of the primary is reviewed; one per primary.
   // mode "review": one request, one answer, then the link closes.
   // The advisor is bound now (a thread the bridge created) or later via code.
-  op_link_create({ primary, advisor, mode = "advisor", name, request, plan }) {
+  op_link_create({ primary, advisor, mode = "advisor", name, request, plan, noGate, reqPaths }) {
     if (!primary?.app || !primary?.id) throw new Error("primary endpoint unknown (caller identity missing)");
     if (mode === "advisor")
       for (const l of Object.values(this.s.links))
@@ -393,8 +463,11 @@ class BrokerState {
     if (mode === "review") {
       link.round = 1;
       if (plan) link.plan = true; // a plan to review, not code
+      if (plan && noGate) link.noGate = true; // an auto-mode consult the agent started
+      if (reqPaths?.length) link.reqPaths = reqPaths; // what an approval covers
     } else link.generation = 0; // bumped by each real user prompt
     this.s.links[id] = link;
+    if (mode === "review") this.registerPaths(primary, reqPaths);
     logEvent({ op: "link_create", id, mode, primary, advisor: advisor ?? null });
     if (advisor) this.sendReviewRequest(link);
     return { id, joinCode: link.joinCode ?? null };
@@ -415,6 +488,7 @@ class BrokerState {
   sendReviewRequest(link) {
     if (link.mode !== "review" || !link.request || !link.advisor) return;
     this.post({ from: link.primary.app, toEndpoint: link.advisor, kind: "review-request", linkId: link.id, text: link.request, plan: link.plan });
+    this.consulted(link.primary);
     delete link.request;
   }
 
@@ -439,7 +513,7 @@ class BrokerState {
   // The next round of a review: same reviewer, same kind, round + 1. One
   // continuation per round (checked and set in this one op), and none past
   // the emergency cap.
-  op_link_continue({ primary, roundOf, request, plan, threadId }) {
+  op_link_continue({ primary, roundOf, request, plan, threadId, reqPaths }) {
     const prev = this.roundToContinue(primary, roundOf);
     if (plan !== undefined && !!plan !== !!prev.plan) throw new Error(`${roundOf} was a ${prev.plan ? "plan" : "code"} review; continue it as one`);
     if (threadId && !(prev.advisor.app === "openai" && prev.advisor.id === threadId)) throw new Error(`${roundOf} was reviewed in another chat; continue it there`);
@@ -450,8 +524,11 @@ class BrokerState {
     const heading = `Round ${round} of review ${roundOf} (earlier rounds ended with [CHANGES REQUESTED]). Answer each point the requester disagrees with: accept it or hold, and say why.`;
     const link = { id, mode: "review", name: prev.name ?? null, active: true, createdAt: Date.now(), primary, advisor: prev.advisor, reviews: 0, advisories: [], round, roundOf };
     if (prev.plan) link.plan = true;
+    if (prev.noGate) link.noGate = true;
+    if (reqPaths?.length) link.reqPaths = reqPaths;
     link.request = `${heading}\n\n${request}`.slice(0, MAX_TEXT - 500);
     this.s.links[id] = link;
+    this.registerPaths(primary, reqPaths);
     logEvent({ op: "link_continue", id, roundOf, round });
     this.sendReviewRequest(link);
     return { id, round, advisor: prev.advisor, plan: !!prev.plan };
@@ -486,6 +563,20 @@ class BrokerState {
       pending.find((m) => norm(text).startsWith(norm(inlineText(m).split("\n")[0])) && text.includes(AGENT_LINE));
     if (m) m.promptMatched = Date.now();
     return !!m;
+  }
+
+  // The same test without using a delivery up (the advisor's turn_start may
+  // already have matched it): any delivery to this chat in the last day
+  looksFromBridge(endpoint, prompt) {
+    const text = prompt.trim();
+    const norm = (s) => s.replace(/\s+/g, " ").trim();
+    return this.s.messages.some(
+      (m) =>
+        m.dispatch &&
+        sameEndpoint(m.toEndpoint, endpoint) &&
+        Date.now() - m.ts < DAY &&
+        (inlineText(m).trim() === text || (norm(text).startsWith(norm(inlineText(m).split("\n")[0])) && text.includes(AGENT_LINE))),
+    );
   }
 
   // From the primary's UserPromptSubmit hook: what the user asked this turn.
@@ -564,7 +655,8 @@ class BrokerState {
     if (link.mode === "review") {
       const lastRound = decision === "changes_requested" && (link.round ?? 1) >= MAX_ROUNDS();
       Object.assign(link, { active: false, closedAt: Date.now(), decision });
-      const r = this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "review-result", linkId: link.id, text, plan: link.plan, decision, lastRound });
+      if (decision === "approved" && !link.plan) this.approvePaths(link);
+      const r = this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "review-result", linkId: link.id, text, plan: link.plan, decision, lastRound, noGate: link.noGate });
       return { delivered: "now", text, ...r };
     }
     // an answer to a request from before the user's latest prompt no longer
@@ -616,9 +708,9 @@ class BrokerState {
     return { ok: true };
   }
 
-  post({ from, toEndpoint, kind, linkId, text, plan, decision, lastRound, generation }) {
+  post({ from, toEndpoint, kind, linkId, text, plan, decision, lastRound, generation, noGate }) {
     const msg = { id: "m" + ++this.s.seq, from, to: toEndpoint.app, toEndpoint, kind, linkId, text: text.slice(0, MAX_TEXT), ts: Date.now(), readAt: null };
-    Object.assign(msg, plan && { plan: true }, decision && { decision }, lastRound && { lastRound: true }, generation !== undefined && { generation });
+    Object.assign(msg, plan && { plan: true }, plan && noGate && { noGate: true }, decision && { decision }, lastRound && { lastRound: true }, generation !== undefined && { generation });
     this.s.messages.push(msg);
     logEvent({ op: "send", id: msg.id, from, to: toEndpoint, kind, linkId, len: msg.text.length });
     return { id: msg.id };

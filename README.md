@@ -18,6 +18,7 @@ Using peer-bridge:
 - [Install](#install)
 - [Use it](#use-it)
 - [How reviews work](#how-reviews-work)
+- [Auto mode](#auto-mode)
 - [Your rules](#your-rules)
 - [When the other side is closed](#when-the-other-side-is-closed)
 - [Privacy and safety](#privacy-and-safety)
@@ -35,8 +36,9 @@ Reference, for agents and contributors:
 | Mode | What happens | Use it for |
 |---|---|---|
 | **Advisor** | After every turn of your chat (the *primary*), a chat in the other app reviews it: what you asked, the answer, and the diff of that turn. | Longer work where you want a second opinion on each step. |
-| **One-off review** | Your chat asks the other app once, normally with its uncommitted changes attached. Follow-up rounds go to the same reviewer. | A finished change, a tricky fix, a commit you're unsure about. |
+| **One-off review** | Your chat asks the other app once; the reviewer reads the changes from your folders itself. Follow-up rounds go to the same reviewer. | A finished change, a tricky fix, a commit you're unsure about. |
 | **Plan review** | A one-off review of a plan before anything is built. Afterwards the primary shows you the plan and the verdict, and waits for your approval. | Design decisions, larger changes. |
+| **Auto mode** | Your agent works with ChatGPT as its reviewer throughout: it asks for reviews itself at the moments that matter, always in the same reviewer chat, and doesn't move past them without approval. | Any longer piece of work where you want a second model to check each real step, without reviewing every small one. |
 
 Every answer starts with **`[APPROVED]`** or **`[CHANGES REQUESTED]`**. On changes requested, the agent that wrote the code fixes what holds up, pushes back where it disagrees, and asks again until it is approved, or stops and asks you when it is going in circles.
 
@@ -73,6 +75,7 @@ You talk to your agent as usual and ask it to use the bridge; it calls the bridg
 
 - *"Ask ChatGPT to review this change."* A new ChatGPT chat reviews your uncommitted changes and the answer comes back as a new turn.
 - *"Get the plan reviewed by ChatGPT before you start."* A plan review: Claude shows you the reviewed plan and waits for your go-ahead.
+- *"Work with GPT on this"* or *"auto mode on"*: auto mode (see below).
 - *"Link a ChatGPT advisor to this chat."* From now on every turn is reviewed.
 - *"Use the same ChatGPT chat as last time."* The review continues in that chat, with its earlier context.
 - *"Stop the reviews."* The link is closed.
@@ -110,6 +113,19 @@ An approval with must-fix items, or a rejection without any, is refused, so the 
 
 **Plan reviews.** The reviewer's `[APPROVED]` is not your approval: after a plan review the bridge tells the agent to show you the plan and the verdict and to wait for your explicit go-ahead.
 
+## Auto mode
+
+Auto mode is for working with a second model throughout, without reviewing every small step and without the agent quietly skipping the reviews. It uses the same reviews as above; turning it on adds a few things for that chat:
+
+- **A standing instruction** with each prompt: ask for a review before settling a direction, when the direction changes (a different approach, a larger change than expected, a dropped or added requirement), when a coherent step is done and before committing it, when stuck, before anything hard to undo, and before saying the work is done. Small edits, reading and questions go into the next review.
+- **One reviewer chat** for the whole piece of work, so it remembers what was agreed. Each request still restates the goal, the step and anything that deviated.
+- **The reviewer watches the direction too:** besides the code, it says so when the plan or scope looks wrong. No plan is required when the work doesn't need one.
+- **A check at the end of each turn:** if the reviewer hasn't approved the current changes, the agent is asked once to request a review or tell you why not; telling you doesn't count as approval. It never stops the agent while a review is waiting, or a second time for the same changes. It's a safety net, not a guarantee: it can't stop what happens inside a turn.
+- **A gentle reminder** after five of your messages without a review, if nothing is waiting.
+- **Plans:** a plan review the agent starts on its own in auto mode goes on once the reviewer approves it. A plan review you asked for still waits for your approval. This is an instruction to the agent, not a lock.
+
+The work can span several folders or files, git or not, for example an iOS repo and then the same feature in the Android repo from the same chat. Each review names them, and the end-of-turn check covers every folder or file named in a review or when auto mode was turned on. A folder the agent never names isn't checked. Say "auto mode off" to stop.
+
 ## Your rules
 
 Standing instructions for every agent working through the bridge, in either app, go in one optional file:
@@ -139,8 +155,8 @@ Messages the bridge sends on its own, like an advisor's review of each turn, don
 
 ## Privacy and safety
 
-- **What is sent:** your message for the turn, the agent's final answer, and the diff of the turn or of your uncommitted changes (capped at 20,000 characters). It goes to the other app's chat, and so to that vendor.
-- **Left out of attached diffs:** files whose names suggest secrets, neither their content nor their names: `.env*`, keys and certificates, `*secret*`, `*credential*`, `.netrc`, `.npmrc`, and the folders `secrets/`, `.ssh/`, `.aws/` and any folder named like `*secret*` or `*credential*`. This goes by path only: secrets inside other files, in your messages or in the agents' answers are not removed.
+- **What is sent:** your message for the turn, the agent's final answer, and, in advisor mode, the diff of the turn (capped at 20,000 characters). One-off reviews and auto mode don't paste the changes: the reviewer reads them from your folders with the commands the request gives, so whatever it reads goes to that vendor too.
+- **Left out of diffs, summaries and the reviewer's commands:** files whose names suggest secrets, neither their content nor their names: `.env*`, keys and certificates, `*secret*`, `*credential*`, `.netrc`, `.npmrc`, and the folders `secrets/`, `.ssh/`, `.aws/` and any folder named like `*secret*` or `*credential*`. The reviewer is also told not to open them, and auto mode's check leaves them out too, in folders outside git as well. This goes by path only: secrets inside other files, in your messages or in the agents' answers are not removed.
 - **The other agent can't give orders.** Its messages are marked as agent messages, not user instructions, and can't authorize anything. Your rules come only from your own file, through local channels.
 - **Reviewer chats the bridge creates in ChatGPT run read-only.** A chat that joins with a code keeps its own permissions; it is only told not to act on the project.
 - **Local only.** The broker listens on `127.0.0.1` and requires a token. State lives in your user folder; old messages are pruned after a day (read) or a week.
@@ -164,6 +180,8 @@ Other settings, read by the bridge's processes: `PEER_BRIDGE_CLAUDE_BIN` (Claude
 - A Claude session's listener runs for up to 12 hours at a time; each turn or session start arms it again.
 - A ChatGPT thread runs the bridge's messages as prompts, and the bridge recognises its own by their text (if the app changes line endings or spacing, the message's first line and its fixed last line still identify it). If you paste one verbatim before the bridge's own turn for it runs, only the fix-loop count restarts.
 - On macOS, ChatGPT as the primary with a Claude advisor hasn't been verified yet.
+- One-off reviews and auto mode: the reviewer reads the changes itself, so how carefully it reads is up to the model. In auto mode the bridge also makes sure an approval covers only what was there when the review was asked for.
+- Auto mode runs from Claude Code, with a ChatGPT reviewer. The end-of-turn check compares file contents with what the reviewer approved; it doesn't run git's filters, so a repository with line-ending conversion may ask for one review too many after a commit.
 - CLIs: the Claude Code CLI should work, since it reads the same MCP server and hooks, but it hasn't been tested. The bridge can only reopen closed sessions that run in Claude Desktop; a CLI session has to be resumed by hand. The Codex CLI isn't supported: messages for the ChatGPT side wake ChatGPT Desktop, not a terminal session.
 
 ---
@@ -174,7 +192,8 @@ The bridge's MCP tools, for agents. You normally don't call them yourself.
 
 | Tool | What it does |
 |---|---|
-| `bridge_review` | Ask the other app for one review of `request`. `kind`: `"code"` (default) or `"plan"`. `include_diff` attaches the chat's uncommitted changes; default true for code, false for a plan (on the ChatGPT side only when its project folder is known). `reviewer`: `"openai"` (from Claude: a new ChatGPT chat, with optional `model` and `effort`, or an existing one with `thread_id`) or `"join"` (returns a code). `round_of`: after `[CHANGES REQUESTED]`, the link id of that round, to send the next round to the same reviewer; no `reviewer` needed. `thread_id` only picks the chat; it doesn't continue a review. |
+| `bridge_review` | Ask the other app for one review of `request`. `kind`: `"code"` (default) or `"plan"`. `paths`: the folders or files the work changed, git or not (default: the chat's folder; none for a plan); the request gives the reviewer a short status and the command to show the changes, and the reviewer reads them itself. `include_diff` also pastes the changes, for a reviewer that can't read the paths. `own_initiative`: in auto mode, a plan review the agent started on its own goes on once approved. `reviewer`: `"openai"` (from Claude: a new ChatGPT chat, with optional `model` and `effort`, or an existing one with `thread_id`) or `"join"` (returns a code). `round_of`: after `[CHANGES REQUESTED]`, the link id of that round, to send the next round to the same reviewer; no `reviewer` needed. `thread_id` only picks the chat; it doesn't continue a review. |
+| `bridge_auto` | Turn auto mode on or off (from Claude). `model`, `effort` or `thread_id` choose the reviewer chat; `paths` adds folders or files the work will change. |
 | `bridge_link` | Make this chat a primary whose every turn is reviewed. `advisor`: `"openai"` (from Claude) or `"join"`. |
 | `bridge_link_join` | Become the advisor or reviewer of a link, with its code. |
 | `bridge_advise` | Answer a review request: `request_id`, `decision` (`"approved"` or `"changes_requested"`), `note`, `blocking`, `nits`. |
@@ -196,7 +215,18 @@ primary chat ──Stop hook──▶ outbox ──▶ broker ──▶ advisor 
            [APPROVED] + nits: added to the user's next prompt
 ```
 
-- **Hooks.** When a turn starts, a `UserPromptSubmit` hook records the question and snapshots the working tree (`git stash create`, which touches no files or refs). When it ends, a `Stop` hook queues the question, the final answer and the turn's diff for review. Hooks never wait for the reviewer and never use the network.
+That is advisor mode. One-off reviews and auto mode work the other way round: the agent asks, and the reviewer reads the changes itself.
+
+```text
+agent ──bridge_review──▶ broker ──▶ reviewer chat ── reads the folders (git diff, files)
+  ▲   (request, paths, git commands)                      │
+  └──────────── [APPROVED] / [CHANGES REQUESTED] ◀────────┘ bridge_advise
+  Stop hook (auto mode): unapproved changes left? ask once for a review
+```
+
+- **Review requests.** The request carries the agent's own description, and for each path a short status, a stat and a ready read-only `git diff` command. Nothing is pasted unless the reviewer says it can't read the paths. The whole request has to fit one message: the file lists are dropped first, and if it still doesn't fit, the agent is told to split it.
+- **What an approval covers (auto mode).** When a review is asked for, the bridge records a fingerprint of the files under its paths: in git, the tracked and untracked files that aren't ignored; outside git, every file except `node_modules`; secret files left out in both. Changes to files it leaves out aren't caught. An approval covers that fingerprint, so a change made while the review ran stays unreviewed. Committing doesn't change the fingerprint, and the next review of the path compares from the commit that was approved.
+- **Hooks.** When a turn starts, a `UserPromptSubmit` hook records the question and snapshots the working tree (`git stash create`, which touches no files or refs). When it ends, a `Stop` hook queues the question, the final answer and the turn's diff for review. In auto mode the `Stop` hook also compares the tracked paths with what was approved, and if something is left, stops the turn once to say so. Hooks never wait for the reviewer and never use the network.
 - **Messages typed mid-turn.** Claude Code runs the prompt hook again, with the running turn's id, for a message you type while it works and for its own notices. These stay part of the running turn: the task and the diff baseline are kept, your message is added to the task, notices are left out, and none of them restarts the fix-loop count. A prompt without an id always starts a new turn.
 - **Broker.** A small local store shared by both apps' MCP servers: HTTP on `127.0.0.1` with a token, plus a state file. Hooks read the state file and drop requests into an outbox folder. The broker keeps the names of the requests it has applied, so a takeover doesn't apply one twice. If the process holding the broker exits, another server takes over within about 2 seconds.
 - **Waking ChatGPT.** The whole message is added to the thread's own queue through the app's bundled `codex app-server`, then `codex://threads/wake/<id>` makes the app run it, in the background if needed.
@@ -212,11 +242,11 @@ npm test
 
 | Test | Covers |
 |---|---|
-| `scripts/test-git.mjs` | Turn diffs: secret exclusion, repos without commits, untracked edits, size cap. |
+| `scripts/test-git.mjs` | Turn diffs (secret exclusion, repos without commits, untracked edits, size cap), review summaries and commands, and auto mode's fingerprint (edits, deletes, links, unreadable files, folders outside git). |
 | `scripts/test-codex.mjs` | Model choice for new ChatGPT threads: ids, picker names, unknown models and efforts refused. |
 | `scripts/test-platform.mjs` | Finding the apps' bundled CLIs. |
 | `scripts/smoke.mjs` | End to end over MCP: two real server processes, the hooks, a throwaway git repo. |
-| `scripts/test-link.mjs` | Links, reviews and rounds, the fix loop, hooks, rules, pruning, broker handover. |
+| `scripts/test-link.mjs` | Links, reviews and rounds, the fix loop, hooks, rules, auto mode's approvals and end-of-turn check, pruning, broker handover. |
 | `scripts/test-install.mjs` | Install, reinstall and uninstall against throwaway config folders. |
 | `scripts/test-doctor.mjs` | `doctor` on a missing install, untrusted Codex hooks, the rules file. |
 
@@ -225,7 +255,8 @@ Repository layout:
 - `src/server.mjs`: the MCP server and its tools.
 - `src/broker.mjs`: shared state, delivery, links and reviews.
 - `src/hook.mjs`: the hooks for both apps.
-- `src/git.mjs`: turn diffs. `src/codex.mjs`: ChatGPT thread driver. `src/caller.mjs`: caller identity.
+- `src/auto.mjs`: auto mode's instructions and end-of-turn message.
+- `src/git.mjs`: turn diffs, review summaries and fingerprints. `src/codex.mjs`: ChatGPT thread driver. `src/caller.mjs`: caller identity.
 - `src/rules.mjs`, `src/config.mjs`: your rules and settings. `src/platform.mjs`: OS paths and app launching.
 - `scripts/`: installer, `doctor`, tests, and debugging helpers (`send.mjs`, `codex-thread.mjs`).
 - `docs/notes/`: working notes (in Turkish) with the experiments and measurements behind the design.
