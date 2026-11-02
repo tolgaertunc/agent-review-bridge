@@ -1032,7 +1032,10 @@ class BrokerState {
       if (side === "claude") m.wokenAt = Math.max(m.wokenAt ?? 0, now);
     }
     logEvent({ op: "receive", side, endpoint, ids: out.map((m) => m.id) });
-    return { messages: out.map(({ id, from, kind, linkId, text, ts, plan, decision, lastRound }) => ({ id, from, kind, linkId, text, ts, plan, decision, lastRound })) };
+    // everything nextStep reads goes along, so the instruction is the same as in a wake
+    return {
+      messages: out.map(({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about }) => ({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about })),
+    };
   }
 }
 
