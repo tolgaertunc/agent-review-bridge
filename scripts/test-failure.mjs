@@ -400,6 +400,63 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   console.log("12 auto mode on again starts fresh; a late approval from before doesn't touch it");
 }
 
+// 13. a review that got no answer can be asked again with round_of: same
+// reviewer, same round number, with the reviewer's last real findings; the
+// notice says how; a retry is continued once only and keeps the plan gate
+{
+  const { nextStep } = await import("../src/broker.mjs");
+  const r1 = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Retry round one.", plan: true, noGate: true });
+  await call("advise", { endpoint: GPT, requestId: reqOf(r1.id).id, decision: "changes_requested", blocking: [{ title: "Order the steps." }] });
+  const info = await call("round_info", { primary: CLAUDE, roundOf: r1.id });
+  assert.equal(info.round, 2);
+  assert.match(info.previous.text, /Order the steps\./);
+  const r2 = await call("link_continue", { primary: CLAUDE, roundOf: r1.id, request: "Round two." });
+  const m2 = await until(() => reqOf(r2.id)?.watch?.clientId && reqOf(r2.id));
+  fake({ turns: { [m2.watch.clientId]: { state: "completed", completedAt: 1 } } });
+  const n = await until(() => failedFor(m2.id)[0]);
+  assert.match(nextStep(state().messages.find((x) => x.id === n.id)), new RegExp(`use bridge_review\\(round_of="${r2.id}"\\)`), "the notice says how to ask again");
+  fake({});
+  const again = await call("round_info", { primary: CLAUDE, roundOf: r2.id });
+  assert.equal(again.retry, true);
+  assert.equal(again.round, 2, "a retry keeps its round");
+  assert.equal(again.previous.linkId, r1.id, "the last real answer, from round one");
+  const r3 = await call("link_continue", { primary: CLAUDE, roundOf: r2.id, request: "Round two, again." });
+  assert.equal(r3.round, 2);
+  assert.equal(r3.retry, true);
+  assert.deepEqual(r3.advisor, GPT, "the same reviewer");
+  assert.match(reqOf(r3.id).text, new RegExp(`^Retry of round 2 of review ${r1.id}: the previous attempt \\(${r2.id}\\) got no answer\\.`));
+  assert.equal(reqOf(r3.id).plan, true);
+  assert.equal(state().links[r3.id].noGate, true, "the plan gate stays with the retry");
+  await assert.rejects(call("link_continue", { primary: CLAUDE, roundOf: r2.id, request: "twice" }), /already continued/);
+  await call("advise", { endpoint: GPT, requestId: reqOf(r3.id).id, decision: "approved" });
+  // a retry of a first round has no earlier answer
+  const f1 = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Lost first round." });
+  const mf = await until(() => reqOf(f1.id)?.watch?.clientId && reqOf(f1.id));
+  fake({ turns: { [mf.watch.clientId]: { state: "failed", completedAt: 1, error: { message: "limit" } } } });
+  await until(() => failedFor(mf.id)[0]);
+  fake({});
+  const first = await call("round_info", { primary: CLAUDE, roundOf: f1.id });
+  assert.deepEqual([first.round, first.retry, first.previous], [1, true, { none: true }]);
+  // at the round cap a retry is still allowed, a further round isn't
+  process.env.PEER_BRIDGE_MAX_ROUNDS = "2";
+  try {
+    const c1 = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Cap one." });
+    await call("advise", { endpoint: GPT, requestId: reqOf(c1.id).id, decision: "changes_requested", blocking: [{ title: "a" }] });
+    const c2 = await call("link_continue", { primary: CLAUDE, roundOf: c1.id, request: "Cap two." });
+    const mc = await until(() => reqOf(c2.id)?.watch?.clientId && reqOf(c2.id));
+    fake({ turns: { [mc.watch.clientId]: { state: "interrupted", completedAt: 1 } } });
+    await until(() => failedFor(mc.id)[0]);
+    fake({});
+    const c3 = await call("link_continue", { primary: CLAUDE, roundOf: c2.id, request: "Cap two, again." });
+    assert.equal(c3.round, 2, "a retry at the cap");
+    await call("advise", { endpoint: GPT, requestId: reqOf(c3.id).id, decision: "changes_requested", blocking: [{ title: "b" }] });
+    await assert.rejects(call("link_continue", { primary: CLAUDE, roundOf: c3.id, request: "Cap three." }), /rounds without approval/);
+  } finally {
+    delete process.env.PEER_BRIDGE_MAX_ROUNDS;
+  }
+  console.log("13 a review that got no answer is asked again with round_of: same reviewer and round, the last real findings, the plan gate kept, once only, allowed at the cap");
+}
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log("\nfailure tests passed");
 process.exit(0);

@@ -7,8 +7,9 @@
 // prompt  UserPromptSubmit: record the user's message for this turn's review
 //         request, and hand the advisor's pending nits to the model as
 //         additional context.
-// start   Claude only, SessionStart: in auto mode, the full rules again, since
-//         a compaction or a resumed session may have lost them.
+// start   Claude only, SessionStart: what a compaction or a resumed session
+//         may have lost: auto mode's full rules, and for a chat reviewing for
+//         another, the reviews still waiting for its answer with its role.
 // stopfail Claude only, StopFailure: an API error (a usage limit, an outage)
 //         ended the turn; whoever waits on a message it was woken for is told.
 // listen  Claude only, registered with asyncRewake on Stop and SessionStart:
@@ -22,7 +23,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { readState, activeLinks, writeOutbox, pendingFor, claudeWakeText, listenerFile, turnFile, DATA_DIR, MAX_DIFF } from "./broker.mjs";
+import { readState, activeLinks, writeOutbox, pendingFor, claudeWakeText, listenerFile, turnFile, DATA_DIR, MAX_DIFF, REVIEWER_ROLE } from "./broker.mjs";
 import { baseline, turnDiff, fingerprint } from "./git.mjs";
 import { autoFor, AUTO_RULES, AUTO_RULES_SHORT, AUTO_REMINDER, REMIND_AFTER, autoGuard } from "./auto.mjs";
 import { rulesBlock } from "./rules.mjs";
@@ -136,9 +137,23 @@ if (event === "stop") {
 }
 
 if (event === "start") {
-  if (app === "claude" && autoFor(readState(), endpoint)) {
-    await answer({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: AUTO_RULES } });
-    hookLog({ autoRules: input.source ?? null });
+  if (app !== "claude") process.exit(0);
+  const state = readState();
+  // review requests addressed to this chat on open one-off reviews, unanswered
+  const waiting = (state?.messages ?? []).filter(
+    (m) => m.kind === "review-request" && sameEndpoint(m.toEndpoint, endpoint) && !m.answeredAt && state.links?.[m.linkId]?.active && state.links[m.linkId].mode === "review",
+  );
+  const context = [
+    autoFor(state, endpoint) && AUTO_RULES,
+    waiting.length &&
+      `[PEER-BRIDGE] Reviews waiting for your answer: ${waiting.map((m) => `${m.id} from ${m.from} chat ${state.links[m.linkId].primary.id} (link ${m.linkId})`).join("; ")}. ` +
+        `If you lost one, read it again with bridge_receive and its id. ${REVIEWER_ROLE} Answer each once with bridge_advise (request_id = its id).`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  if (context) {
+    await answer({ hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context } });
+    hookLog({ start: input.source ?? null, waiting: waiting.map((m) => m.id) });
   }
   process.exit(0);
 }

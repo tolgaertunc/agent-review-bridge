@@ -110,6 +110,7 @@ assert.match(req, /\+export const parse = \(s\) => s\.split\(','\)\.map\(\(x\) =
 assert.match(req, /New untracked files:\nnotes\.md/);
 assert.doesNotMatch(req, /super-secret|\.env|secrets\//, "secret files must never be sent, not even by name");
 const reqId = req.match(/Review request (m\d+)/)[1];
+assert.doesNotMatch(req, /As the reviewer: read-only/, "advisor mode's requests are unchanged");
 assert.match(textOf(await call(openai, "bridge_receive", {}, asGpt(THREAD))), /^No unread peer messages\./, "a delivered message isn't handed out again");
 console.log("3 review request shown in full in the ChatGPT thread: question, answer, turn's diff; .env, .envrc, secrets/ left out");
 
@@ -125,6 +126,8 @@ console.log("4 concern delivered to the Claude primary; the advisor is told to s
 const rev = (await call(claude, "bridge_review", { reviewer: "join", request: "Is the trim change safe for quoted CSV?" })).structuredContent;
 assert.match(textOf(await call(openai, "bridge_link_join", { code: rev.joinCode }, asGpt(REVIEWER))), /Its request arrives as the next message/);
 const revReq = await deliveredTo(REVIEWER, /Is the trim change safe/);
+assert.match(revReq, /Is the trim change safe for quoted CSV\?\n\nAs the reviewer: read-only, don't change the project\. Answer once with bridge_advise/, "the role travels with each request");
+assert.doesNotMatch(revReq, /Your answer to the previous round|No earlier answer/, "a new review has no earlier answer");
 assert.match(revReq, /Is the trim change safe for quoted CSV\?/);
 assert.match(revReq, /Where the changes are: read them yourself/);
 assert.match(revReq, /Run each command whole \(the file lists can be cut short\)/, "the reviewer is told not to narrow a cut list");
@@ -156,6 +159,7 @@ console.log(`5a review ${again.id} continued in the earlier reviewer thread`);
 const planRev = (await call(claude, "bridge_review", { reviewer: "join", kind: "plan", request: "Plan: 1) add trim 2) add tests" })).structuredContent;
 assert.match(textOf(await call(openai, "bridge_link_join", { code: planRev.joinCode }, asGpt("gpt-thread-planner"))), /Joined plan review/);
 const planReq = await deliveredTo("gpt-thread-planner", /add trim/);
+assert.match(planReq, /As the reviewer: read-only/);
 assert.match(planReq, /^CLAUDE: Plan review request (m\d+)/);
 assert.match(planReq, /This is a plan, not finished work/);
 assert.doesNotMatch(planReq, /Where the changes are/, "a plan review names no paths by default");
@@ -192,6 +196,8 @@ console.log("5a3 plan gate kept when a plan result and a review request are read
 const round2 = (await call(claude, "bridge_review", { round_of: planRev.id, request: "Moved the tests first. Kept trim before tests: it's one line." })).structuredContent;
 assert.equal(round2.round, 2);
 const r2req = await deliveredTo("gpt-thread-planner", /Moved the tests first/);
+assert.match(r2req, /As the reviewer: read-only/);
+assert.match(r2req, new RegExp(`Your answer to the previous round \\(${planRev.id}\\):\\n\\[CHANGES REQUESTED\\]\\n\\nMust fix:\\n- Tests first\\.`), "the round carries the earlier findings");
 assert.match(r2req, new RegExp(`^CLAUDE: Plan review request m\\d+ \\(link ${round2.id}\\)\\n\\nRound 2 of review ${planRev.id}`));
 assert.match(r2req, /This is a plan, not finished work/);
 const again2 = await claude.callTool({ name: "bridge_review", arguments: { round_of: planRev.id, request: "twice" } });
@@ -389,10 +395,11 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   const w1 = (await call(claude, "bridge_review", { reviewer: "join", paths: [repo], request: "Where check one." })).structuredContent;
   await call(openai, "bridge_link_join", { code: w1.joinCode }, asGpt("gpt-where"));
   const wq1 = await deliveredTo("gpt-where", /Where check one\./);
-  await call(openai, "bridge_advise", { request_id: wq1.match(/Review request (m\d+)/)[1], decision: "changes_requested", blocking: [{ title: "z" }] }, asGpt("gpt-where"));
+  await call(openai, "bridge_advise", { request_id: wq1.match(/Review request (m\d+)/)[1], decision: "changes_requested", blocking: [{ title: "z", detail: "long ".repeat(800) }] }, asGpt("gpt-where"));
   const w2 = (await call(claude, "bridge_review", { round_of: w1.id, paths: [repo], request: "Where check two." })).structuredContent;
   assert.deepEqual(Object.keys(w2).sort(), ["advisor", "id", "plan", "round"], "a round's result fields");
   const wq2 = await deliveredTo("gpt-where", /Where check two\./);
+  assert.match(wq2, /Your answer to the previous round \(L\d+\):\n\[CHANGES REQUESTED\][\s\S]{2900,3000}\n… \(cut here: the rest isn't shown\. Don't assume points you can't see were resolved/, "a long earlier answer is capped, and says so");
   assert.equal(where(wq2), where(wq1));
   await call(openai, "bridge_advise", { request_id: wq2.match(/Review request (m\d+)/)[1], decision: "approved" }, asGpt("gpt-where"));
 
@@ -403,9 +410,9 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   await call(openai, "bridge_advise", { request_id: pq1.match(/Plan review request (m\d+)/)[1], decision: "changes_requested", blocking: [{ title: "w" }] }, asGpt("gpt-long"));
   const over = await claude.callTool({ name: "bridge_review", arguments: { round_of: p1.id, request: "y".repeat(36_000) } });
   assert.match(textOf(over), /^This review doesn't fit one message/);
-  await call(claude, "bridge_review", { round_of: p1.id, request: "y".repeat(35_400) + " END-OF-LONG-ROUND" });
+  await call(claude, "bridge_review", { round_of: p1.id, request: "y".repeat(34_800) + " END-OF-LONG-ROUND" });
   const pq2 = await deliveredTo("gpt-long", /END-OF-LONG-ROUND/);
-  assert.match(pq2, /END-OF-LONG-ROUND\n\nThis is a plan, not finished work/, "the round arrives uncut");
+  assert.match(pq2, /END-OF-LONG-ROUND\n\nAs the reviewer:[\s\S]*This is a plan, not finished work/, "the round arrives uncut");
   await call(openai, "bridge_advise", { request_id: pq2.match(/Plan review request (m\d+)/)[1], decision: "approved" }, asGpt("gpt-long"));
 
   // auto mode: a plan consulted on by the agent's own choice goes on, and its
