@@ -856,5 +856,36 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   console.log("32 status: open links and at most 5 closed in the last hour; older ones counted");
 }
 
+// 33. auto mode's rules: in full when a session starts again (a compaction may
+// have lost them), short but complete with each prompt; a deleted tracked
+// folder is named as gone, and its approved deletion ends the check
+{
+  const { fingerprint } = await import("../src/git.mjs");
+  const B = { app: "claude", id: "claude-rules" };
+  const R = { app: "openai", id: "gpt-rules" };
+  const gone = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-gone-"));
+  fs.writeFileSync(path.join(gone, "f.txt"), "x");
+  await call("auto_set", { endpoint: B, on: true, paths: [{ path: gone, fp: fingerprint(gone).hash, head: null }] });
+  const start = await runHook("claude", "start", { session_id: B.id, source: "compact" });
+  const ctx = JSON.parse(start.out).hookSpecificOutput;
+  assert.equal(ctx.hookEventName, "SessionStart");
+  assert.match(ctx.additionalContext, /Get its approval at the moments that matter, not at every small step/, "the full rules");
+  const prompt = await runHook("claude", "prompt", { session_id: B.id, prompt: "next step" });
+  const pctx = JSON.parse(prompt.out).hookSpecificOutput.additionalContext;
+  assert.match(pctx, /Auto mode is on: get the reviewer's approval \(bridge_review\) before settling or changing a direction/);
+  assert.match(pctx, /Pass own_initiative=true only for a plan you chose to consult on/);
+  assert.doesNotMatch(pctx, /not at every small step/, "not the full rules with every prompt");
+  // a deleted tracked folder
+  fs.rmSync(gone, { recursive: true, force: true });
+  const blocked = JSON.parse((await runHook("claude", "stop", { session_id: B.id })).out);
+  assert.match(blocked.reason, /peer-bridge-gone-\w+ \(no longer there\)/);
+  const l = await call("link_create", { primary: B, mode: "review", advisor: R, request: "deleted it", reqPaths: [{ path: gone, fp: fingerprint(gone).hash, head: null }] });
+  await call("advise", { endpoint: R, requestId: state().messages.find((m) => m.linkId === l.id).id, decision: "approved" });
+  assert.equal((await runHook("claude", "stop", { session_id: B.id })).out, "", "the approved deletion ends the check");
+  await call("auto_set", { endpoint: B, on: false });
+  assert.equal((await runHook("claude", "start", { session_id: B.id, source: "resume" })).out, "", "auto mode off: nothing at session start");
+  console.log("33 auto mode rules: in full at session start, short with each prompt; a deleted folder named as gone until its deletion is approved");
+}
+
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));
 process.exit(0);

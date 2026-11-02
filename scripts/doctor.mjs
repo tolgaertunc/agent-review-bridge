@@ -162,6 +162,7 @@ function runs(cmd, shell) {
     ["Stop", "listen", true],
     ["StopFailure", "stopfail", false],
     ["SessionStart", "listen", true],
+    ["SessionStart", "start", false],
     ["UserPromptSubmit", "prompt", false],
   ];
   for (const [event, kind, rewake] of want) {
