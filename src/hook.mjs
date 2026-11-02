@@ -7,6 +7,8 @@
 // prompt  UserPromptSubmit: record the user's message for this turn's review
 //         request, and hand the advisor's pending nits to the model as
 //         additional context.
+// stopfail Claude only, StopFailure: an API error (a usage limit, an outage)
+//         ended the turn; whoever waits on a message it was woken for is told.
 // listen  Claude only, registered with asyncRewake on Stop and SessionStart:
 //         waits in the background for a message addressed to this session and
 //         exits 2 to wake it. Re-armed by every Stop/SessionStart, so it
@@ -67,6 +69,12 @@ const guardFile = (endpoint) => turnFile(endpoint).replace(/\.json$/, ".auto-gua
 const advisedPrimary = (state) => activeLinks(state).find((l) => l.mode === "advisor" && sameEndpoint(l.primary, endpoint));
 // a review this chat asked for is still waiting for its answer
 const reviewPending = (state) => activeLinks(state).some((l) => l.mode === "review" && sameEndpoint(l.primary, endpoint));
+// this chat works through the bridge: linked, in auto mode, or sent a message
+// lately (a wake always comes from one, read from this same state file)
+const involved = (state) =>
+  !!autoFor(state, endpoint) ||
+  activeLinks(state).some((l) => sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint)) ||
+  (state?.messages ?? []).some((m) => sameEndpoint(m.toEndpoint, endpoint) && t0 - m.ts < 24 * 3600_000);
 
 // a JSON answer on stdout, flushed before exit (a piped stdout over 8 KB
 // would be cut off)
@@ -115,7 +123,18 @@ if (event === "stop") {
       fs.writeFileSync(guardFile(endpoint), JSON.stringify({ key, at: Date.now() }));
       await answer({ decision: "block", reason: autoGuard(unreviewed, unchecked) });
       hookLog({ autoGuard: unreviewed, unchecked, ms: Date.now() - t0 });
+      process.exit(0); // the turn goes on: it hasn't ended yet
     }
+  }
+  // the turn ended normally: what woke it was handled (time of this hook)
+  if (app === "claude" && involved(state)) writeOutbox("turn_ok", { endpoint, at: t0 });
+  process.exit(0);
+}
+
+if (event === "stopfail") {
+  if (app === "claude" && involved(readState())) {
+    writeOutbox("turn_failed", { endpoint, at: t0, error: input.error ?? null, details: input.error_details ?? null });
+    hookLog({ failed: input.error ?? null });
   }
   process.exit(0);
 }
@@ -210,7 +229,7 @@ if (event === "listen") {
       // asynchronous on macOS and Linux, so a long wake could be cut off),
       // and only then marked read
       await new Promise((resolve) => process.stderr.write(pending.map(claudeWakeText).join("\n\n"), resolve));
-      writeOutbox("wake_ack", { ids: pending.map((m) => m.id) });
+      writeOutbox("wake_ack", { ids: pending.map((m) => m.id), at: Date.now() });
       hookLog({ woke: pending.map((m) => m.id) });
       process.exit(2);
     }

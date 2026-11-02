@@ -160,6 +160,7 @@ function runs(cmd, shell) {
   const want = [
     ["Stop", "stop", false],
     ["Stop", "listen", true],
+    ["StopFailure", "stopfail", false],
     ["SessionStart", "listen", true],
     ["UserPromptSubmit", "prompt", false],
   ];

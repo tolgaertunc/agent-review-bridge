@@ -48,7 +48,7 @@ console.log(`doctor 1 nothing installed: ${d.report.fails} problems reported, ex
 // present but untrusted in this fresh CODEX_HOME, which doctor must flag
 execFileSync(process.execPath, [path.resolve(import.meta.dirname, "install.mjs")], { env, stdio: "ignore" });
 d = doctor();
-for (const n of ["MCP server", "tool permission", "Stop hook (stop)", "Stop hook (listen)", "SessionStart hook (listen)", "UserPromptSubmit hook (prompt)"])
+for (const n of ["MCP server", "tool permission", "Stop hook (stop)", "Stop hook (listen)", "StopFailure hook (stopfail)", "SessionStart hook (listen)", "UserPromptSubmit hook (prompt)"])
   assert.equal(d.get("Claude Code", n).status, "ok", `Claude Code ${n}: ${d.get("Claude Code", n).detail}`);
 assert.equal(d.get("ChatGPT Desktop", "MCP server").status, "ok");
 assert.equal(d.get("ChatGPT Desktop", "tool approval").status, "ok");

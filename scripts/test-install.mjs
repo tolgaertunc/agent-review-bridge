@@ -37,6 +37,7 @@ assert.equal(claude.Stop.filter(ours).length, 2);
 assert.ok(claude.Stop.some((h) => h.command === "echo other"));
 assert.ok(claude.Stop.find((h) => h.command.includes("--event listen")).asyncRewake);
 assert.equal(claude.SessionStart.filter(ours).length, 1);
+assert.ok(claude.StopFailure.filter(ours).length === 1 && claude.StopFailure[0].command.includes("--event stopfail"));
 assert.equal(claude.UserPromptSubmit.filter(ours).length, 1);
 assert.equal(codex.Stop.length, 1, "legacy blocking hook replaced");
 assert.ok(codex.Stop[0].command.includes("--event stop"));

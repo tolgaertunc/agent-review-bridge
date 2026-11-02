@@ -94,6 +94,29 @@ const OPEN_ARGS = {
 
 const MODEL_CHOICE = "a model or effort ChatGPT doesn't offer is refused with the list of what it does";
 
+const when = (ms) => new Date(ms).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+
+// ChatGPT's usage limits, or "unknown" when they can't be read in time
+async function chatgptLimits() {
+  try {
+    const { readLimits } = await import("./codex.mjs");
+    return await readLimits();
+  } catch {
+    return "unknown";
+  }
+}
+
+// Before a review goes to ChatGPT: a request it can't run would never be
+// answered. Unknown limits don't stop it.
+async function chatgptBlocked() {
+  const l = await chatgptLimits();
+  if (!l?.blocked) return null;
+  return text(
+    `Nothing was sent: ChatGPT's usage limit is reached${l.resetsAt ? ` until ${when(l.resetsAt)}` : ""}. ` +
+      "Tell the user; ask again after that, or once they have added credits.",
+  );
+}
+
 // A new ChatGPT thread, read-only: it reviews, it doesn't touch the project
 async function newThread({ model, effort, name, seed }) {
   const { createThread, ModelChoiceError } = await import("./codex.mjs");
@@ -128,7 +151,12 @@ server.registerTool(
     const stop = await reach(target.to, { open, remember });
     if (stop) return stop;
     const r = await call("send", { endpoint, text: t, linkId: target.linkId, replyTo: reply_to });
-    return text(`Sent ${r.id} to ${r.to.app} chat ${r.to.id} (link ${r.linkId}). The user can't see tool calls: write what you sent in your reply.`, r);
+    const f = r.lastFailure;
+    return text(
+      `Sent ${r.id} to ${r.to.app} chat ${r.to.id} (link ${r.linkId}). The user can't see tool calls: write what you sent in your reply.` +
+        (f ? ` Note: that chat's last turn, at ${when(f.at)}, ended with an error (${f.error}${f.details ? `: ${f.details}` : ""}); it may not answer until it recovers.` : ""),
+      r,
+    );
   },
 );
 
@@ -401,7 +429,7 @@ server.registerTool(
       // the round's kind comes from the earlier one; the broker refuses a mismatch
       const info = await call("round_info", { primary, roundOf: round_of });
       // checked before the round is used up
-      const stop = await reach(info.advisor, { open, remember });
+      const stop = (await reach(info.advisor, { open, remember })) ?? (info.advisor.app === "openai" ? await chatgptBlocked() : null);
       if (stop) return stop;
       const plan = kind ? kind === "plan" : info.plan;
       const req = reviewRequest({ request, plan, paths, includeDiff: include_diff, extra, auto });
@@ -427,7 +455,7 @@ server.registerTool(
       return withRules(`${what} ${r.id} is waiting for a reviewer. In the chat that should review (either app), ask it to call bridge_link_join with code ${r.joinCode}.`, r);
     }
     // before a thread or link is made
-    const stop = await reach({ app: "openai", id: thread_id ?? null }, { open, remember });
+    const stop = (await reach({ app: "openai", id: thread_id ?? null }, { open, remember })) ?? (await chatgptBlocked());
     if (stop) return stop;
     let threadId = thread_id;
     if (!threadId) {
@@ -561,7 +589,8 @@ server.registerTool(
   "bridge_status",
   {
     title: "Bridge status",
-    description: "Show this chat's links (role, other chat, health, whether Claude sides are listening), pending notes and unread messages.",
+    description:
+      "Show this chat's open links and up to 5 closed in the last hour (role, other chat, health, whether Claude sides are listening), pending notes, unread messages, ChatGPT's usage limits, and the last observed failure of linked chats.",
     inputSchema: {},
     annotations: READ_ONLY,
   },
@@ -569,7 +598,7 @@ server.registerTool(
     const caller = await identify(SIDE, extra);
     const endpoint = await self(extra);
     await call("report", { side: SIDE, event: "caller", data: { tool: "bridge_status", ...caller } });
-    return text(JSON.stringify({ chat: endpoint, ...(await call("status", { endpoint })), server: serverInfo, caller }, null, 2));
+    return text(JSON.stringify({ chat: endpoint, ...(await call("status", { endpoint })), chatgptLimits: await chatgptLimits(), server: serverInfo, caller }, null, 2));
   },
 );
 

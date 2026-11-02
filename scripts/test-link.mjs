@@ -837,5 +837,24 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   }
 }
 
+// 32. status lists open links and the few closed in the last hour; older
+// ones are only counted, and internal fields stay out
+{
+  const S = { app: "claude", id: "claude-status" };
+  const ids = [];
+  for (let i = 0; i < 8; i++) {
+    const { id } = await call("link_create", { primary: S, mode: "review", request: `r${i}`, reqPaths: [{ path: "/x", fp: "f", head: "h" }] });
+    ids.push(id);
+  }
+  for (const id of ids.slice(0, 7)) await call("link_close", { linkId: id });
+  const st = await call("status", { endpoint: S });
+  assert.equal(st.links.filter((l) => l.active).length, 1, "the open one");
+  assert.equal(st.links.filter((l) => !l.active).length, 5, "at most 5 recently closed");
+  assert.equal(st.olderLinks, 2, "the rest counted");
+  assert.ok(st.links.every((l) => !("reqPaths" in l) && !("request" in l)));
+  await call("link_close", { linkId: ids[7] });
+  console.log("32 status: open links and at most 5 closed in the last hour; older ones counted");
+}
+
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));
 process.exit(0);

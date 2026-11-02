@@ -343,6 +343,20 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   console.log(`5f a 9-folder request fits one message with every command (${big.length} chars); 40 folders are refused`);
 }
 
+// 5g. ChatGPT's usage limit reached: nothing is sent, and the agent hears
+// when it opens again; status shows the limits
+{
+  const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+  fs.writeFileSync(path.join(dir, "fake-codex.json"), JSON.stringify({ limits: { ordinaryUsageAllowed: false, rateLimits: { primary: { usedPercent: 100, resetsAt }, credits: { hasCredits: false } } } }));
+  const before = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8")).messages.length;
+  const refused = await claude.callTool({ name: "bridge_review", arguments: { reviewer: "openai", thread_id: "gpt-limit", request: "Limit check." } });
+  assert.match(textOf(refused), /Nothing was sent: ChatGPT's usage limit is reached until .+\. Tell the user/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8")).messages.length, before, "nothing queued");
+  assert.equal(JSON.parse(textOf(await claude.callTool({ name: "bridge_status", arguments: {} }))).chatgptLimits.blocked, true);
+  fs.rmSync(path.join(dir, "fake-codex.json"));
+  console.log("5g ChatGPT's usage limit reached: the review isn't sent and the agent is told when it opens; status shows it");
+}
+
 // 6. status from the ChatGPT side knows its own chat; unlink ends reviews
 const gptStatus = JSON.parse(textOf(await call(openai, "bridge_status", {}, asGpt(THREAD))));
 assert.equal(gptStatus.chat.id, THREAD);

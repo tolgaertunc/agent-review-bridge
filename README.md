@@ -124,7 +124,7 @@ Auto mode is for working with a second model throughout, without reviewing every
 - **A gentle reminder** after five of your messages without a review, if nothing is waiting.
 - **Plans:** a plan review the agent starts on its own in auto mode goes on once the reviewer approves it. A plan review you asked for still waits for your approval. This is an instruction to the agent, not a lock.
 
-The work can span several folders or files, git or not, for example an iOS repo and then the same feature in the Android repo from the same chat. Each review names them, and the end-of-turn check covers every folder or file named in a review or when auto mode was turned on. A folder the agent never names isn't checked. Say "auto mode off" to stop.
+The work can span several folders or files, git or not, for example an iOS repo and then the same feature in the Android repo from the same chat. Each review names them, and the end-of-turn check covers every folder or file named in a review or when auto mode was turned on. A folder the agent never names isn't checked. Say "auto mode off" to stop; turning it on again starts fresh, with a new reviewer chat.
 
 ## Your rules
 
@@ -177,6 +177,7 @@ Other settings, read by the bridge's processes: `PEER_BRIDGE_CLAUDE_BIN` (Claude
 ## Known limits
 
 - A Claude Code session can only be woken while it is open in Claude Desktop; messages for a closed one wait until it opens.
+- After an API error ends a Claude turn, its listener isn't armed again until the next turn or session start, so once its limit resets, a waiting message arrives with your next prompt. The bridge knows when Claude's limit resets only if Claude's error message says so.
 - A Claude session's listener runs for up to 12 hours at a time; each turn or session start arms it again.
 - A ChatGPT thread runs the bridge's messages as prompts, and the bridge recognises its own by their text (if the app changes line endings or spacing, the message's first line and its fixed last line still identify it). If you paste one verbatim before the bridge's own turn for it runs, only the fix-loop count restarts.
 - On macOS, ChatGPT as the primary with a Claude advisor hasn't been verified yet.
@@ -199,7 +200,7 @@ The bridge's MCP tools, for agents. You normally don't call them yourself.
 | `bridge_advise` | Answer a review request: `request_id`, `decision` (`"approved"` or `"changes_requested"`), `note`, `blocking`, `nits`. |
 | `bridge_receive` | Read messages that are still unread, or one again by `id`. Messages normally arrive in full without it. |
 | `bridge_send` | Send a free-form message to the chat on the other end of this chat's latest link. With `reply_to` (a message id) the answer goes to that message's sender, on its own link. |
-| `bridge_status` | This chat's links, their health, and whether Claude sessions are listening. |
+| `bridge_status` | This chat's open links and up to 5 closed in the last hour (older ones are only counted), their health, whether Claude sessions are listening, ChatGPT's usage limits, and the last observed failure of linked chats. |
 | `bridge_unlink` | Close this chat's links. |
 
 `bridge_review`, `bridge_link` and `bridge_send` also take `open` and `remember`, used only after the user agreed to open a closed app.
@@ -233,6 +234,7 @@ agent ──bridge_review──▶ broker ──▶ reviewer chat ── reads t
 - **Waking Claude Code.** A background hook (`asyncRewake`) waits for messages for its session and wakes it with the whole message, in the same format a ChatGPT thread gets. It re-arms on every turn and session start. If a wake ever looks cut off, `bridge_receive` with the message's id returns it in full.
 - **Identity.** The bridge learns which chat is calling from the host, never from the model's memory: `CLAUDE_CODE_SESSION_ID` on the Claude side, `_meta.threadId` on the ChatGPT side. Context compaction can't break a link.
 - **Problems are visible.** A failed delivery or a Claude session that isn't listening shows up in the waiting chat's next prompt and in `bridge_status`.
+- **When no answer is coming.** Before a review goes to ChatGPT, the bridge checks its usage limit: if it's reached, nothing is sent and the agent hears when it opens again. After a review request or a message is queued in a ChatGPT thread, the bridge follows that exact turn (by an id it gives the prompt): early checks, then every 5 minutes, for up to 6 hours. If the turn fails (a usage limit, an outage) or ends without the review answer, the waiting chat is woken and told; past 6 hours it hears that no answer was confirmed. On the Claude side a `StopFailure` hook does the same when an API error (Claude's own limit, an outage) ends a turn the bridge woke it for. Each case is told once, an answer that already arrived stays, and `bridge_status` shows ChatGPT's limits and the last observed failure of linked chats. Advisor mode doesn't do this yet.
 
 ## Development
 
@@ -247,6 +249,7 @@ npm test
 | `scripts/test-platform.mjs` | Finding the apps' bundled CLIs. |
 | `scripts/smoke.mjs` | End to end over MCP: two real server processes, the hooks, a throwaway git repo. |
 | `scripts/test-link.mjs` | Links, reviews and rounds, the fix loop, hooks, rules, auto mode's approvals and end-of-turn check, pruning, broker handover. |
+| `scripts/test-failure.mjs` | When no answer is coming: failed ChatGPT turns and the 6-hour watch, Claude's `StopFailure`, usage limits, time-limited app-server calls, auto mode's fresh start. |
 | `scripts/test-install.mjs` | Install, reinstall and uninstall against throwaway config folders. |
 | `scripts/test-doctor.mjs` | `doctor` on a missing install, untrusted Codex hooks, the rules file. |
 

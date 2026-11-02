@@ -11,7 +11,8 @@
 // - Hooks in both apps (src/hook.mjs): a Stop hook that queues each turn of a
 //   linked primary for review without blocking, a UserPromptSubmit hook that
 //   hands over the advisor's nits, and on Claude a background listener that
-//   wakes the session when something arrives for it.
+//   wakes the session when something arrives for it, and a StopFailure hook
+//   that tells whoever waits when an API error (a usage limit) ends a turn.
 // - Cleans up what older versions registered: the Claude Desktop config entry
 //   and the blocking Codex Stop hook.
 
@@ -78,6 +79,8 @@ const quick = (app, event) => ({
 const claudeListener = { type: "command", command: hookCmd("claude", "listen"), asyncRewake: true, timeout: 12 * 3600 };
 const CLAUDE_HOOKS = {
   Stop: [quick("claude", "stop"), claudeListener],
+  // an API error (a usage limit) ended the turn: whoever waits is told
+  StopFailure: [quick("claude", "stopfail")],
   SessionStart: [claudeListener],
   UserPromptSubmit: [quick("claude", "prompt")],
 };

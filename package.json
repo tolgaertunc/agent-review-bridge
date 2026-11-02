@@ -10,7 +10,7 @@
     "test:git": "node scripts/test-git.mjs",
     "test:link": "node scripts/test-link.mjs",
     "test:install": "node scripts/test-install.mjs",
-    "test": "node scripts/test-git.mjs && node scripts/test-platform.mjs && node scripts/test-codex.mjs && node scripts/smoke.mjs && node scripts/test-link.mjs && node scripts/test-install.mjs && node scripts/test-doctor.mjs",
+    "test": "node scripts/test-git.mjs && node scripts/test-platform.mjs && node scripts/test-codex.mjs && node scripts/smoke.mjs && node scripts/test-link.mjs && node scripts/test-failure.mjs && node scripts/test-install.mjs && node scripts/test-doctor.mjs",
     "test:doctor": "node scripts/test-doctor.mjs",
     "test:platform": "node scripts/test-platform.mjs",
     "test:codex": "node scripts/test-codex.mjs"
