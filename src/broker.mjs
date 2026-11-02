@@ -32,7 +32,7 @@ export const PROTOCOL = Number(process.env.PEER_BRIDGE_TEST_PROTOCOL || 14);
 export const SIDES = ["claude", "openai"];
 // Claude Desktop's session ids, as claude://code/continue?session= accepts them
 export const HOST_ID = /^local_[A-Za-z0-9-]{1,64}$/;
-const MAX_TEXT = 40_000;
+export const MAX_TEXT = 40_000;
 const MAX_PROMPT = 6_000;
 // Claude Code's notice that a background task finished, delivered through
 // UserPromptSubmit like a prompt (measured)
@@ -668,7 +668,7 @@ class BrokerState {
     const id = "L" + ++this.s.linkSeq;
     const link = { id, mode, name: name ?? null, active: true, createdAt: Date.now(), primary, advisor: advisor ?? null, reviews: 0, advisories: [] };
     if (!advisor) link.joinCode = crypto.randomBytes(3).toString("hex");
-    if (request) link.request = request.slice(0, MAX_TEXT - 500);
+    if (request) link.request = request;
     if (mode === "review") {
       link.round = 1;
       if (plan) link.plan = true; // a plan to review, not code
@@ -697,7 +697,7 @@ class BrokerState {
   // the one request of a "review" link, once its reviewer is known
   sendReviewRequest(link) {
     if (link.mode !== "review" || !link.request || !link.advisor) return;
-    this.post({ from: link.primary.app, toEndpoint: link.advisor, kind: "review-request", linkId: link.id, text: link.request, plan: link.plan });
+    this.post({ from: link.primary.app, toEndpoint: link.advisor, kind: "review-request", linkId: link.id, text: link.request });
     this.consulted(link.primary);
     delete link.request;
   }
@@ -737,7 +737,7 @@ class BrokerState {
     if (prev.noGate) link.noGate = true;
     if (reqPaths?.length) link.reqPaths = reqPaths;
     link.autoSince = this.autoSession(primary);
-    link.request = `${heading}\n\n${request}`.slice(0, MAX_TEXT - 500);
+    link.request = `${heading}\n\n${request}`;
     this.s.links[id] = link;
     this.registerPaths(primary, reqPaths);
     logEvent({ op: "link_continue", id, roundOf, round });
@@ -867,7 +867,7 @@ class BrokerState {
       const lastRound = decision === "changes_requested" && (link.round ?? 1) >= MAX_ROUNDS();
       Object.assign(link, { active: false, closedAt: Date.now(), decision });
       if (decision === "approved" && !link.plan) this.approvePaths(link);
-      const r = this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "review-result", linkId: link.id, text, plan: link.plan, decision, lastRound, noGate: link.noGate });
+      const r = this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "review-result", linkId: link.id, text, decision, lastRound });
       return { delivered: "now", text, ...r };
     }
     // an answer to a request from before the user's latest prompt no longer
@@ -952,9 +952,13 @@ class BrokerState {
     return { ok: true };
   }
 
-  post({ from, toEndpoint, kind, linkId, text, plan, decision, lastRound, generation, noGate, about }) {
+  post({ from, toEndpoint, kind, linkId, text, decision, lastRound, generation, about }) {
     const msg = { id: "m" + ++this.s.seq, from, to: toEndpoint.app, toEndpoint, kind, linkId, text: text.slice(0, MAX_TEXT), ts: Date.now(), readAt: null };
-    Object.assign(msg, plan && { plan: true }, plan && noGate && { noGate: true }, decision && { decision }, lastRound && { lastRound: true }, generation !== undefined && { generation }, about && { about });
+    // a review's request and result say whether it is a plan, and whether
+    // its plan waits for the user, as its link decided (each message is
+    // rendered on its own later, by the hooks too)
+    const link = ["review-request", "review-result"].includes(kind) ? this.s.links[linkId] : null;
+    Object.assign(msg, link?.plan && { plan: true }, link?.plan && link.noGate && { noGate: true }, decision && { decision }, lastRound && { lastRound: true }, generation !== undefined && { generation }, about && { about });
     this.s.messages.push(msg);
     logEvent({ op: "send", id: msg.id, from, to: toEndpoint, kind, linkId, len: msg.text.length });
     return { id: msg.id };
