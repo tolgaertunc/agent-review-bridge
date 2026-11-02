@@ -280,10 +280,9 @@ function reviewRequest({ request, plan, paths, includeDiff, extra, auto }) {
   const compose = ({ diffs, lists }) => {
     const where =
       sections.length &&
-      "Where the changes are: read them yourself with the commands below, from these paths only, file by file if they are large. " +
-        "Run each command whole first: the file lists can be cut short, so narrowing a command to the files listed can miss changes. " +
-        "Don't open files that look like secrets (.env and .env.*, keys, certificates, credentials); they are left out of the lists and commands on purpose. " +
-        "If you can't read a path, say so in your answer: the requester will then send the changes as text.\n\n" +
+      "Where the changes are: read them yourself with the commands below, from these paths only. Run each command whole (the file lists can be cut short). " +
+        "Don't open secret files (.env*, keys, certificates, credentials); they're left out on purpose. " +
+        "If you can't read a path, say so: the requester will send the changes as text.\n\n" +
         (focus.length ? `Focus on ${focus.join(", ")}; the rest of the folder's changes are listed too, since an approval covers them.\n\n` : "") +
         (lists ? "" : "(The file lists are left out to fit one message; the commands show everything.)\n\n") +
         sections.map((x) => [x.head, lists && x.list, x.how, x.command, diffs && x.diff].filter(Boolean).join("\n")).join("\n\n");
@@ -382,8 +381,7 @@ const WAIT = "Wait for the answer, and don't change the files under the review's
 // What a plan is reviewed for, sent with the plan (the reviewer thread may be
 // one that was briefed for code)
 const PLAN_GUIDE =
-  "This is a plan, not finished work: review it before anything is built. Check that it reaches the stated goal, " +
-  "missing or wrongly ordered steps, risks and what could break, simpler alternatives, scope creep, and how the result will be checked.";
+  "This is a plan, not finished work: check it reaches the goal; missing or misordered steps; risks; simpler options; scope creep; how the result will be checked.";
 
 function codexTurnCwd(extra) {
   let m = extra?._meta?.["x-codex-turn-metadata"];

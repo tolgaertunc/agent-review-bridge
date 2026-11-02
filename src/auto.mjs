@@ -8,7 +8,8 @@ export const REMIND_AFTER = 5;
 export const autoKey = (endpoint) => `${endpoint.app}:${endpoint.id}`;
 export const autoFor = (state, endpoint) => (endpoint && state?.auto?.[autoKey(endpoint)]?.on ? state.auto[autoKey(endpoint)] : null);
 
-// To the working agent, with each prompt while auto mode is on
+// To the working agent in full when auto mode is turned on and whenever its
+// session starts again (a compaction may have summarised them away)
 export const AUTO_RULES =
   "[PEER-BRIDGE] Auto mode is on: you work with a second model as your reviewer (bridge_review; it reuses the same reviewer chat). " +
   "Get its approval at the moments that matter, not at every small step, and never move past one of these without it:\n" +
@@ -24,10 +25,16 @@ export const AUTO_RULES =
   "While a review runs, don't change the files under its paths. For a plan you consult on by your own choice, pass own_initiative=true and go on once it's approved; " +
   "if the user asked for the plan review, or you're not sure, leave it out: then you show the user the plan and wait for their approval.";
 
+// With each prompt in between: short, but complete on its own
+export const AUTO_RULES_SHORT =
+  "[PEER-BRIDGE] Auto mode is on: get the reviewer's approval (bridge_review) before settling or changing a direction, when a step is done and before committing it, " +
+  "on an uncertainty a short look doesn't resolve, before push, deleting data or migrations (the user's permission is still needed), and before saying the work is done. " +
+  "Name every path you changed in `paths`. Pass own_initiative=true only for a plan you chose to consult on; not if the user asked for that review or you're not sure.";
+
 // Added to review requests while the requester is in auto mode
 export const AUTO_REVIEWER =
-  "Auto mode: review the work against its goal and anything agreed so far. Besides the code, say so if the direction, the plan or the scope looks wrong, " +
-  "or if the change goes beyond what was agreed. Don't ask for a plan when the work doesn't need one. If this adapts work already approved in another path, check that it is consistent with it.";
+  "Auto mode: judge the work against its goal and what was agreed, and say if the direction, plan or scope looks wrong or goes beyond it. " +
+  "Don't ask for a plan the work doesn't need. If this adapts work approved in another path, check it's consistent.";
 
 export const AUTO_REMINDER =
   "[PEER-BRIDGE] For your information: you haven't consulted the reviewer for a few turns. If a decision or a change since then calls for it, ask now; if not, carry on.";

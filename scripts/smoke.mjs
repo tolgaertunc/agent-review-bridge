@@ -127,7 +127,8 @@ assert.match(textOf(await call(openai, "bridge_link_join", { code: rev.joinCode 
 const revReq = await deliveredTo(REVIEWER, /Is the trim change safe/);
 assert.match(revReq, /Is the trim change safe for quoted CSV\?/);
 assert.match(revReq, /Where the changes are: read them yourself/);
-assert.match(revReq, /Run each command whole first/, "the reviewer is told not to narrow a cut list");
+assert.match(revReq, /Run each command whole \(the file lists can be cut short\)/, "the reviewer is told not to narrow a cut list");
+assert.match(revReq, /Don't open secret files/);
 assert.match(revReq, /\(git: uncommitted changes against HEAD\)/);
 assert.match(revReq, /git -C '.*' diff --no-ext-diff --no-textconv [0-9a-f]+ -- '\.'/);
 assert.match(revReq, /parser\.js/);
@@ -299,7 +300,7 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   const r1 = (await call(autoClaude, "bridge_review", { request: "Goal: trim fields. Step: parse trims." })).structuredContent;
   assert.equal(r1.threadId, "gpt-auto-reviewer", "auto mode picks its reviewer chat");
   const q = await deliveredTo("gpt-auto-reviewer", /Goal: trim fields/);
-  assert.match(q, /Auto mode: review the work against its goal/);
+  assert.match(q, /Auto mode: judge the work against its goal/);
   assert.match(q, /Where the changes are/);
   await call(openai, "bridge_advise", { request_id: q.match(/Review request (m\d+)/)[1], decision: "approved" }, asGpt("gpt-auto-reviewer"));
   const approved = JSON.parse(textOf(await call(autoClaude, "bridge_status"))).auto;

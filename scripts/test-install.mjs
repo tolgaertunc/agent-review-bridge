@@ -36,7 +36,8 @@ assert.deepEqual(read(path.join(claudeDir, "settings.json")).permissions.allow, 
 assert.equal(claude.Stop.filter(ours).length, 2);
 assert.ok(claude.Stop.some((h) => h.command === "echo other"));
 assert.ok(claude.Stop.find((h) => h.command.includes("--event listen")).asyncRewake);
-assert.equal(claude.SessionStart.filter(ours).length, 1);
+assert.equal(claude.SessionStart.filter(ours).length, 2, "the listener and the auto mode rules");
+assert.ok(claude.SessionStart.some((h) => h.command.includes("--event start") && !h.asyncRewake));
 assert.ok(claude.StopFailure.filter(ours).length === 1 && claude.StopFailure[0].command.includes("--event stopfail"));
 assert.equal(claude.UserPromptSubmit.filter(ours).length, 1);
 assert.equal(codex.Stop.length, 1, "legacy blocking hook replaced");
