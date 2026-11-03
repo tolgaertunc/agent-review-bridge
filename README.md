@@ -263,7 +263,6 @@ Repository layout:
 - `src/git.mjs`: turn diffs, review summaries and fingerprints. `src/codex.mjs`: ChatGPT thread driver. `src/caller.mjs`: caller identity.
 - `src/rules.mjs`, `src/config.mjs`: your rules and settings. `src/platform.mjs`: OS paths and app launching.
 - `scripts/`: installer, `doctor`, tests, and debugging helpers (`send.mjs`, `codex-thread.mjs`).
-- `docs/notes/`: working notes (in Turkish) with the experiments and measurements behind the design.
 
 ## License
 

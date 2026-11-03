@@ -1,5 +1,5 @@
 // Drive ChatGPT Desktop threads through the app's own queue (experimental,
-// undocumented; see docs/notes/lab-notebook.tr.md, Q1/Q2). A private
+// undocumented, measured on the app itself). A private
 // `codex app-server` started from the app's bundled CLI shares the app's
 // state (threads, queue). Prompts are
 // queued from that process and the desktop app runs them:
