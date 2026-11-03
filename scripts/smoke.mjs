@@ -340,7 +340,9 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   const big = await deliveredTo("gpt-many", /Nine folders\./);
   assert.ok(big.length < 40_000, `fits one message (${big.length})`);
   assert.match(big, /The file lists are left out to fit one message/);
-  for (const d of nine) assert.ok(big.includes(`-C '${fs.realpathSync(d)}' diff`), `command for ${d}`); // git gives the real path
+  // git gives the real path, with forward slashes on Windows too
+  const gitPath = (d) => fs.realpathSync(d).split(path.sep).join("/");
+  for (const d of nine) assert.ok(big.includes(`-C '${gitPath(d)}' diff`), `command for ${d}`);
   // each path's scope line and command alone take over 1,000 characters, so
   // 40 of them can't fit the 36,000 a request may take
   const forty = many(40);

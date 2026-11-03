@@ -139,14 +139,26 @@ function repo({ commit = true } = {}) {
   r.write("c.js", "c\n");
   const f3 = fp();
   assert.notEqual(f3, f2, "a new file changes it");
-  fs.chmodSync(path.join(r.d, "c.js"), 0o755);
-  const f4 = fp();
-  assert.notEqual(f4, f3, "the executable bit changes it");
-  fs.symlinkSync("a.js", path.join(r.d, "link"));
+  // Windows files have no executable bit (chmod only sets read-only)
+  if (process.platform !== "win32") {
+    fs.chmodSync(path.join(r.d, "c.js"), 0o755);
+    assert.notEqual(fp(), f3, "the executable bit changes it");
+  }
+  // a file symlink needs Developer Mode or admin rights on Windows
+  let symlinks = true;
+  try {
+    fs.symlinkSync("a.js", path.join(r.d, "link"));
+  } catch (e) {
+    if (process.platform !== "win32" || e.code !== "EPERM") throw e;
+    symlinks = false;
+  }
+  if (symlinks) {
+    const toA = fp();
+    fs.rmSync(path.join(r.d, "link"));
+    fs.symlinkSync("b.js", path.join(r.d, "link"));
+    assert.notEqual(fp(), toA, "a symlink's target changes it");
+  }
   const f5 = fp();
-  fs.rmSync(path.join(r.d, "link"));
-  fs.symlinkSync("b.js", path.join(r.d, "link"));
-  assert.notEqual(fp(), f5, "a symlink's target changes it");
   r.git("add", ".");
   r.git("commit", "-qm", "all");
   fs.rmSync(path.join(r.d, "a.js"));
@@ -207,7 +219,11 @@ function repo({ commit = true } = {}) {
   } finally {
     fs.rmSync(links, { recursive: true, force: true });
   }
-  console.log("git 6 fingerprint: content-based, committed deletes and secrets don't count, index flags can't hide edits, unreadable files fail visibly, plain folders and folder links too");
+  console.log(
+    "git 6 fingerprint: content-based, committed deletes and secrets don't count, index flags can't hide edits, unreadable files fail visibly, plain folders and folder links too" +
+      (process.platform === "win32" ? " (Windows: no executable bit to check)" : "") +
+      (symlinks ? "" : " (file symlinks not allowed here: their check skipped)"),
+  );
 }
 
 // a base that left HEAD's history isn't used
