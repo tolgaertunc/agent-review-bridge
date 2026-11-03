@@ -688,10 +688,17 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   const P = { app: "claude", id: "claude-mid-turn" };
   const l = await call("link_create", { primary: P, advisor: { app: "openai", id: "gpt-mid-turn" } });
   const link = () => state().links[l.id];
+  // wait for this hook's own request to be applied, not for the outbox to
+  // shrink (files left from an earlier step would end the wait too early)
+  const outbox = () => new Set(fs.readdirSync(path.join(dir, "outbox")));
   const prompt = async (prompt_id, text) => {
-    const n = fs.readdirSync(path.join(dir, "outbox")).length;
+    const before = outbox();
     await runHook("claude", "prompt", { session_id: P.id, prompt: text, ...(prompt_id && { prompt_id }) });
-    await until(() => fs.readdirSync(path.join(dir, "outbox")).length <= n); // processed
+    const mine = [...outbox()].filter((f) => !before.has(f));
+    await until(() => {
+      const now = outbox();
+      return mine.every((f) => !now.has(f));
+    });
   };
   const base = () => JSON.parse(fs.readFileSync(turnFile(P), "utf8"));
   const review = async (prompt_id, answer) => {

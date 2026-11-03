@@ -20,6 +20,8 @@ import { AUTO_RULES, AUTO_REVIEWER } from "./auto.mjs";
 import { rulesBlock } from "./rules.mjs";
 import { readConfig, writeConfig } from "./config.mjs";
 import { chatgptRunning, openChatgpt, openUrl } from "./platform.mjs";
+import * as rc from "./readchat.mjs";
+import { claudeSession, readClaudePage, findClaude } from "./chats.mjs";
 
 const sideArg = process.argv.indexOf("--side");
 const SIDE = sideArg > -1 ? process.argv[sideArg + 1] : process.env.PEER_BRIDGE_SIDE;
@@ -616,6 +618,118 @@ server.registerTool(
     if (r.dup) return text("Same nits as before; not sent again.", r);
     // the user can't see tool calls, so the answer goes into the chat too
     return withRules(`${how[r.delivered]} The user can't see tool calls: write this as your reply, unchanged:\n\n${r.text}`, r, { first: true });
+  },
+);
+
+// ------------------------------------------------------------ reading chats
+// Find and read one of the user's chats on this computer, in either app. No
+// link, no message, no wake; see src/readchat.mjs.
+
+const READ_CHAT =
+  "Read one of the user's chats stored on this computer: a ChatGPT Desktop chat (its Codex chats, archived ones too) or a Claude Code session. " +
+  "Find it by name (or part of it), id, or text in its messages. Use this, not a web browser, for those chats. " +
+  "Chats that exist only on a website (ordinary chatgpt.com or claude.ai chats) aren't stored here: say so, and use another way only if the user asks for one. " +
+  "Only for a chat or search the user asked for; don't browse their chats on your own. " +
+  "Read-only: it creates no link, sends nothing, wakes no one, and works with the other app closed. " +
+  "Several matches, or a search that stopped early: you get a list; ask the user which one, don't guess. Long chats come in pages: pass the returned cursor.";
+
+const APPS = { chatgpt: "chatgpt", claude: "claude" };
+// ChatGPT is faked in the tests; they never read the real app's chats
+const chatgptOff = () => (process.env.PEER_BRIDGE_FAKE_CODEX ? "ChatGPT is stood in for in tests" : null);
+
+async function readOne({ app, id, includeTools, limit, resume, self: me }) {
+  if (id === me) return text("[PEER-BRIDGE] That is this chat itself; it isn't read through the bridge.");
+  const opts = { resume, limit, includeTools };
+  let r;
+  if (app === "claude") {
+    const s = claudeSession(id);
+    if (!s) return text(`[PEER-BRIDGE] No Claude Code session with id ${id} on this computer.`);
+    try {
+      r = await readClaudePage(s, opts);
+    } catch (e) {
+      return text(`[PEER-BRIDGE] That Claude Code session couldn't be read right now (${e.message}).`);
+    }
+  } else {
+    const cant = (why) => text(`[PEER-BRIDGE] ChatGPT Desktop's chats couldn't be read right now (${why}).`);
+    if (chatgptOff()) return cant(chatgptOff());
+    const { withChatgpt, readChatgptPage } = await import("./codex.mjs");
+    try {
+      r = await withChatgpt((s) => readChatgptPage(s, id, opts));
+    } catch (e) {
+      return cant(e.message);
+    }
+  }
+  if (r.moved) return text(rc.MOVED);
+  // a page that read nothing new keeps the cursor it came with
+  const cursor = rc.encodeCursor({ k: "read", app, id, t: includeTools ? 1 : 0, r: r.page.pos ?? resume });
+  return text(rc.pageText(r.meta, r.page, { total: r.total, cursor, first: resume === undefined }));
+}
+
+const chatSources = () => ({
+  claude: (a) => findClaude({ ...a, offset: a.pos ?? 0 }),
+  chatgpt:
+    chatgptOff() ??
+    (async (a) => {
+      const { withChatgpt, findChatgpt } = await import("./codex.mjs");
+      return withChatgpt((s) => findChatgpt(s, { ...a, pos: a.pos ?? {} }, { normalize: rc.normalizeName, inFolder: rc.inFolder }));
+    }),
+});
+
+server.registerTool(
+  "bridge_read_chat",
+  {
+    title: "Read one of the user's chats",
+    description: READ_CHAT,
+    inputSchema: {
+      app: z.enum(["chatgpt", "claude"]).optional().describe("Which app's chats; omitted: both"),
+      name: z.string().optional().describe("All or part of the chat's title"),
+      id: z.string().optional().describe("A ChatGPT thread id or a Claude session id, to read that chat directly"),
+      search: z.string().optional().describe("Text that occurs in the chat's messages"),
+      folder: z.string().optional().describe("Only chats working in this folder or below it; relative to this chat's folder"),
+      archived: z.boolean().optional().describe("Also look in ChatGPT's archived chats"),
+      cursor: z.string().optional().describe("The cursor a previous call returned: more of the same chat, or more of the same search"),
+      limit: z.number().int().min(1).max(rc.MAX_LIMIT).optional().describe(`Messages per page (default ${rc.PAGE_LIMIT})`),
+      include_tools: z.boolean().optional().describe("Also show the chat's tool steps and the text between them"),
+    },
+    annotations: READ_ONLY,
+  },
+  async (a, extra) => {
+    const me = (await self(extra))?.id ?? null;
+    const limit = a.limit ?? rc.PAGE_LIMIT;
+    let crit = null;
+    let pos = {};
+    if (a.cursor) {
+      const c = rc.decodeCursor(a.cursor);
+      if (!c) return text("[PEER-BRIDGE] That cursor isn't one this tool returned. Leave it out to start again.");
+      if (c.k === "read") {
+        if ((a.id && a.id !== c.id) || (a.include_tools !== undefined && !!a.include_tools !== !!c.t))
+          return text("[PEER-BRIDGE] That cursor belongs to another chat or to other options (include_tools). Leave it out to start again.");
+        return readOne({ app: c.app, id: c.id, includeTools: !!c.t, limit, resume: c.r, self: me });
+      }
+      crit = c.crit;
+      pos = c.pos ?? {};
+    }
+    if (!crit && a.id) {
+      const app = a.app ?? (claudeSession(a.id) ? "claude" : "chatgpt");
+      return readOne({ app, id: a.id, includeTools: !!a.include_tools, limit, self: me });
+    }
+    if (!crit) {
+      if (!a.name && !a.search) return text("[PEER-BRIDGE] Say which chat: its name, its id, or text from its messages.");
+      let folder = a.folder;
+      if (folder && !path.isAbsolute(folder)) {
+        const base = projectDir(extra);
+        if (!base) return text("[PEER-BRIDGE] This chat's folder isn't known here: give the folder as a full path.");
+        folder = path.resolve(base, folder);
+      }
+      crit = { app: APPS[a.app] ?? null, name: a.name ?? null, search: a.search ?? null, folder: folder ?? null, archived: !!a.archived };
+    }
+    const found = await rc.findChats(crit, pos, me, chatSources());
+    const cursor = rc.moreToSearch(found) ? rc.encodeCursor({ k: "find", crit, pos: found.next }) : null;
+    if (!found.candidates.length) return text(rc.noneText(found, crit, cursor));
+    // a search that stopped early could have missed another match
+    const only = rc.pickOne(found, { continued: !!a.cursor });
+    if (only) return readOne({ app: only.app, id: only.id, includeTools: !!a.include_tools, limit, self: me });
+    return text(rc.listText(found, cursor));
   },
 );
 
