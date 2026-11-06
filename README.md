@@ -269,7 +269,6 @@ Repository layout:
 - `src/readchat.mjs`, `src/chats.mjs`: reading chats (shared paging and texts; Claude Code sessions). ChatGPT threads are read in `src/codex.mjs`.
 - `src/rules.mjs`, `src/config.mjs`: your rules and settings. `src/platform.mjs`: OS paths and app launching.
 - `scripts/`: installer, `doctor`, tests, and debugging helpers (`send.mjs`, `codex-thread.mjs`).
-- `docs/notes/`: working notes (in Turkish) with the experiments and measurements behind the design.
 
 ## License
 
