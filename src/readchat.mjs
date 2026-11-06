@@ -63,7 +63,7 @@ export const encodeCursor = (c) => Buffer.from(JSON.stringify(c)).toString("base
 
 const validPos = (app, r) =>
   app === "claude"
-    ? Number.isInteger(r?.o) && r.o >= 0 && typeof r.h === "string" && typeof r.l === "boolean"
+    ? Number.isInteger(r?.o) && r.o >= 0 && Number.isInteger(r.n) && r.n >= 0 && typeof r.h === "string" && r.h !== "" && typeof r.l === "boolean" && (!r.s || Number.isInteger(r.e))
     : (r?.pc === null || typeof r?.pc === "string") && typeof r?.b === "string";
 
 const validKey = (a) => typeof a?.exact === "boolean" && typeof a.updated === "number" && typeof a.app === "string" && typeof a.id === "string";

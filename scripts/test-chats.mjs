@@ -248,6 +248,76 @@ async function readAll(pageFn) {
   const byFolder = await find({ folder: "/deep" });
   assert.ok(!byFolder.complete);
   assert.match(byFolder.problems.join(), /deep\.jsonl \(folder not found within the limit\)/);
+  // a stand-in name that matches is still uncertain if the real title may lie
+  // further back; and a first message past the limit isn't "no such name"
+  clean();
+  session([R.title("The real title"), R.user("Needle in a stand-in"), ...Array.from({ length: 6 }, () => ({ type: "x", pad: "p".repeat(1_000_000) }))], { id: "standin" });
+  const standin = await rc.findChats({ name: "needle", app: "claude" }, null, { claude: claudeFind });
+  assert.equal(standin.total, 1);
+  assert.ok(!standin.complete);
+  assert.match(standin.partial.claude, /standin\.jsonl \(title not found within the limit\)/);
+  assert.equal(rc.pickOne(standin), null, "an uncertain search reads nothing on its own");
+  clean();
+  session([{ type: "x", pad: "p".repeat(1_500_000) }, R.user("The first words")], { id: "late-first" });
+  const lateFirst = await find({ name: "first words" });
+  assert.equal(lateFirst.found.length, 0);
+  assert.ok(!lateFirst.complete, "the first message lay past the limit: not settled");
+  assert.match(lateFirst.problems.join(), /late-first\.jsonl \(title not found within the limit\)/);
+  // two records alike for their first 64 KiB are still two records
+  clean();
+  const alike = (i) => ({ type: "user", message: { role: "user", content: "a".repeat(70_000) }, uuid: `uuid-${i}`, timestamp: `2026-11-01T10:00:0${i}Z`, cwd: "/w" });
+  const twins = session([0, 1, 2, 3].map(alike), { id: "twins" });
+  const t1 = await page(twins.id, { limit: 2 });
+  fs.writeFileSync(twins.file, lines([1, 2, 3].map(alike)));
+  assert.ok((await page(twins.id, { resume: t1.page.pos, limit: 2 })).moved, "an earlier record gone, with the same first 64 KiB at the cursor: stops");
+  // the same with a huge record that differs only in the middle of nowhere
+  const hugeAlike = (end) => ({ type: "user", message: { role: "user", content: "h".repeat(MAX_RECORD + 1_000) + end }, cwd: "/w" });
+  const two = session([R.user("old"), hugeAlike("A"), R.user("new")], { id: "huge-alike" });
+  const h1 = await page(two.id, { limit: 1 });
+  assert.ok(h1.page.pos.n > MAX_RECORD, "the page ended by passing the huge record, so its cursor sits on it");
+  assert.ok(!(await page(two.id, { limit: 1, resume: h1.page.pos })).moved, "unchanged, it holds");
+  const hugeBytes = fs.readFileSync(two.file);
+  const tailAt = hugeBytes.lastIndexOf('A"}', hugeBytes.length);
+  hugeBytes[hugeBytes.indexOf('hA"', h1.page.pos.o) + 1] = "B".charCodeAt(0);
+  assert.ok(tailAt > 0);
+  fs.writeFileSync(two.file, hugeBytes);
+  assert.ok((await page(two.id, { limit: 1, resume: h1.page.pos })).moved, "the same length and start but another end is another record");
+  // a stretch of metadata longer than the budget: pages go on, none stands still
+  clean();
+  const md = (i) => ({ type: "progress", i, pad: "m".repeat(1_000_000) });
+  const metaOnly = session([R.user("oldest"), ...Array.from({ length: 12 }, (_, i) => md(i)), R.user("newest")], { id: "meta-only" });
+  const stops = [];
+  const metaAll = await readAll(async (resume) => {
+    const r = await readClaudePage(await sessionOf(metaOnly.id), { resume, limit: 5, includeTools: false, budget: 3_000_000 });
+    if (r.page.more) stops.push(r.page.pos.o);
+    return r;
+  });
+  assert.deepEqual(metaAll.map((b) => b.split("\n")[1]), ["oldest", "newest"]);
+  assert.ok(stops.length >= 2, "several pages through the stretch");
+  assert.ok(stops.every((o, i) => !i || o < stops[i - 1]), "each one further back");
+  // a message is never shown in part: one split by the budget comes whole on
+  // the next page; one wider than a whole budget is left out and said so
+  clean();
+  const part = (id, n) => R.asst(id, [R.text(`${id}-part${n} ${"t".repeat(800_000)}`)]);
+  const fits = session([R.user("q"), part("m", 1), part("m", 2), ...Array.from({ length: 2 }, (_, i) => md(i)), R.user("newest")], { id: "fits" });
+  for (const includeTools of [false, true]) {
+    const got = await readAll(async (resume) => readClaudePage(await sessionOf(fits.id), { resume, limit: 5, includeTools, budget: 2_500_000 }));
+    const m = got.filter((b) => /m-part/.test(b));
+    assert.equal(m.length, 1, "one message, one block");
+    assert.match(m[0], /m-part1/, "starting from its first record");
+    assert.match(m[0], /^### Assistant ·/, "an answer, whole");
+  }
+  const wide = session([R.user("before it"), ...Array.from({ length: 10 }, (_, i) => part("w", i)), R.user("after it")], { id: "wide" });
+  for (const includeTools of [false, true]) {
+    let spread = 0;
+    const got = await readAll(async (resume) => {
+      const r = await readClaudePage(await sessionOf(wide.id), { resume, limit: 5, includeTools, budget: 2_500_000 });
+      spread += r.page.dropped["messages spread too far to read"] ?? 0;
+      return r;
+    });
+    assert.deepEqual(got.map((b) => b.split("\n")[1]), ["before it", "after it"], "no fragment of it is shown");
+    assert.equal(spread, 1, "it is reported once");
+  }
   // the event loop while a page of a large file is read
   clean();
   const chunk = "w".repeat(1_000_000);
@@ -486,19 +556,22 @@ const findG = async (s, crit) => {
   assert.match(rc.pickOne(await search(["old notes"]))?.id, /^old notes/, "a single match");
   assert.equal(rc.pickOne(await search(["Notes"], { complete: false })), null, "not everything searched: ask");
   assert.equal(rc.pickOne(await search(["Notes"], { complete: false, partial: true })), null, "something unreadable: ask");
+  assert.equal(rc.pickOne(await search(["Notes"], { complete: true, partial: true })), null, "something unsettled: ask");
   assert.equal(rc.pickOne(await search(["Notes"], { after: { exact: false, updated: 99, app: "a", id: "a" } })), null, "a continued list never reads on its own");
   const failed = await rc.findChats({ name: "notes" }, null, { claude: async ({ add }) => (add({ app: "claude", id: "n", name: "Notes", updated: 1 }), { complete: true, scope: "1 of 1 sessions" }), chatgpt: "down" });
   assert.equal(rc.pickOne(failed), null, "an app failed: ask");
   assert.equal(rc.decodeCursor("garbage"), null);
-  const good = { k: "read", app: "claude", id: "x", t: 0, r: { o: 4, h: "ab", l: true } };
+  const good = { k: "read", app: "claude", id: "x", t: 0, r: { o: 4, n: 2, h: "ab", l: true } };
   assert.deepEqual(rc.decodeCursor(rc.encodeCursor(good)), good);
   for (const bad of [
     { ...good, k: "find" },
     { ...good, app: "other" },
     { ...good, id: 1 },
     { ...good, t: 2 },
-    { ...good, r: { o: -1, h: "ab", l: true } },
+    { ...good, r: { o: -1, n: 2, h: "ab", l: true } },
     { ...good, r: { o: 1 } },
+    { ...good, r: { o: 1, n: 2, h: "", l: true } },
+    { ...good, r: { o: 1, n: 0, h: "ab", l: true, s: true } },
     { ...good, app: "chatgpt", r: { pc: 1, b: "x" } },
   ])
     assert.equal(rc.decodeCursor(rc.encodeCursor(bad)), null, JSON.stringify(bad));

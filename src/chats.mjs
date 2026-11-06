@@ -6,7 +6,7 @@
 // id>/custom-title.json and in "custom-title" records (the last one wins). A
 // session moved to another folder (a worktree) can sit under several folder
 // keys; the newest file is the session. The format is Claude Code's own and
-// undocumented: only known shapes are read, the rest is left out and counted.
+// undocumented: only known shapes are read, other records are metadata.
 //
 // Transcripts can be huge and this runs in the MCP server, which may also own
 // the broker: files are read in chunks from the end, asynchronously, never
@@ -26,7 +26,7 @@ const TITLE_FILE_BYTES = 64 * 1024;
 export const PAGE_BYTES = 64 * 1024 * 1024; // read for one page before it ends early
 const RESULTS_BYTES = 2 * 1024 * 1024; // past a cursor, for the results of the tool steps before it
 const MAX_TOOL_LINES = 200;
-const FINGERPRINT_BYTES = 64 * 1024;
+const EDGE_BYTES = 64 * 1024; // what identifies a record too large to keep
 
 // Claude Code's own blocks in user turns: reminders and notices it adds,
 // sometimes before the user's own words in the same message. They are taken
@@ -94,24 +94,38 @@ const parse = (buf) => {
   }
 };
 
-// The file's records from `start` (a byte position) back to its beginning, as
-// { offset, raw, head }: raw is null for a record over MAX_RECORD, whose bytes
-// are never kept, and head is its first bytes, enough to tell it apart. Ends
-// with { budget: true } once more than `budget` bytes were read. If that
-// happens inside such a record it also gives { skipAt, head }: start there with
-// `skipping` to go on, so no record can make one call read without limit.
-export async function* reverseRecords(file, { start, budget = Infinity, skipping: resumeSkip = false } = {}) {
-  const fh = await fs.promises.open(file, "r");
-  const headAt = async (offset) => {
-    const buf = Buffer.alloc(FINGERPRINT_BYTES);
-    const { bytesRead } = await fh.read(buf, 0, buf.length, offset);
+const sha = (...bufs) => {
+  const h = crypto.createHash("sha1");
+  for (const b of bufs) h.update(b);
+  return h.digest("hex").slice(0, 20);
+};
+
+// A record too large to keep is known by its length, its first and its last
+// bytes; read from the file, so this never holds more than that
+async function hugeAnchor(fh, offset, end) {
+  const edge = async (at) => {
+    const buf = Buffer.alloc(Math.min(EDGE_BYTES, end - offset));
+    const { bytesRead } = await fh.read(buf, 0, buf.length, at);
     return buf.subarray(0, bytesRead);
   };
+  return sha(await edge(offset), await edge(Math.max(offset, end - EDGE_BYTES)));
+}
+
+// The file's records from `start` (a byte position) back to its beginning, as
+// { offset, length, raw }. A record over MAX_RECORD has raw null and an
+// `anchor` instead: its bytes are never kept. Ends with { budget: true } once
+// more than `budget` bytes were read. If that happens inside such a record it
+// also gives { skipAt, end, head }: pass skip: { end } with start = skipAt to
+// go on, so no record can make one call read without limit.
+export async function* reverseRecords(file, { start, budget = Infinity, skip = null } = {}) {
+  const fh = await fs.promises.open(file, "r");
+  const huge = async (offset, end) => ({ offset, length: end - offset, raw: null, anchor: await hugeAnchor(fh, offset, end) });
   try {
     const size = start ?? (await fh.stat()).size;
     let pos = size;
     let carry = Buffer.alloc(0);
-    let skipping = resumeSkip;
+    let skipping = !!skip;
+    let recordEnd = skip?.end ?? null;
     while (pos > 0) {
       const from = Math.max(0, pos - CHUNK);
       const chunk = Buffer.alloc(pos - from);
@@ -122,10 +136,11 @@ export async function* reverseRecords(file, { start, budget = Infinity, skipping
       if (skipping) {
         const nl = chunk.lastIndexOf(10);
         if (nl === -1) {
-          if (size - pos > budget) return void (yield { budget: true, skipAt: pos, head: chunk.subarray(0, FINGERPRINT_BYTES) });
+          // (at the very start of the file there is nothing left to go on with)
+          if (size - pos > budget && pos > 0) return void (yield { budget: true, skipAt: pos, end: recordEnd, head: chunk.subarray(0, EDGE_BYTES) });
           continue;
         }
-        yield { offset: from + nl + 1, raw: null, head: await headAt(from + nl + 1) };
+        yield await huge(from + nl + 1, recordEnd);
         skipping = false;
         body = chunk.subarray(0, nl + 1);
         carry = Buffer.alloc(0);
@@ -136,9 +151,9 @@ export async function* reverseRecords(file, { start, budget = Infinity, skipping
         const nl = all.lastIndexOf(10, end - 1);
         if (nl === -1) break;
         if (end > nl + 1) {
-          const len = end - nl - 1;
-          if (len > MAX_RECORD) yield { offset: from + nl + 1, raw: null, head: all.subarray(nl + 1, nl + 1 + FINGERPRINT_BYTES) };
-          else yield { offset: from + nl + 1, raw: all.subarray(nl + 1, end) };
+          const length = end - nl - 1;
+          if (length > MAX_RECORD) yield await huge(from + nl + 1, from + end);
+          else yield { offset: from + nl + 1, length, raw: all.subarray(nl + 1, end) };
           if (size - pos > budget) return void (yield { budget: true });
         }
         end = nl;
@@ -146,11 +161,12 @@ export async function* reverseRecords(file, { start, budget = Infinity, skipping
       carry = Buffer.from(all.subarray(0, end));
       if (carry.length > MAX_RECORD) {
         skipping = true;
+        recordEnd = from + carry.length;
         carry = Buffer.alloc(0);
       }
     }
-    if (skipping) yield { offset: 0, raw: null, head: await headAt(0) };
-    else if (carry.length) yield { offset: 0, raw: carry };
+    if (skipping) yield await huge(0, recordEnd);
+    else if (carry.length) yield { offset: 0, length: carry.length, raw: carry };
   } finally {
     await fh.close();
   }
@@ -182,7 +198,8 @@ async function readTitleFile(s) {
   }
 }
 
-// The first thing the user wrote, within the first part of the file
+// The first thing the user wrote, within the first part of the file, and
+// whether that was enough to tell: { text, settled }
 async function firstMessage(s) {
   const fh = await fs.promises.open(s.file, "r");
   try {
@@ -191,12 +208,12 @@ async function firstMessage(s) {
     let start = 0;
     for (;;) {
       const nl = buf.indexOf(10, start);
-      if (nl === -1) return null;
+      if (nl === -1) return { text: null, settled: s.size <= HEAD_BYTES };
       const r = parse(buf.subarray(start, nl));
       start = nl + 1;
       if (r?.type === "user" && !r.isSidechain && !r.isMeta && !r.isCompactSummary) {
         const t = humanText(textOf(r.message?.content));
-        if (t) return t;
+        if (t) return { text: t, settled: true };
       }
     }
   } finally {
@@ -206,8 +223,8 @@ async function firstMessage(s) {
 
 // Title and folder, from the end of the file (titles are written again and
 // again, and most records carry the folder). `titleKnown`/`folderKnown` say
-// whether they were settled within the limit: a large session may hold them
-// further back.
+// whether they were settled within the limits: a large session may hold them
+// further back, and a stand-in name from the first message may not be its name.
 export async function claudeMeta(s) {
   let name = await readTitleFile(s);
   let folder = null;
@@ -225,19 +242,21 @@ export async function claudeMeta(s) {
       if (!name && r.type === "custom-title" && r.customTitle) name = r.customTitle;
       if (!folder && typeof r.cwd === "string") folder = r.cwd;
     }
-  const titled = !!name;
+  let titleKnown = !!name;
   if (!name) {
     const first = await firstMessage(s);
-    name = first ? `(untitled) ${first.replace(/\s+/g, " ").slice(0, 60)}` : "(untitled)";
+    name = first.text ? `(untitled) ${first.text.replace(/\s+/g, " ").slice(0, 60)}` : "(untitled)";
+    titleKnown = scannedAll && first.settled;
   }
-  return { app: "claude", id: s.id, name, folder, updated: s.mtime, titleKnown: titled || scannedAll, folderKnown: !!folder || scannedAll };
+  return { app: "claude", id: s.id, name, folder, updated: s.mtime, titleKnown, folderKnown: !!folder || scannedAll };
 }
 
 // ------------------------------------------------------------------ finding
 
 // By title and/or folder, over every session, newest first. A session whose
-// title or folder couldn't be settled within the limits is reported rather
-// than taken for a non-match; so is one the deadline didn't reach.
+// title or folder couldn't be settled within the limits is reported, whether
+// or not what is known of it matches, and so is one the deadline didn't reach:
+// then the search isn't complete.
 export async function findClaude({ name, folder, self, add, deadline = Infinity }) {
   const { sessions, problems } = await scanSessions();
   const want = name ? normalizeName(name) : null;
@@ -247,16 +266,11 @@ export async function findClaude({ name, folder, self, add, deadline = Infinity 
     looked++;
     if (s.id === self) continue;
     try {
-      const meta = await claudeMeta(s);
-      if (folder && !inFolder(meta.folder, folder)) {
-        if (!meta.folderKnown) problems.push(`${s.file} (folder not found within the limit)`);
-        continue;
-      }
-      if (want && !normalizeName(meta.name).includes(want)) {
-        if (!meta.titleKnown) problems.push(`${s.file} (title not found within the limit)`);
-        continue;
-      }
-      const { titleKnown: _t, folderKnown: _f, ...chat } = meta;
+      const { titleKnown, folderKnown, ...chat } = await claudeMeta(s);
+      if (want && !titleKnown) problems.push(`${s.file} (title not found within the limit)`);
+      if (folder && !folderKnown) problems.push(`${s.file} (folder not found within the limit)`);
+      if (folder && !inFolder(chat.folder, folder)) continue;
+      if (want && !normalizeName(chat.name).includes(want)) continue;
       add(chat);
     } catch (e) {
       // deleted meanwhile is gone; anything else might have been a match
@@ -302,8 +316,6 @@ function toolLine(b, result) {
   return `${what} (${outcome})`;
 }
 
-const fingerprint = (raw) => (raw ? crypto.createHash("sha1").update(raw.subarray(0, FINGERPRINT_BYTES)).digest("hex").slice(0, 16) : "");
-
 const noteResults = (r, results) => {
   const c = r?.message?.content;
   if (r?.type === "user" && Array.isArray(c)) for (const b of c) if (b.type === "tool_result") results.set(b.tool_use_id, { error: !!b.is_error });
@@ -330,51 +342,63 @@ async function resultsAfter(file, offset) {
   return results;
 }
 
-// Is that position still the start of the same record (or, inside a huge one,
-// the same bytes)? A shifted or rewritten file fails this; records added at
-// the end don't touch it.
-async function boundaryHolds(file, { o, h, s: inside }) {
+// A record as a cursor knows it: where it starts, how long it is, and a hash
+// of all of it (or, for a huge one, of its two ends)
+const recordPos = (rec) => ({ o: rec.offset, n: rec.length, h: rec.raw ? sha(rec.raw) : rec.anchor });
+
+// Is that position still the same record, whole (or, inside a huge one, the
+// same bytes)? A shifted or rewritten file fails this; records added at the
+// end don't touch it.
+async function boundaryHolds(file, { o, h, n, s: inside }) {
   const fh = await fs.promises.open(file, "r");
   try {
     const { size } = await fh.stat();
     if (o >= size) return false;
-    if (o > 0 && !inside) {
-      const prev = Buffer.alloc(1);
-      await fh.read(prev, 0, 1, o - 1);
-      if (prev[0] !== 10) return false;
-    }
-    const buf = Buffer.alloc(FINGERPRINT_BYTES);
-    const { bytesRead } = await fh.read(buf, 0, buf.length, o);
-    const nl = buf.subarray(0, bytesRead).indexOf(10);
-    return fingerprint(buf.subarray(0, nl === -1 ? bytesRead : nl)) === h;
+    const at = async (offset, length) => {
+      const buf = Buffer.alloc(length);
+      const { bytesRead } = await fh.read(buf, 0, length, offset);
+      return buf.subarray(0, bytesRead);
+    };
+    if (inside) return sha(await at(o, EDGE_BYTES)) === h;
+    if (o > 0 && (await at(o - 1, 1))[0] !== 10) return false;
+    if (o + n > size) return false;
+    if (o + n < size && (await at(o + n, 1))[0] !== 10) return false;
+    return (n > MAX_RECORD ? await hugeAnchor(fh, o, o + n) : sha(await at(o, n))) === h;
   } finally {
     await fh.close();
   }
 }
 
-// A session's units, newest first, as { unit, pos }, or { budget: true }. pos
-// is { o, h, l }: where the unit's earliest record starts, its fingerprint,
-// and whether an assistant message follows in that turn (which is what makes
-// an earlier one a step, not the answer); with s: true it is a place inside a
-// huge record, where the last call's budget ran out. Records of one assistant message
-// are merged into one unit, however far apart; things dropped in between are
-// reported right after it, so no cursor can fall inside a message.
+// A session's units, newest first, as { unit, pos }, or { budget: true, pos }
+// when the read budget ran out. pos is what a cursor stores: { o, n, h } for
+// the record it sits on, l for whether an assistant message follows in that
+// turn (which is what makes an earlier one a step, not the answer), s and e
+// for a place inside a huge record, and m for the message whose earlier
+// records are being passed over.
+//
+// Records of one assistant message are merged into one unit, however far
+// apart, and shown only whole. Things dropped in between are reported right
+// after it, so no cursor can fall inside a message. If the budget runs out in
+// one, the page ends before it and the next call starts there with a fresh
+// budget; a message spread wider than a whole budget is left out and said so.
 export async function* claudeStream(file, resume, { includeTools = true, budget = PAGE_BYTES } = {}) {
   const results = resume && includeTools ? await resultsAfter(file, resume.o) : new Map();
   let later = resume?.l ?? false;
+  let passing = resume?.m ?? null;
   let open = null;
   let pending = [];
+  let last = null; // the last record read, shown or not
   const at = (r) => (r.timestamp ? Date.parse(r.timestamp) || null : null);
+  const posOf = (rec) => ({ ...recordPos(rec), l: later, ...(passing && { m: passing }) });
   const flush = () => {
     const steps = [];
     if (open) {
-      const { id: _id, uses, offset, raw, ...unit } = open;
-      unit.tools = uses.map((b) => toolLine(b, results.get(b.id)));
-      unit.kind = !unit.text ? "tool" : uses.length || later ? "interim" : "final";
+      const { uses, at: when, text, moreTools, pos: start } = open;
+      const kind = !text ? "tool" : uses.length || later ? "interim" : "final";
       later = true;
-      const pos = { o: offset, h: fingerprint(raw), l: later };
-      steps.push({ unit, pos });
-      for (const kind of pending) steps.push({ unit: { kind }, pos });
+      const pos = { ...start, l: later };
+      steps.push({ unit: { kind, at: when, text, moreTools, tools: uses.map((b) => toolLine(b, results.get(b.id))) }, pos });
+      for (const k of pending) steps.push({ unit: { kind: k }, pos });
     }
     open = null;
     pending = [];
@@ -382,15 +406,22 @@ export async function* claudeStream(file, resume, { includeTools = true, budget 
   };
   const dropped = function* (kind, rec) {
     if (open) pending.push(kind);
-    else yield { unit: { kind }, pos: { o: rec.offset, h: fingerprint(rec.raw ?? rec.head), l: later } };
+    else yield { unit: { kind }, pos: posOf(rec) };
   };
-  for await (const rec of reverseRecords(file, { start: resume?.o, budget, skipping: !!resume?.s })) {
+  for await (const rec of reverseRecords(file, { start: resume?.o, budget, skip: resume?.s ? { end: resume.e } : null })) {
     if (rec.budget) {
-      // a message still open comes first, so the cursor can sit past it
-      yield* flush();
-      yield { budget: true, ...(rec.skipAt !== undefined && { pos: { o: rec.skipAt, h: fingerprint(rec.head), l: later, s: true } }) };
+      const inside = rec.skipAt !== undefined ? { o: rec.skipAt, n: 0, h: sha(rec.head), s: true, e: rec.end, l: later, ...(passing && { m: passing }) } : null;
+      if (open?.before) yield { budget: true, pos: posOf(open.before) };
+      else if (open) {
+        // nothing before it in this call: it alone used up the budget
+        const pos = { ...(inside ?? posOf(last)), l: true, m: open.id };
+        yield { unit: { kind: "drop:messages spread too far to read" }, pos };
+        yield { budget: true, pos };
+      } else yield { budget: true, pos: inside ?? posOf(last) };
       return;
     }
+    const previous = last;
+    last = rec;
     if (!rec.raw) {
       yield* dropped("drop:records too large to read", rec);
       continue;
@@ -410,7 +441,8 @@ export async function* claudeStream(file, resume, { includeTools = true, budget 
       if (a?.type === "queued_command" && (a.origin?.kind === "human" || a.humanTurn) && typeof a.prompt === "string") {
         yield* flush();
         later = false;
-        yield { unit: { kind: "user", at: at(r), text: humanText(a.prompt), midTurn: true }, pos: { o: rec.offset, h: fingerprint(rec.raw), l: false } };
+        passing = null;
+        yield { unit: { kind: "user", at: at(r), text: humanText(a.prompt), midTurn: true }, pos: posOf(rec) };
       }
       continue;
     }
@@ -431,11 +463,14 @@ export async function* claudeStream(file, resume, { includeTools = true, budget 
       }
       yield* flush();
       later = false;
-      yield { unit: { kind: "user", at: at(r), text: [t, ...Array(images).fill("[image]")].filter(Boolean).join("\n") }, pos: { o: rec.offset, h: fingerprint(rec.raw), l: false } };
+      passing = null;
+      yield { unit: { kind: "user", at: at(r), text: [t, ...Array(images).fill("[image]")].filter(Boolean).join("\n") }, pos: posOf(rec) };
       continue;
     }
     // assistant: one API message can span several records (one per block)
     const id = r.message?.id ?? `at${rec.offset}`;
+    if (passing === id) continue; // the rest of a message already left out
+    passing = null;
     if (open && open.id !== id) yield* flush();
     for (const b of [...(r.message?.content ?? [])].reverse()) {
       if (b.type === "thinking" || b.type === "redacted_thinking") {
@@ -443,9 +478,8 @@ export async function* claudeStream(file, resume, { includeTools = true, budget 
         continue;
       }
       if (b.type === "text" ? !b.text?.trim() : b.type !== "tool_use") continue;
-      if (!open) open = { id, uses: [], text: "", at: at(r), moreTools: 0, offset: rec.offset, raw: null };
-      open.offset = rec.offset;
-      open.raw = Buffer.from(rec.raw.subarray(0, FINGERPRINT_BYTES));
+      if (!open) open = { id, uses: [], text: "", at: at(r), moreTools: 0, before: previous };
+      open.pos = recordPos(rec);
       open.at = at(r) ?? open.at;
       if (b.type === "text") open.text = (open.text ? `${b.text}\n${open.text}` : b.text).slice(0, 8_000);
       if (b.type === "tool_use") {
