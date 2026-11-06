@@ -9,7 +9,7 @@ import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { codexInMacApps } from "../src/platform.mjs";
 
-const root = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-platform-"));
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-platform-"));
 const touch = (...parts) => {
   const f = path.join(root, ...parts);
   fs.mkdirSync(path.dirname(f), { recursive: true });
@@ -57,7 +57,7 @@ try {
   {
     const home = path.join(root, "home");
     // Windows env names are case-insensitive (Path vs PATH): drop them all first
-    const drop = /^(path|home|userprofile|appdata|peer_bridge_codex_bin|peer_bridge_claude_bin|claude_code_execpath)$/i;
+    const drop = /^(path|home|userprofile|appdata|agent_review_bridge_codex_bin|agent_review_bridge_claude_bin|claude_code_execpath)$/i;
     const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !drop.test(k)));
     Object.assign(env, { HOME: home, USERPROFILE: home, APPDATA: path.join(home, "AppData", "Roaming"), PATH: "" });
     const versionDir = process.platform === "win32" ? path.join(env.APPDATA, "Claude", "claude-code", "2.1.0", "abc") : path.join(home, "Library", "Application Support", "Claude", "claude-code", "2.1.0", "abc");
@@ -72,7 +72,7 @@ try {
       assert.equal(r.status, 0, r.stderr);
       return JSON.parse(r.stdout);
     };
-    assert.deepEqual(probe({ PEER_BRIDGE_CODEX_BIN: "/x/codex" }).codex, { path: "/x/codex", source: "override" });
+    assert.deepEqual(probe({ AGENT_REVIEW_BRIDGE_CODEX_BIN: "/x/codex" }).codex, { path: "/x/codex", source: "override" });
     if (process.platform === "win32" || process.platform === "darwin") {
       assert.equal(probe({}).claude, claude);
       console.log("platform 4 override labelled; Claude Desktop's bundled Claude Code found");

@@ -1,8 +1,8 @@
-# peer-bridge
+# agent-review-bridge
 
-**Let Claude Code and ChatGPT Desktop review each other's work, from their own desktop apps.**
+**AI agents review each other's work: Claude Code ↔ ChatGPT Desktop, in their own desktop apps, through your own subscriptions, with no API keys.**
 
-peer-bridge connects a chat in the Code tab of Claude Desktop with a chat in ChatGPT Desktop. One chat writes the code; the other reviews it, either after every turn or when asked. Both are ordinary chats in the official apps, using your own subscriptions: no model APIs and no API keys. Either app can take either role, and you can read both sides of the conversation in the chats themselves.
+agent-review-bridge connects a chat in the Code tab of Claude Desktop with a chat in ChatGPT Desktop. One chat writes the code; the other reviews it, either after every turn or when asked. Both are ordinary chats in the official apps, using your own subscriptions: no model APIs and no API keys. Either app can take either role, and you can read both sides of the conversation in the chats themselves.
 
 It is built and tested with the desktop apps. The Claude Code CLI uses the same setup (MCP server and hooks) but hasn't been tested yet; the Codex CLI isn't supported yet.
 
@@ -12,7 +12,7 @@ It is built and tested with the desktop apps. The Claude Code CLI uses the same 
 
 ## Contents
 
-Using peer-bridge:
+Using agent-review-bridge:
 
 - [What it does](#what-it-does)
 - [Install](#install)
@@ -49,13 +49,13 @@ Requirements: Node.js 22 or newer, git, and both desktop apps, signed in: Claude
 1. Get the code and install it:
 
    ```bash
-   git clone https://github.com/tolgaertunc/peer-bridge.git
-   cd peer-bridge
+   git clone https://github.com/tolgaertunc/agent-review-bridge.git
+   cd agent-review-bridge
    npm install
    node scripts/install.mjs
    ```
 
-   The installer registers the bridge's MCP server in both apps, adds its hooks, and allows the bridge's own tools without approval prompts (a woken chat can't wait for a click). It backs up every file it changes and leaves your other settings and hooks alone. The hooks point at this folder, so re-run it if you move the folder. If it can't find the Claude Code CLI, it prints the command to register the server by hand (or set `PEER_BRIDGE_CLAUDE_BIN`).
+   The installer registers the bridge's MCP server in both apps, adds its hooks, and allows the bridge's own tools without approval prompts (a woken chat can't wait for a click). It backs up every file it changes and leaves your other settings and hooks alone. The hooks point at this folder, so re-run it if you move the folder. If it can't find the Claude Code CLI, it prints the command to register the server by hand (or set `AGENT_REVIEW_BRIDGE_CLAUDE_BIN`).
 
 2. Restart both apps. Restart ChatGPT Desktop normally, with its window open: it reads hooks only at startup, and it silently skips a new or changed hook until it trusts it.
 
@@ -83,7 +83,7 @@ You talk to your agent as usual and ask it to use the bridge; it calls the bridg
 
 You can pick the model and reasoning effort of a new ChatGPT chat ("…with gpt-6.1-sol, high effort"). The bridge checks the name against the models your ChatGPT Desktop offers; an unknown one is refused with the list, and nothing is created.
 
-From ChatGPT, or to use an existing chat of either app as the reviewer, ask for a **join code** and paste it into the other chat: *"join the peer-bridge link with code 3fa9c1"*.
+From ChatGPT, or to use an existing chat of either app as the reviewer, ask for a **join code** and paste it into the other chat: *"join the agent-review-bridge link with code 3fa9c1"*.
 
 Open the ChatGPT chat at any time to read the whole exchange: requests arrive starting with `CLAUDE:`, and the reviewer writes its answer there too.
 
@@ -110,7 +110,7 @@ An approval with must-fix items, or a rejection without any, is refused, so the 
 - **One-off review:** the agent asks for the next round of the same review (*Round 2 of review L7*). It goes to the same reviewer with the same kind (a plan review stays one).
 - **Advisor:** the agent's next turn is reviewed again. A new message from you starts the count over. When an approval ends a fix loop, it comes with your next message, so you see the loop end; routine approvals stay silent. An answer about a turn from before your latest message no longer steers the loop, but it comes once with your next message, marked as being about an earlier turn.
 
-**Emergency stop.** If two agents go 20 rounds in a row without approval, the loop stops and the agent is told to ask you (`PEER_BRIDGE_MAX_ROUNDS` changes the number).
+**Emergency stop.** If two agents go 20 rounds in a row without approval, the loop stops and the agent is told to ask you (`AGENT_REVIEW_BRIDGE_MAX_ROUNDS` changes the number).
 
 **Plan reviews.** The reviewer's `[APPROVED]` is not your approval: after a plan review the bridge tells the agent to show you the plan and the verdict and to wait for your explicit go-ahead.
 
@@ -123,9 +123,10 @@ Auto mode is for working with a second model throughout, without reviewing every
 - **The reviewer watches the direction too:** besides the code, it says so when the plan or scope looks wrong. No plan is required when the work doesn't need one.
 - **A check at the end of each turn:** if the reviewer hasn't approved the current changes, the agent is asked once to request a review or tell you why not; telling you doesn't count as approval. It never stops the agent while a review is waiting, or a second time for the same changes. It's a safety net, not a guarantee: it can't stop what happens inside a turn.
 - **A gentle reminder** after five of your messages without a review, if nothing is waiting.
+- **One review of the whole work, if you want it:** after a long, multi-step job, once you say it's done, the agent asks once whether you want a single review covering all of it. It doesn't ask again, and it doesn't replace the reviews along the way, nor the approval before it says the work is done.
 - **Plans:** a plan review the agent starts on its own in auto mode goes on once the reviewer approves it. A plan review you asked for still waits for your approval. This is an instruction to the agent, not a lock.
 
-The work can span several folders or files, git or not, for example an iOS repo and then the same feature in the Android repo from the same chat. Each review names them, and the end-of-turn check covers every folder or file named in a review or when auto mode was turned on. A folder the agent never names isn't checked. Say "auto mode off" to stop; turning it on again starts fresh, with a new reviewer chat.
+The work can span several folders or files, git or not, for example an iOS repo and then the same feature in the Android repo from the same chat. Each review names them, and the end-of-turn check covers every folder or file named in a code review or when auto mode was turned on (a plan review's paths are only context). A folder the agent never names isn't checked, and one that was never approved and is gone drops out. Say "auto mode off" to stop; turning it on again starts fresh, with a new reviewer chat.
 
 ## Your rules
 
@@ -133,8 +134,8 @@ Standing instructions for every agent working through the bridge, in either app,
 
 | System | File |
 |---|---|
-| macOS, Linux | `~/.config/peer-bridge/rules.md` (or `$XDG_CONFIG_HOME/peer-bridge/rules.md`) |
-| Windows | `%APPDATA%\peer-bridge\rules.md` |
+| macOS, Linux | `~/.config/agent-review-bridge/rules.md` (or `$XDG_CONFIG_HOME/agent-review-bridge/rules.md`) |
+| Windows | `%APPDATA%\agent-review-bridge\rules.md` |
 
 Write plain sentences:
 
@@ -172,9 +173,9 @@ Run `npm run doctor` first; it prints a fix for each problem it finds.
 | ChatGPT never reviews anything | Its hooks may be untrusted. Restart ChatGPT Desktop normally, with its window open, and run `doctor`. |
 | "Claude session isn't listening" | Open that Claude Code session in Claude Desktop; it picks up waiting messages when it starts. |
 | Nothing happens after an update | Re-run `node scripts/install.mjs` and restart both apps. |
-| The bundled `codex` isn't found | Set `PEER_BRIDGE_CODEX_BIN` to ChatGPT Desktop's own `codex`; `doctor` shows which one is used. |
+| The bundled `codex` isn't found | Set `AGENT_REVIEW_BRIDGE_CODEX_BIN` to ChatGPT Desktop's own `codex`; `doctor` shows which one is used. |
 
-Other settings, read by the bridge's processes: `PEER_BRIDGE_CLAUDE_BIN` (Claude Code CLI), `PEER_BRIDGE_CONFIG_DIR` (where `rules.md` and `config.json` live), `PEER_BRIDGE_DIR` (state), `PEER_BRIDGE_PORT` (broker port, default 7457), `PEER_BRIDGE_MAX_ROUNDS` (default 20).
+Other settings, read by the bridge's processes: `AGENT_REVIEW_BRIDGE_CLAUDE_BIN` (Claude Code CLI), `AGENT_REVIEW_BRIDGE_CONFIG_DIR` (where `rules.md` and `config.json` live), `AGENT_REVIEW_BRIDGE_DIR` (state), `AGENT_REVIEW_BRIDGE_PORT` (broker port, default 7457), `AGENT_REVIEW_BRIDGE_MAX_ROUNDS` (default 20).
 
 ## Known limits
 
@@ -239,7 +240,7 @@ agent ──bridge_review──▶ broker ──▶ reviewer chat ── reads t
 - **Waking Claude Code.** A background hook (`asyncRewake`) waits for messages for its session and wakes it with the whole message, in the same format a ChatGPT thread gets. It re-arms on every turn and session start. If a wake ever looks cut off, `bridge_receive` with the message's id returns it in full.
 - **Identity.** The bridge learns which chat is calling from the host, never from the model's memory: `CLAUDE_CODE_SESSION_ID` on the Claude side, `_meta.threadId` on the ChatGPT side. Context compaction can't break a link.
 - **Problems are visible.** A failed delivery or a Claude session that isn't listening shows up in the waiting chat's next prompt and in `bridge_status`.
-- **When no answer is coming.** Before a review goes to ChatGPT, the bridge checks its usage limit: if it's reached, nothing is sent and the agent hears when it opens again. After a review request or a message is queued in a ChatGPT thread, the bridge follows that exact turn (by an id it gives the prompt): early checks, then every 5 minutes, for up to 6 hours. If the turn fails (a usage limit, an outage) or ends without the review answer, the waiting chat is woken and told; past 6 hours it hears that no answer was confirmed. On the Claude side a `StopFailure` hook does the same when an API error (Claude's own limit, an outage) ends a turn the bridge woke it for. For a review, the notice says how to ask the same reviewer again (`round_of`): the retry keeps its round number and carries the reviewer's last real findings. Each case is told once, an answer that already arrived stays, and `bridge_status` shows ChatGPT's limits and the last observed failure of linked chats. Advisor mode doesn't do this yet.
+- **When no answer is coming.** Before a review goes to ChatGPT, the bridge checks its usage limit: if it's reached, nothing is sent and the agent hears when it opens again. After a review request or a message is queued in a ChatGPT thread, the bridge follows that exact turn (by an id it gives the prompt): early checks, then every minute, for up to 6 hours. If the turn fails (a usage limit, an outage) or ends without the review answer, the waiting chat is woken and told; past 6 hours it hears that no answer was confirmed. On the Claude side a `StopFailure` hook does the same when an API error (Claude's own limit, an outage) ends a turn the bridge woke it for. For a review, the notice says how to ask the same reviewer again (`round_of`): the retry keeps its round number and carries the reviewer's last real findings. Each case is told once, an answer that already arrived stays, and `bridge_status` shows ChatGPT's limits and the last observed failure of linked chats. Advisor mode doesn't do this yet.
 
 ## Development
 

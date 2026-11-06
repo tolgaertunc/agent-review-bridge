@@ -11,7 +11,7 @@ export const autoFor = (state, endpoint) => (endpoint && state?.auto?.[autoKey(e
 // To the working agent in full when auto mode is turned on and whenever its
 // session starts again (a compaction may have summarised them away)
 export const AUTO_RULES =
-  "[PEER-BRIDGE] Auto mode is on: you work with a second model as your reviewer (bridge_review; it reuses the same reviewer chat). " +
+  "[AGENT-REVIEW-BRIDGE] Auto mode is on: you work with a second model as your reviewer (bridge_review; it reuses the same reviewer chat). " +
   "Get its approval at the moments that matter, not at every small step, and never move past one of these without it:\n" +
   "- before settling a direction: when the work needs a plan or you must choose between approaches;\n" +
   "- when the direction changes: a different approach, a larger change than expected, a dropped or added requirement;\n" +
@@ -19,6 +19,8 @@ export const AUTO_RULES =
   "- when you hit an uncertainty that a short look into the code or docs doesn't resolve;\n" +
   "- before anything hard to undo (push, deleting data, migrations); the reviewer's approval doesn't replace the user's permission for these;\n" +
   "- before telling the user the work is done.\n" +
+  "After a long job of several steps, once the user says it's done, ask them once whether they want one review of the whole work (all its commits); " +
+  "do it only if they say yes, and don't offer it again. It doesn't replace the reviews above.\n" +
   "Small edits, reading and questions don't need a review on their own; they go into the next one.\n" +
   "In each request say what the goal is, what this step does, and anything that deviated from what was agreed. Name every folder or file you changed for this work in `paths`; " +
   "if you committed work in a path before its first review, say which commits. Don't argue for your solution; if the reviewer asks for changes and you disagree, give your reasons in the next round. " +
@@ -27,7 +29,7 @@ export const AUTO_RULES =
 
 // With each prompt in between: short, but complete on its own
 export const AUTO_RULES_SHORT =
-  "[PEER-BRIDGE] Auto mode is on: get the reviewer's approval (bridge_review) before settling or changing a direction, when a step is done and before committing it, " +
+  "[AGENT-REVIEW-BRIDGE] Auto mode is on: get the reviewer's approval (bridge_review) before settling or changing a direction, when a step is done and before committing it, " +
   "on an uncertainty a short look doesn't resolve, before push, deleting data or migrations (the user's permission is still needed), and before saying the work is done. " +
   "Name every path you changed in `paths`. Pass own_initiative=true only for a plan you chose to consult on; not if the user asked for that review or you're not sure.";
 
@@ -37,13 +39,13 @@ export const AUTO_REVIEWER =
   "Don't ask for a plan the work doesn't need. If this adapts work approved in another path, check it's consistent.";
 
 export const AUTO_REMINDER =
-  "[PEER-BRIDGE] For your information: you haven't consulted the reviewer for a few turns. If a decision or a change since then calls for it, ask now; if not, carry on.";
+  "[AGENT-REVIEW-BRIDGE] For your information: you haven't consulted the reviewer for a few turns. If a decision or a change since then calls for it, ask now; if not, carry on.";
 
 // From the Stop check, once for the same unreviewed changes in auto mode
 export const autoGuard = (unreviewed, unchecked = []) =>
   [
-    unreviewed.length && `[PEER-BRIDGE] Auto mode: the reviewer hasn't approved the current changes in ${unreviewed.join(", ")}.`,
-    unchecked.length && `[PEER-BRIDGE] Auto mode couldn't check ${unchecked.join("; ")}: tell the user, since unreviewed changes there can't be caught.`,
+    unreviewed.length && `[AGENT-REVIEW-BRIDGE] Auto mode: the reviewer hasn't approved the current changes in ${unreviewed.join(", ")}.`,
+    unchecked.length && `[AGENT-REVIEW-BRIDGE] Auto mode couldn't check ${unchecked.join("; ")}: tell the user, since unreviewed changes there can't be caught.`,
     unreviewed.length &&
       "Ask for a review (bridge_review) before you finish, or tell the user why not; telling them doesn't count as approval, the changes stay unreviewed.",
     "If you are waiting for the user's answer or have to stop for another reason, you can stop now.",

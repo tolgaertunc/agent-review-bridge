@@ -22,10 +22,10 @@ const RPC_MS = 60_000;
 export class AppServer {
   static async open({ debug = false, timeoutMs = RPC_MS } = {}) {
     const bin = findCodexCli();
-    if (!bin) throw new Error("ChatGPT Desktop's codex CLI not found (set PEER_BRIDGE_CODEX_BIN)");
+    if (!bin) throw new Error("ChatGPT Desktop's codex CLI not found (set AGENT_REVIEW_BRIDGE_CODEX_BIN)");
     const s = new AppServer(bin, debug);
     try {
-      await s.rpc("initialize", { clientInfo: { name: "peer-bridge", version: "0.1.0" }, capabilities: { experimentalApi: true } }, { timeoutMs });
+      await s.rpc("initialize", { clientInfo: { name: "agent-review-bridge", version: "0.1.0" }, capabilities: { experimentalApi: true } }, { timeoutMs });
       s.notify("initialized");
       return s;
     } catch (e) {
@@ -41,7 +41,7 @@ export class AppServer {
     this.listeners = new Set();
     // without our own MCP server: one spawned here would grab the broker and
     // die with this short-lived process
-    this.proc = spawn(bin, ["-c", "mcp_servers.peer_bridge.enabled=false", "app-server"], { stdio: ["pipe", "pipe", "pipe"] });
+    this.proc = spawn(bin, ["-c", "mcp_servers.agent_review_bridge.enabled=false", "app-server"], { stdio: ["pipe", "pipe", "pipe"] });
     this.proc.stderr.on("data", (d) => debug && process.stderr.write(d));
     // a process that dies or can't start fails every call still waiting
     const gone = (why) => {
@@ -190,7 +190,7 @@ export async function createThreadOn(s, { model, effort, cwd, name, seed, sandbo
   });
   const threadId = r.thread.id;
   if (effort) await s.rpc("thread/settings/update", { threadId, effort });
-  const text = seed ?? "This thread is driven by peer-bridge.";
+  const text = seed ?? "This thread is driven by agent-review-bridge.";
   await s.rpc("thread/inject_items", { threadId, items: [{ type: "message", role: "developer", content: [{ type: "input_text", text }] }] });
   if (name) await s.rpc("thread/name/set", { threadId, name });
   return { threadId, model: r.model };
@@ -210,7 +210,7 @@ export async function sendToThread(threadId, prompt, { wake = true, clientId = c
 // Tests stand in for ChatGPT with <data dir>/fake-codex.json:
 // { limits: <account/rateLimits/read answer>, turns: { <clientId>: {state, error} }, hang: true }
 function fake() {
-  if (!process.env.PEER_BRIDGE_FAKE_CODEX) return null;
+  if (!process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX) return null;
   try {
     return JSON.parse(fs.readFileSync(path.join(dataDir(), "fake-codex.json"), "utf8"));
   } catch {

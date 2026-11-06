@@ -1,4 +1,4 @@
-// Peer bridge MCP server (stdio):
+// Agent review bridge MCP server (stdio):
 //   node src/server.mjs --side claude   (Claude Code, one per session)
 //   node src/server.mjs --side openai   (ChatGPT Desktop)
 //
@@ -12,6 +12,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import fs from "node:fs";
 import path from "node:path";
 import { call, keepOwner, SIDES, MAX_DIFF, MAX_TEXT, HOST_ID, REVIEWER_ROLE, nextStep } from "./broker.mjs";
 import { identify, endpointOf } from "./caller.mjs";
@@ -19,12 +20,12 @@ import { pathInfo, usableBase, reviewSummary, pathDiff, fingerprint } from "./gi
 import { AUTO_RULES, AUTO_REVIEWER } from "./auto.mjs";
 import { rulesBlock } from "./rules.mjs";
 import { readConfig, writeConfig } from "./config.mjs";
-import { chatgptRunning, openChatgpt, openUrl } from "./platform.mjs";
+import { chatgptRunning, openChatgpt, openUrl, dataDir } from "./platform.mjs";
 import * as rc from "./readchat.mjs";
 import { claudeSession, readClaudePage, findClaude } from "./chats.mjs";
 
 const sideArg = process.argv.indexOf("--side");
-const SIDE = sideArg > -1 ? process.argv[sideArg + 1] : process.env.PEER_BRIDGE_SIDE;
+const SIDE = sideArg > -1 ? process.argv[sideArg + 1] : process.env.AGENT_REVIEW_BRIDGE_SIDE;
 if (!SIDES.includes(SIDE)) {
   console.error(`usage: server.mjs --side ${SIDES.join("|")}`);
   process.exit(2);
@@ -115,15 +116,39 @@ async function chatgptBlocked() {
   if (!l?.blocked) return null;
   return text(
     `Nothing was sent: ChatGPT's usage limit is reached${l.resetsAt ? ` until ${when(l.resetsAt)}` : ""}. ` +
-      "Tell the user; ask again after that, or once they have added credits.",
+      "Tell the user, in their language; ask again after that, or once they have added credits.",
   );
 }
 
+// Every chat the bridge makes is named so the user can tell it apart in
+// ChatGPT's sidebar, whatever name the agent gave it
+export const THREAD_PREFIX = "Agent review bridge · ";
+export const threadName = (name) => (name.startsWith(THREAD_PREFIX) ? name : THREAD_PREFIX + name);
+
+// The same model however it's written: "GPT 6.1 Sol" and "gpt-6.1-sol"
+const modelKey = (m) => String(m ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+const sameModel = (a, b) => modelKey(a) === modelKey(b);
+
 // A new ChatGPT thread, read-only: it reviews, it doesn't touch the project
 async function newThread({ model, effort, name, seed }) {
+  // tests: the chats that would be made are listed in <data dir>/fake-threads.json
+  if (process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX) {
+    const file = path.join(dataDir(), "fake-threads.json");
+    let made = [];
+    try {
+      made = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      // none yet
+    }
+    const threadId = `gpt-new-${made.length + 1}`;
+    made.push({ threadId, model: model ?? null, effort: effort ?? null, name: threadName(name) });
+    fs.writeFileSync(file, JSON.stringify(made));
+    await call("reviewer_chat", { endpoint: { app: "openai", id: threadId } });
+    return { threadId, model };
+  }
   const { createThread, ModelChoiceError } = await import("./codex.mjs");
   try {
-    const t = await createThread({ model, effort, name, seed, sandbox: "read-only" });
+    const t = await createThread({ model, effort, name: threadName(name), seed, sandbox: "read-only" });
     await call("reviewer_chat", { endpoint: { app: "openai", id: t.threadId } });
     return t;
   } catch (e) {
@@ -132,7 +157,7 @@ async function newThread({ model, effort, name, seed }) {
   }
 }
 
-const server = new McpServer({ name: "peer-bridge", version: "0.1.0" });
+const server = new McpServer({ name: "agent-review-bridge", version: "0.1.0" });
 
 server.registerTool(
   "bridge_send",
@@ -196,7 +221,7 @@ const DECIDING =
   "In a later round, judge it against your earlier findings, and don't raise new blocking points on parts you already accepted unless they are serious. ";
 
 const ADVISOR_BRIEF =
-  "You are the advisor in a peer-bridge link: another AI agent (the primary) works with the user in its own chat, " +
+  "You are the advisor in an agent-review-bridge link: another AI agent (the primary) works with the user in its own chat, " +
   "and after each of its turns a review request arrives in full in this chat. " +
   "For each one: review the primary's turn, call bridge_advise exactly once with request_id set to the request's id, then write the text it returns as your reply so the user can read it. " +
   DECIDING +
@@ -208,7 +233,7 @@ server.registerTool(
   {
     title: "Link an advisor to this chat",
     description:
-      "Make this chat the primary of a peer-bridge link: after each of your turns, an advisor chat in the other app reviews it. " +
+      "Make this chat the primary of an agent-review-bridge link: after each of your turns, an advisor chat in the other app reviews it. " +
       (SIDE === "claude"
         ? `advisor='openai' creates a new ChatGPT thread for it (optionally pick the model and effort; ${MODEL_CHOICE}) or binds an existing one (thread_id). `
         : "") +
@@ -237,7 +262,7 @@ server.registerTool(
     if (stop) return stop;
     let threadId = thread_id;
     if (!threadId) {
-      const t = await newThread({ model, effort, name: name ?? "Peer bridge · Advisor", seed: ADVISOR_BRIEF });
+      const t = await newThread({ model, effort, name: name ?? "Advisor", seed: ADVISOR_BRIEF });
       if (t.refused) return text(t.refused);
       threadId = t.threadId;
     }
@@ -426,7 +451,10 @@ server.registerTool(
       "After [CHANGES REQUESTED], ask for the next round with round_of (the previous review's link id): same reviewer and kind, and say what you changed and where you disagree; " +
       "after a review that got no answer, round_of asks the same reviewer again. " +
       (SIDE === "claude"
-        ? `reviewer='openai' opens a new ChatGPT thread for it (pick the model and effort; ${MODEL_CHOICE}), or continues in an earlier one (thread_id), which keeps that chat's context; `
+        ? `reviewer='openai' opens a new ChatGPT thread for it (pick the model and effort; ${MODEL_CHOICE}), or continues in an earlier one (thread_id), which keeps that chat's context. ` +
+          "Use thread_id only to go on with the same work (a later round, or a follow-up of it); for other work open a new thread, even with the same model. " +
+          "A reviewer the user names by model (\"ask Astra\") means a new thread with that model, unless they point to an earlier chat. " +
+          "In auto mode a review without thread_id goes to auto mode's reviewer chat, unless you give another model or a name: then it gets a chat of its own. "
         : "") +
       "reviewer='join' returns a code for an existing chat, which then calls bridge_link_join. The answer arrives as a new turn.",
     inputSchema: {
@@ -445,7 +473,7 @@ server.registerTool(
         thread_id: z
           .string()
           .optional()
-          .describe("Existing ChatGPT thread to review in, e.g. an earlier reviewer's; it keeps its own model and permissions (model/effort/name are ignored)"),
+          .describe("Existing ChatGPT thread to review in, for the same work only (an earlier reviewer of it); it keeps its own model and permissions (model/effort/name are ignored)"),
       }),
     },
     annotations: LOCAL,
@@ -454,17 +482,27 @@ server.registerTool(
     const primary = await self(extra);
     if (!primary) return text("Can't tell which chat this is, so the review can't be routed back.");
     const auto = await autoOf(primary);
+    if (!name?.trim()) name = undefined;
     // 1. Where it goes, with no side effects: the earlier round's reviewer,
     // auto mode's reviewer chat, or the one asked for (a join has none yet)
     let round = null;
     let target = null;
+    let separate = false;
     if (round_of) round = await call("round_info", { primary, roundOf: round_of });
     else {
       if (auto && SIDE === "claude" && reviewer !== "join") {
         reviewer = "openai";
-        thread_id ??= auto.thread;
-        model ??= auto.model;
-        effort ??= auto.effort;
+        // a chat asked for by another model or by name is a chat of its own;
+        // auto mode's reviewer chat stays as it is. The first review makes
+        // auto mode's chat with what it asks for, unless that is another
+        // model than the one auto mode was turned on with.
+        const other = model !== undefined && !sameModel(model, auto.model);
+        separate = !thread_id && (auto.thread ? name !== undefined || other : other && auto.model != null);
+        if (!separate) {
+          thread_id ??= auto.thread;
+          model ??= auto.model;
+          effort ??= auto.effort;
+        }
       }
       if (!reviewer) return text("Say where the reviewer runs (reviewer), or continue an earlier review with round_of.");
     }
@@ -497,17 +535,19 @@ server.registerTool(
     }
     let threadId = thread_id;
     if (!threadId) {
-      const t = await newThread({ model, effort, name: name ?? `Peer bridge · ${what}: ${request.trim().slice(0, 40)}`, seed: REVIEWER_BRIEF });
+      const t = await newThread({ model, effort, name: name ?? `${what}: ${request.trim().slice(0, 40)}`, seed: REVIEWER_BRIEF });
       if (t.refused) return text(t.refused);
       threadId = t.threadId;
       model = t.model ?? model;
-      if (auto) await call("auto_thread", { endpoint: primary, thread: threadId });
+      if (auto && !separate) await call("auto_thread", { endpoint: primary, thread: threadId, model, effort });
     }
     const r = await call("link_create", { primary, mode: "review", advisor: { app: "openai", id: threadId }, request: req.text, plan, noGate, reqPaths: req.reqPaths });
     const where = thread_id ? `ChatGPT thread ${threadId}` : `a new ChatGPT thread (${threadId}${model ? `, ${model}` : ""}${effort ? `, effort ${effort}` : ""})`;
     return withRules(
       `${what} ${r.id} sent to ${where}. The answer arrives as a new turn when it's ready. ${WAIT}` +
-        (auto ? " Auto mode keeps using this reviewer chat." : ` To continue in that chat later, pass thread_id ${threadId}.`),
+        (auto && !separate && (thread_id ?? null) === (auto.thread ?? null)
+          ? " Auto mode keeps using this reviewer chat."
+          : ` To continue this work in that chat later, pass thread_id ${threadId}; for other work, start a new chat.`),
       { ...r, threadId },
     );
   },
@@ -562,7 +602,7 @@ server.registerTool(
   "bridge_link_join",
   {
     title: "Become an advisor",
-    description: "Make this chat the advisor or reviewer of a peer-bridge link, using the join code from bridge_link or bridge_review.",
+    description: "Make this chat the advisor or reviewer of an agent-review-bridge link, using the join code from bridge_link or bridge_review.",
     inputSchema: { code: z.string().describe("Join code from bridge_link or bridge_review") },
     annotations: LOCAL,
   },
@@ -584,7 +624,7 @@ server.registerTool(
 server.registerTool(
   "bridge_unlink",
   {
-    title: "End peer-bridge links",
+    title: "End agent-review-bridge links",
     description: "Stop reviews: close every active link this chat is part of (as primary or advisor).",
     inputSchema: {},
     annotations: LOCAL,
@@ -636,22 +676,22 @@ const READ_CHAT =
   "Several matches, or a search that couldn't reach every chat: you get a list; ask the user which one, don't guess. Long chats and long lists come in pages: pass the returned cursor.";
 
 // ChatGPT is faked in the tests; they never read the real app's chats
-const chatgptOff = () => (process.env.PEER_BRIDGE_FAKE_CODEX ? "ChatGPT is stood in for in tests" : null);
+const chatgptOff = () => (process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX ? "ChatGPT is stood in for in tests" : null);
 
 async function readOne({ app, id, includeTools, limit, resume, self: me }) {
-  if (id === me) return text("[PEER-BRIDGE] That is this chat itself; it isn't read through the bridge.");
+  if (id === me) return text("[AGENT-REVIEW-BRIDGE] That is this chat itself; it isn't read through the bridge.");
   const opts = { resume, limit, includeTools };
   let r;
   if (app === "claude") {
     try {
       const s = await claudeSession(id);
-      if (!s) return text(`[PEER-BRIDGE] No Claude Code session with id ${id} on this computer.`);
+      if (!s) return text(`[AGENT-REVIEW-BRIDGE] No Claude Code session with id ${id} on this computer.`);
       r = await readClaudePage(s, opts);
     } catch (e) {
-      return text(`[PEER-BRIDGE] That Claude Code session couldn't be read right now (${e.message}).`);
+      return text(`[AGENT-REVIEW-BRIDGE] That Claude Code session couldn't be read right now (${e.message}).`);
     }
   } else {
-    const cant = (why) => text(`[PEER-BRIDGE] ChatGPT Desktop's chats couldn't be read right now (${why}).`);
+    const cant = (why) => text(`[AGENT-REVIEW-BRIDGE] ChatGPT Desktop's chats couldn't be read right now (${why}).`);
     if (chatgptOff()) return cant(chatgptOff());
     const { withChatgpt, readChatgptPage } = await import("./codex.mjs");
     try {
@@ -698,17 +738,17 @@ server.registerTool(
     // chat don't read the user's other chats, unless the user's own setting
     // says so. Nothing an agent passes can change this.
     const me = await self(extra);
-    if (!me) return text("[PEER-BRIDGE] Can't tell which chat this is, so it can't read other chats.");
+    if (!me) return text("[AGENT-REVIEW-BRIDGE] Can't tell which chat this is, so it can't read other chats.");
     if (readConfig().readChatsInReviewers !== "allow" && !(await call("read_chat_allowed", { endpoint: me })).allowed) return text(rc.READER_BLOCKED);
     const limit = a.limit ?? rc.PAGE_LIMIT;
     let crit = null;
     let after = null;
     if (a.cursor) {
       const c = rc.decodeCursor(a.cursor);
-      if (!c) return text("[PEER-BRIDGE] That cursor isn't one this tool returned. Leave it out to start again.");
+      if (!c) return text("[AGENT-REVIEW-BRIDGE] That cursor isn't one this tool returned. Leave it out to start again.");
       const other = a.name !== undefined || a.folder !== undefined || a.archived !== undefined;
       const conflict = c.k === "read" ? other || (a.id && a.id !== c.id) || (a.app && a.app !== c.app) || (a.include_tools !== undefined && !!a.include_tools !== !!c.t) : other || a.id !== undefined || a.app !== undefined;
-      if (conflict) return text("[PEER-BRIDGE] A cursor goes on with the same chat or the same search; other arguments can't change that. Leave it out to start again.");
+      if (conflict) return text("[AGENT-REVIEW-BRIDGE] A cursor goes on with the same chat or the same search; other arguments can't change that. Leave it out to start again.");
       if (c.k === "read") return readOne({ app: c.app, id: c.id, includeTools: !!c.t, limit, resume: c.r, self: me.id });
       crit = c.crit;
       after = c.after;
@@ -718,11 +758,11 @@ server.registerTool(
       return readOne({ app, id: a.id, includeTools: !!a.include_tools, limit, self: me.id });
     }
     if (!crit) {
-      if (!a.name) return text("[PEER-BRIDGE] Say which chat: its name or its id.");
+      if (!a.name) return text("[AGENT-REVIEW-BRIDGE] Say which chat: its name or its id.");
       let folder = a.folder;
       if (folder && !path.isAbsolute(folder)) {
         const base = projectDir(extra);
-        if (!base) return text("[PEER-BRIDGE] This chat's folder isn't known here: give the folder as a full path.");
+        if (!base) return text("[AGENT-REVIEW-BRIDGE] This chat's folder isn't known here: give the folder as a full path.");
         folder = path.resolve(base, folder);
       }
       crit = { app: a.app ?? null, name: a.name, folder: folder ?? null, archived: !!a.archived };
@@ -762,10 +802,10 @@ const serverInfo = {
   pid: process.pid,
   ppid: process.ppid,
   session: Object.fromEntries(SESSION_VARS.filter((k) => process.env[k]).map((k) => [k, process.env[k]])),
-  hostEnvNames: Object.keys(process.env).filter((k) => /^(CLAUDE|CODEX|OPENAI|MCP|PEER_BRIDGE)/i.test(k)),
+  hostEnvNames: Object.keys(process.env).filter((k) => /^(CLAUDE|CODEX|OPENAI|MCP|AGENT_REVIEW_BRIDGE)/i.test(k)),
 };
 call("report", { side: SIDE, event: "server-start", data: serverInfo }).catch(() => {});
 keepOwner();
 
 await server.connect(new StdioServerTransport());
-console.error(`[peer-bridge] stdio server ready (side=${SIDE}, pid=${process.pid})`);
+console.error(`[agent-review-bridge] stdio server ready (side=${SIDE}, pid=${process.pid})`);

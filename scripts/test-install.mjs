@@ -8,7 +8,7 @@ import path from "node:path";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 
-const root = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-install-"));
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-install-"));
 const claudeDir = path.join(root, "claude");
 const codexDir = path.join(root, "codex");
 for (const d of [claudeDir, codexDir]) fs.mkdirSync(d);
@@ -32,7 +32,7 @@ install();
 install(); // idempotent
 let claude = flat(read(path.join(claudeDir, "settings.json")));
 let codex = flat(read(path.join(codexDir, "hooks.json")));
-assert.deepEqual(read(path.join(claudeDir, "settings.json")).permissions.allow, ["Bash(ls:*)", "mcp__peer-bridge"]);
+assert.deepEqual(read(path.join(claudeDir, "settings.json")).permissions.allow, ["Bash(ls:*)", "mcp__agent-review-bridge"]);
 assert.equal(claude.Stop.filter(ours).length, 2);
 assert.ok(claude.Stop.some((h) => h.command === "echo other"));
 assert.ok(claude.Stop.find((h) => h.command.includes("--event listen")).asyncRewake);
@@ -47,11 +47,11 @@ if (process.platform === "win32") {
   // PowerShell can't start a command line with a quoted path
   const w = codex.Stop[0].commandWindows;
   assert.ok(w && !w.startsWith('"'), `commandWindows must not start with a quote: ${w}`);
-  execFileSync("powershell.exe", ["-NoProfile", "-Command", `'{}' | ${w}; exit $LASTEXITCODE`], { env: { ...env, PEER_BRIDGE_DIR: root } });
+  execFileSync("powershell.exe", ["-NoProfile", "-Command", `'{}' | ${w}; exit $LASTEXITCODE`], { env: { ...env, AGENT_REVIEW_BRIDGE_DIR: root } });
 }
 assert.equal(codex.PreToolUse[0].command, "echo keep");
 const toml = fs.readFileSync(path.join(codexDir, "config.toml"), "utf8");
-assert.equal(toml.match(/>>> peer-bridge/g).length, 1);
+assert.equal(toml.match(/>>> agent-review-bridge/g).length, 1);
 assert.match(toml, /default_tools_approval_mode = "approve"/);
 console.log("install ×2: one copy of each hook, other hooks kept, legacy Codex hook replaced, approvals set");
 
@@ -66,16 +66,16 @@ console.log("uninstall: only our entries removed");
 // Windows volume without 8.3 names: the PowerShell call-operator form is
 // written instead, and it runs the hook
 if (process.platform === "win32") {
-  execFileSync(process.execPath, [path.resolve(import.meta.dirname, "install.mjs")], { env: { ...env, PEER_BRIDGE_NO_SHORT_NAMES: "1" }, encoding: "utf8" });
+  execFileSync(process.execPath, [path.resolve(import.meta.dirname, "install.mjs")], { env: { ...env, AGENT_REVIEW_BRIDGE_NO_SHORT_NAMES: "1" }, encoding: "utf8" });
   const w = flat(read(path.join(codexDir, "hooks.json"))).Stop[0].commandWindows;
   assert.ok(w.startsWith('& "') && w.includes(process.execPath), `fallback form expected, got: ${w}`);
   const dataDir = path.join(root, "data");
   execFileSync("powershell.exe", ["-NoProfile", "-Command", `'{"session_id":"fallback-probe"}' | ${w}; exit $LASTEXITCODE`], {
-    env: { ...env, PEER_BRIDGE_DIR: dataDir },
+    env: { ...env, AGENT_REVIEW_BRIDGE_DIR: dataDir },
   });
   fs.writeFileSync(path.join(dataDir, "debug-hooks"), "");
   execFileSync("powershell.exe", ["-NoProfile", "-Command", `'{"session_id":"fallback-probe"}' | ${w}; exit $LASTEXITCODE`], {
-    env: { ...env, PEER_BRIDGE_DIR: dataDir },
+    env: { ...env, AGENT_REVIEW_BRIDGE_DIR: dataDir },
   });
   assert.match(fs.readFileSync(path.join(dataDir, "hooks.jsonl"), "utf8"), /"session_id":"fallback-probe"/, "fallback command must reach the hook");
   install("--uninstall");
