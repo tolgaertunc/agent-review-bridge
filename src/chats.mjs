@@ -95,17 +95,23 @@ const parse = (buf) => {
 };
 
 // The file's records from `start` (a byte position) back to its beginning, as
-// { offset, raw }: raw is null for a record over MAX_RECORD, whose bytes are
-// never kept. Ends with { budget: true } once more than `budget` bytes were
-// read; a record being skipped counts only towards `skipBudget`, so a page
-// read always gets past one.
-export async function* reverseRecords(file, { start, budget = Infinity, skipBudget = Infinity } = {}) {
+// { offset, raw, head }: raw is null for a record over MAX_RECORD, whose bytes
+// are never kept, and head is its first bytes, enough to tell it apart. Ends
+// with { budget: true } once more than `budget` bytes were read. If that
+// happens inside such a record it also gives { skipAt, head }: start there with
+// `skipping` to go on, so no record can make one call read without limit.
+export async function* reverseRecords(file, { start, budget = Infinity, skipping: resumeSkip = false } = {}) {
   const fh = await fs.promises.open(file, "r");
+  const headAt = async (offset) => {
+    const buf = Buffer.alloc(FINGERPRINT_BYTES);
+    const { bytesRead } = await fh.read(buf, 0, buf.length, offset);
+    return buf.subarray(0, bytesRead);
+  };
   try {
     const size = start ?? (await fh.stat()).size;
     let pos = size;
     let carry = Buffer.alloc(0);
-    let skipping = false;
+    let skipping = resumeSkip;
     while (pos > 0) {
       const from = Math.max(0, pos - CHUNK);
       const chunk = Buffer.alloc(pos - from);
@@ -116,10 +122,10 @@ export async function* reverseRecords(file, { start, budget = Infinity, skipBudg
       if (skipping) {
         const nl = chunk.lastIndexOf(10);
         if (nl === -1) {
-          if (size - pos > skipBudget) return void (yield { budget: true });
+          if (size - pos > budget) return void (yield { budget: true, skipAt: pos, head: chunk.subarray(0, FINGERPRINT_BYTES) });
           continue;
         }
-        yield { offset: from + nl + 1, raw: null };
+        yield { offset: from + nl + 1, raw: null, head: await headAt(from + nl + 1) };
         skipping = false;
         body = chunk.subarray(0, nl + 1);
         carry = Buffer.alloc(0);
@@ -131,7 +137,8 @@ export async function* reverseRecords(file, { start, budget = Infinity, skipBudg
         if (nl === -1) break;
         if (end > nl + 1) {
           const len = end - nl - 1;
-          yield { offset: from + nl + 1, raw: len > MAX_RECORD ? null : all.subarray(nl + 1, end) };
+          if (len > MAX_RECORD) yield { offset: from + nl + 1, raw: null, head: all.subarray(nl + 1, nl + 1 + FINGERPRINT_BYTES) };
+          else yield { offset: from + nl + 1, raw: all.subarray(nl + 1, end) };
           if (size - pos > budget) return void (yield { budget: true });
         }
         end = nl;
@@ -142,7 +149,7 @@ export async function* reverseRecords(file, { start, budget = Infinity, skipBudg
         carry = Buffer.alloc(0);
       }
     }
-    if (skipping) yield { offset: 0, raw: null };
+    if (skipping) yield { offset: 0, raw: null, head: await headAt(0) };
     else if (carry.length) yield { offset: 0, raw: carry };
   } finally {
     await fh.close();
@@ -206,7 +213,7 @@ export async function claudeMeta(s) {
   let folder = null;
   let scannedAll = true;
   if (s.size > 0)
-    for await (const rec of reverseRecords(s.file, { budget: META_BYTES, skipBudget: META_BYTES })) {
+    for await (const rec of reverseRecords(s.file, { budget: META_BYTES })) {
       if (rec.budget) {
         scannedAll = false;
         break;
@@ -323,19 +330,19 @@ async function resultsAfter(file, offset) {
   return results;
 }
 
-// Is that position still the start of the same record? A shifted or rewritten
-// file fails this; records added at the end don't touch it.
-async function boundaryHolds(file, { o, h }) {
+// Is that position still the start of the same record (or, inside a huge one,
+// the same bytes)? A shifted or rewritten file fails this; records added at
+// the end don't touch it.
+async function boundaryHolds(file, { o, h, s: inside }) {
   const fh = await fs.promises.open(file, "r");
   try {
     const { size } = await fh.stat();
     if (o >= size) return false;
-    if (o > 0) {
+    if (o > 0 && !inside) {
       const prev = Buffer.alloc(1);
       await fh.read(prev, 0, 1, o - 1);
       if (prev[0] !== 10) return false;
     }
-    if (!h) return true; // a record too large to keep: only its position is known
     const buf = Buffer.alloc(FINGERPRINT_BYTES);
     const { bytesRead } = await fh.read(buf, 0, buf.length, o);
     const nl = buf.subarray(0, bytesRead).indexOf(10);
@@ -348,7 +355,8 @@ async function boundaryHolds(file, { o, h }) {
 // A session's units, newest first, as { unit, pos }, or { budget: true }. pos
 // is { o, h, l }: where the unit's earliest record starts, its fingerprint,
 // and whether an assistant message follows in that turn (which is what makes
-// an earlier one a step, not the answer). Records of one assistant message
+// an earlier one a step, not the answer); with s: true it is a place inside a
+// huge record, where the last call's budget ran out. Records of one assistant message
 // are merged into one unit, however far apart; things dropped in between are
 // reported right after it, so no cursor can fall inside a message.
 export async function* claudeStream(file, resume, { includeTools = true, budget = PAGE_BYTES } = {}) {
@@ -374,12 +382,13 @@ export async function* claudeStream(file, resume, { includeTools = true, budget 
   };
   const dropped = function* (kind, rec) {
     if (open) pending.push(kind);
-    else yield { unit: { kind }, pos: { o: rec.offset, h: fingerprint(rec.raw), l: later } };
+    else yield { unit: { kind }, pos: { o: rec.offset, h: fingerprint(rec.raw ?? rec.head), l: later } };
   };
-  for await (const rec of reverseRecords(file, { start: resume?.o, budget })) {
+  for await (const rec of reverseRecords(file, { start: resume?.o, budget, skipping: !!resume?.s })) {
     if (rec.budget) {
+      // a message still open comes first, so the cursor can sit past it
       yield* flush();
-      yield { budget: true };
+      yield { budget: true, ...(rec.skipAt !== undefined && { pos: { o: rec.skipAt, h: fingerprint(rec.head), l: later, s: true } }) };
       return;
     }
     if (!rec.raw) {

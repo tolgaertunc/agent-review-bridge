@@ -633,7 +633,7 @@ const READ_CHAT =
   "Chats that exist only on a website (ordinary chatgpt.com or claude.ai chats) aren't stored here: say so, and use another way only if the user asks for one. " +
   "Only for a chat the user asked for; don't browse their chats on your own. " +
   "Read-only: it creates no link, sends nothing, wakes no one, and works with the other app closed. " +
-  "Several matches, or a search that couldn't reach every chat: you get a list; ask the user which one, don't guess. Long chats come in pages: pass the returned cursor.";
+  "Several matches, or a search that couldn't reach every chat: you get a list; ask the user which one, don't guess. Long chats and long lists come in pages: pass the returned cursor.";
 
 // ChatGPT is faked in the tests; they never read the real app's chats
 const chatgptOff = () => (process.env.PEER_BRIDGE_FAKE_CODEX ? "ChatGPT is stood in for in tests" : null);
@@ -687,8 +687,7 @@ server.registerTool(
       id: z.string().optional().describe("A ChatGPT thread id or a Claude session id, to read that chat directly"),
       folder: z.string().optional().describe("Only chats working in this folder or below it; relative to this chat's folder"),
       archived: z.boolean().optional().describe("Also look in ChatGPT's archived chats"),
-      page: z.number().int().min(1).optional().describe(`Which page of a list of matches (${rc.LIST_PAGE} per page)`),
-      cursor: z.string().optional().describe("The cursor a previous read returned, to read further back in the same chat"),
+      cursor: z.string().optional().describe("The cursor a previous call returned: to read further back in the same chat, or to list more of the same matches"),
       limit: z.number().int().min(1).max(rc.MAX_LIMIT).optional().describe(`Messages per page of a chat (default ${rc.PAGE_LIMIT})`),
       include_tools: z.boolean().optional().describe("Also show the chat's tool steps and the text between them"),
     },
@@ -702,33 +701,38 @@ server.registerTool(
     if (!me) return text("[PEER-BRIDGE] Can't tell which chat this is, so it can't read other chats.");
     if (readConfig().readChatsInReviewers !== "allow" && !(await call("read_chat_allowed", { endpoint: me })).allowed) return text(rc.READER_BLOCKED);
     const limit = a.limit ?? rc.PAGE_LIMIT;
+    let crit = null;
+    let after = null;
     if (a.cursor) {
       const c = rc.decodeCursor(a.cursor);
       if (!c) return text("[PEER-BRIDGE] That cursor isn't one this tool returned. Leave it out to start again.");
-      const conflict = a.name !== undefined || a.folder !== undefined || a.archived !== undefined || a.page !== undefined || (a.id && a.id !== c.id) || (a.app && a.app !== c.app) || (a.include_tools !== undefined && !!a.include_tools !== !!c.t);
-      if (conflict) return text("[PEER-BRIDGE] A cursor goes on reading the same chat with the same options; other arguments can't change that. Leave it out to start again.");
-      return readOne({ app: c.app, id: c.id, includeTools: !!c.t, limit, resume: c.r, self: me.id });
+      const other = a.name !== undefined || a.folder !== undefined || a.archived !== undefined;
+      const conflict = c.k === "read" ? other || (a.id && a.id !== c.id) || (a.app && a.app !== c.app) || (a.include_tools !== undefined && !!a.include_tools !== !!c.t) : other || a.id !== undefined || a.app !== undefined;
+      if (conflict) return text("[PEER-BRIDGE] A cursor goes on with the same chat or the same search; other arguments can't change that. Leave it out to start again.");
+      if (c.k === "read") return readOne({ app: c.app, id: c.id, includeTools: !!c.t, limit, resume: c.r, self: me.id });
+      crit = c.crit;
+      after = c.after;
     }
-    if (a.id) {
+    if (!crit && a.id) {
       const app = a.app ?? ((await claudeSession(a.id).catch(() => null)) ? "claude" : "chatgpt");
       return readOne({ app, id: a.id, includeTools: !!a.include_tools, limit, self: me.id });
     }
-    if (!a.name) return text("[PEER-BRIDGE] Say which chat: its name or its id.");
-    let folder = a.folder;
-    if (folder && !path.isAbsolute(folder)) {
-      const base = projectDir(extra);
-      if (!base) return text("[PEER-BRIDGE] This chat's folder isn't known here: give the folder as a full path.");
-      folder = path.resolve(base, folder);
+    if (!crit) {
+      if (!a.name) return text("[PEER-BRIDGE] Say which chat: its name or its id.");
+      let folder = a.folder;
+      if (folder && !path.isAbsolute(folder)) {
+        const base = projectDir(extra);
+        if (!base) return text("[PEER-BRIDGE] This chat's folder isn't known here: give the folder as a full path.");
+        folder = path.resolve(base, folder);
+      }
+      crit = { app: a.app ?? null, name: a.name, folder: folder ?? null, archived: !!a.archived };
     }
-    const page = a.page ?? 1;
-    if (page * rc.LIST_PAGE > rc.MAX_KEPT) return text(rc.TOO_DEEP);
-    const crit = { app: a.app ?? null, name: a.name, folder: folder ?? null, archived: !!a.archived };
-    const found = await rc.findChats(crit, me.id, chatSources(), { page });
+    const found = await rc.findChats(crit, me.id, chatSources(), { after });
     if (!found.candidates.length) return text(rc.noneText(found, crit));
     // a search that couldn't reach everything could have missed another match
     const only = rc.pickOne(found);
     if (only) return readOne({ app: only.app, id: only.id, includeTools: !!a.include_tools, limit, self: me.id });
-    return text(rc.listText(found));
+    return text(rc.listText(found, found.more ? rc.encodeCursor({ k: "list", crit, after: found.next }) : null));
   },
 );
 

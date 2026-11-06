@@ -20,10 +20,6 @@ export const MAX_COMMAND = 160;
 const MAX_NAME = 200;
 const MAX_FOLDER = 300;
 export const LIST_PAGE = 15;
-// Results kept in memory for one call: the requested page and the ones before
-// it, never more than this. Every match is still counted, and every match
-// within this window can be reached; past it the agent is told to narrow it.
-export const MAX_KEPT = 5_000;
 // A whole search stops here and says what it didn't reach
 export const SEARCH_MS = 30_000;
 
@@ -59,8 +55,10 @@ export const chatEntry = (c) => ({ ...c, name: capped(c.name, MAX_NAME), folder:
 
 // ------------------------------------------------------------------ cursors
 
-// Opaque to the agent, and checked: it continues reading one chat with one
-// set of options, and nothing else
+// Opaque to the agent, and checked. A read cursor continues reading one chat
+// with one set of options. A list cursor names the same search and the last
+// entry listed; each call scans every chat again, so nothing can be skipped
+// by a position in a list that moved.
 export const encodeCursor = (c) => Buffer.from(JSON.stringify(c)).toString("base64url");
 
 const validPos = (app, r) =>
@@ -68,10 +66,13 @@ const validPos = (app, r) =>
     ? Number.isInteger(r?.o) && r.o >= 0 && typeof r.h === "string" && typeof r.l === "boolean"
     : (r?.pc === null || typeof r?.pc === "string") && typeof r?.b === "string";
 
+const validKey = (a) => typeof a?.exact === "boolean" && typeof a.updated === "number" && typeof a.app === "string" && typeof a.id === "string";
+
 export function decodeCursor(s) {
   try {
     const c = JSON.parse(Buffer.from(String(s), "base64url").toString("utf8"));
     if (c?.k === "read" && (c.app === "claude" || c.app === "chatgpt") && typeof c.id === "string" && (c.t === 0 || c.t === 1) && validPos(c.app, c.r)) return c;
+    if (c?.k === "list" && typeof c.crit?.name === "string" && validKey(c.after)) return c;
   } catch {
     // not one of ours
   }
@@ -131,6 +132,7 @@ export async function assemble(stream, { limit = PAGE_LIMIT, includeTools = fals
   for await (const step of stream) {
     if (step.budget) {
       more = true;
+      if (step.pos) pos = step.pos; // stopped inside a huge record: go on from there
       break;
     }
     const { unit } = step;
@@ -185,9 +187,10 @@ const scopeText = (scope) =>
     .map(([app, s]) => `${APP_NAME[app]}: ${s}`)
     .join("; ");
 
-export function listText(found) {
-  const pages = Math.ceil(found.total / LIST_PAGE);
-  const paging = pages > 1 ? ` (page ${found.page} of ${pages}, newest first${found.page < pages ? `; pass page ${found.page + 1} for more` : ""})` : "";
+export function listText(found, cursor) {
+  const from = found.before + 1;
+  const to = found.before + found.candidates.length;
+  const paging = found.total > found.candidates.length ? ` (${from}–${to}, newest first${found.more ? `; pass cursor "${cursor}" for more` : ""})` : "";
   const partial = found.complete ? "" : `; not every chat could be searched (${scopeText(found.scope)}), so there may be more: narrow it with app or folder, or try again`;
   return [
     `[PEER-BRIDGE] ${found.total === 1 ? "1 chat matches" : `${found.total} chats match`}${paging}${partial}. Ask the user which one; then read it by id. Don't guess. ` +
@@ -201,18 +204,15 @@ export function listText(found) {
 
 export function noneText(found, crit) {
   const what = [crit.name && `name "${crit.name}"`, crit.folder && `folder ${crit.folder}`].filter(Boolean).join(", ");
-  const page = found.total ? `There are ${found.total} matches, so page ${found.page} is past the end. ` : "";
   const partial = found.complete ? "" : " Not every chat could be searched, so it may still exist.";
+  const none = found.total ? `No more matches: all ${found.total} have been listed.${partial} ` : `No chat matches ${what || "that"} in ${scopeText(found.scope) || "the chats searched"}.${partial} `;
   return [
-    `[PEER-BRIDGE] ${page}${found.total ? "" : `No chat matches ${what || "that"} in ${scopeText(found.scope) || "the chats searched"}.${partial} `}` +
-      "Chats that exist only on chatgpt.com or claude.ai aren't stored on this computer.",
+    `[PEER-BRIDGE] ${none}` + "Chats that exist only on chatgpt.com or claude.ai aren't stored on this computer.",
     errorsText(found),
   ]
     .filter(Boolean)
     .join("\n\n");
 }
-
-export const TOO_DEEP = `[PEER-BRIDGE] That page is too far down (only the first ${MAX_KEPT} matches can be listed). Narrow it with name, app or folder.`;
 
 function errorsText(found) {
   const whole = Object.entries(found.errors ?? {}).map(([app, msg]) => `${APP_NAME[app]}'s chats couldn't be read right now (${msg}).`);
@@ -228,15 +228,20 @@ export const READER_BLOCKED =
 
 // -------------------------------------------------------------- finding
 
-// What a search keeps while it scans: every match is counted, but only the
-// entries up to the requested page stay in memory
-export function collector({ name, page = 1 }) {
+// The one order lists use: exact names first, then newest, then a tie-break,
+// so "what comes after this entry" always has one answer
+const order = (a, b) =>
+  Number(b.exact) - Number(a.exact) || (b.updated ?? 0) - (a.updated ?? 0) || (a.app < b.app ? -1 : a.app > b.app ? 1 : 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
+// What a search keeps while it scans: every match is counted, and only one
+// page of the entries after `after` stays in memory, however many match or
+// however far down the list is. So every match can be reached.
+export function collector({ name, after = null }) {
   const want = name ? normalizeName(name) : null;
-  const keep = Math.min(page * LIST_PAGE, MAX_KEPT);
-  const order = (a, b) => b.exact - a.exact || (b.updated ?? 0) - (a.updated ?? 0);
   let kept = [];
   let total = 0;
   let exact = 0;
+  let before = 0;
   let peak = 0;
   return {
     add(chat) {
@@ -244,13 +249,26 @@ export function collector({ name, page = 1 }) {
       c.exact = !!want && normalizeName(chat.name) === want;
       total++;
       if (c.exact) exact++;
+      if (after && order(c, after) <= 0) return void before++;
       kept.push(c);
-      if (kept.length >= keep * 2) kept = kept.sort(order).slice(0, keep);
+      if (kept.length >= LIST_PAGE * 2) kept = kept.sort(order).slice(0, LIST_PAGE);
       peak = Math.max(peak, kept.length);
     },
     result() {
       kept.sort(order);
-      return { candidates: kept.slice((page - 1) * LIST_PAGE, page * LIST_PAGE), first: kept[0] ?? null, total, exact, peak };
+      const candidates = kept.slice(0, LIST_PAGE);
+      const last = candidates.at(-1);
+      return {
+        candidates,
+        first: kept[0] ?? null,
+        total,
+        exact,
+        before,
+        peak,
+        more: before + candidates.length < total,
+        // where a next call goes on from
+        next: last ? { exact: last.exact, updated: last.updated ?? 0, app: last.app, id: last.id } : null,
+      };
     },
   };
 }
@@ -260,9 +278,9 @@ export function collector({ name, page = 1 }) {
 // args.add for each match, or a string saying why that app can't be searched.
 // An app that fails is reported as such, never as "no match", and makes the
 // search incomplete.
-export async function findChats(crit, self, sources, { page = 1, deadline = Date.now() + SEARCH_MS } = {}) {
-  const c = collector({ name: crit.name, page });
-  const out = { complete: true, scope: {}, errors: {}, partial: {}, page };
+export async function findChats(crit, self, sources, { after = null, deadline = Date.now() + SEARCH_MS } = {}) {
+  const c = collector({ name: crit.name, after });
+  const out = { complete: true, scope: {}, errors: {}, partial: {}, continued: !!after };
   for (const app of ["claude", "chatgpt"]) {
     if (crit.app && crit.app !== app) continue;
     const src = sources[app];
@@ -283,6 +301,6 @@ export async function findChats(crit, self, sources, { page = 1, deadline = Date
 // The one chat to read without asking: only after a complete search, with no
 // app failing, and a single exact name match or a single match at all
 export function pickOne(found) {
-  if (found.page !== 1 || !found.complete || Object.keys(found.errors).length || Object.keys(found.partial).length) return null;
+  if (found.continued || !found.complete || Object.keys(found.errors).length || Object.keys(found.partial).length) return null;
   return found.exact === 1 || found.total === 1 ? found.first : null;
 }

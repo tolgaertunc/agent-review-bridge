@@ -471,15 +471,26 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   t = textOf(await call(claude, "bridge_read_chat", { name: "release" }));
   assert.match(t, /1 chat matches; not every chat could be searched[\s\S]*ChatGPT Desktop's chats couldn't be read right now \(ChatGPT is stood in for in tests\)/, "an app that can't be searched means no automatic read");
   assert.match(textOf(await call(claude, "bridge_read_chat", { cursor: "not-ours" })), /isn't one this tool returned/);
-  assert.match(textOf(await call(claude, "bridge_read_chat", { app: "claude", name: "x", page: 1_000_000 })), /too far down/);
+  // a long list: the cursor reaches every match, and only that search
+  for (let i = 0; i < 17; i++) sess(`c-bulk-${i}`, `Bulk ${i}`, repo, [["user", "x"]]);
+  const ids = new Set();
+  let more = { app: "claude", name: "bulk" };
+  for (let n = 0; more && n < 5; n++) {
+    t = textOf(await call(claude, "bridge_read_chat", more));
+    for (const m of t.matchAll(/id (c-bulk-\d+)/g)) ids.add(m[1]);
+    const next = /pass cursor "([^"]+)"/.exec(t)?.[1];
+    if (next) assert.match(textOf(await call(claude, "bridge_read_chat", { cursor: next, name: "other" })), /A cursor goes on/);
+    more = next ? { cursor: next } : null;
+  }
+  assert.equal(ids.size, 17, "every match of a long list can be reached");
   // paging: a cursor goes on the same chat, and argues with nothing
   sess("c-long", "Long one", repo, [["user", "one"], ["user", "two"], ["user", "three"]]);
   t = textOf(await call(claude, "bridge_read_chat", { app: "claude", id: "c-long", limit: 2 }));
   const cursor = /pass cursor "([^"]+)"/.exec(t)[1];
   assert.match(textOf(await call(claude, "bridge_read_chat", { cursor, limit: 2 })), /one/);
-  assert.match(textOf(await call(claude, "bridge_read_chat", { cursor, name: "other" })), /A cursor goes on reading the same chat/);
-  assert.match(textOf(await call(claude, "bridge_read_chat", { cursor, id: "c-notes-1" })), /A cursor goes on reading the same chat/);
-  assert.match(textOf(await call(claude, "bridge_read_chat", { cursor, include_tools: true })), /A cursor goes on reading the same chat/);
+  assert.match(textOf(await call(claude, "bridge_read_chat", { cursor, name: "other" })), /A cursor goes on/);
+  assert.match(textOf(await call(claude, "bridge_read_chat", { cursor, id: "c-notes-1" })), /A cursor goes on/);
+  assert.match(textOf(await call(claude, "bridge_read_chat", { cursor, include_tools: true })), /A cursor goes on/);
   // a chat that advises for another can't read other chats, however it asks
   for (const args of [{ app: "claude", id: "c-notes-1" }, { app: "claude", name: "notes" }, { cursor }])
     assert.match(textOf(await call(openai, "bridge_read_chat", args, asGpt(THREAD))), /reviews or advises for another chat/, JSON.stringify(args));
