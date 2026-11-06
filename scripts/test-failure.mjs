@@ -160,7 +160,7 @@ const failedFor = (id) => state().messages.filter((m) => m.kind === "failed" && 
   assert.equal(state().messages.find((x) => x.id === n.id).watch, undefined, "a notice is never watched itself");
   const { inlineText } = await import("../src/broker.mjs");
   assert.match(inlineText(n), /^PEER-BRIDGE: No answer is coming to m\d+/);
-  assert.match(inlineText(n), /Tell the user, and don't wait for that answer/);
+  assert.match(inlineText(n), /Tell the user, in their language, and don't wait for that answer/);
   console.log("2 a failed ChatGPT turn (usage limit) reaches the requester once, after a broker takeover too; the review closes; a stepped-down owner's late send error changes nothing");
 }
 
@@ -455,6 +455,36 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
     delete process.env.PEER_BRIDGE_MAX_ROUNDS;
   }
   console.log("13 a review that got no answer is asked again with round_of: same reviewer and round, the last real findings, the plan gate kept, once only, allowed at the cap");
+}
+
+// 14. in auto mode a review that got no answer may be retried once by the
+// agent itself; the retry's own failure gives no new retry
+{
+  const { nextStep } = await import("../src/broker.mjs");
+  const A = { app: "claude", id: "claude-fail-auto" };
+  await call("auto_set", { endpoint: A, on: true });
+  const fail = async (linkId, turn) => {
+    const m = await until(() => reqOf(linkId)?.watch?.clientId && reqOf(linkId));
+    fake({ turns: { [m.watch.clientId]: turn } });
+    await until(() => failedFor(m.id)[0]);
+    fake({});
+    const got = (await call("receive", { side: "claude", endpoint: A })).messages.find((x) => x.kind === "failed" && x.linkId === linkId);
+    assert.ok(got, "the notice is received with its fields");
+    return got;
+  };
+  const r1 = await call("link_create", { primary: A, advisor: GPT, mode: "review", request: "Auto review." });
+  const n1 = await fail(r1.id, { state: "interrupted", completedAt: 1 });
+  assert.deepEqual([n1.auto, n1.retried], [true, undefined]);
+  assert.match(n1.text, /its turn was interrupted \(someone may have stopped it in the app\)/);
+  assert.match(nextStep(n1), new RegExp(`Auto mode: .* once more yourself with bridge_review\\(round_of="${r1.id}"\\); if that fails too, tell the user and don't retry again\\.`));
+  const r2 = await call("link_continue", { primary: A, roundOf: r1.id, request: "Auto review, again." });
+  assert.equal(state().links[r2.id].retry, true, "the retry is kept on its link");
+  const n2 = await fail(r2.id, { state: "failed", completedAt: 1, error: { message: "limit" } });
+  assert.deepEqual([n2.auto, n2.retried], [true, true]);
+  assert.doesNotMatch(nextStep(n2), /Auto mode/, "a failed retry gives no new one");
+  assert.match(nextStep(n2), /Ask again only if the user wants to/);
+  await call("auto_set", { endpoint: A, on: false });
+  console.log("14 auto mode: a failed review may be retried once by the agent; the retry's failure is told to the user");
 }
 
 fs.rmSync(dir, { recursive: true, force: true });

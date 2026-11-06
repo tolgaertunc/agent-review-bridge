@@ -19,6 +19,8 @@ export const AUTO_RULES =
   "- when you hit an uncertainty that a short look into the code or docs doesn't resolve;\n" +
   "- before anything hard to undo (push, deleting data, migrations); the reviewer's approval doesn't replace the user's permission for these;\n" +
   "- before telling the user the work is done.\n" +
+  "After a long job of several steps, once the user says it's done, ask them once whether they want one review of the whole work (all its commits); " +
+  "do it only if they say yes, and don't offer it again. It doesn't replace the reviews above.\n" +
   "Small edits, reading and questions don't need a review on their own; they go into the next one.\n" +
   "In each request say what the goal is, what this step does, and anything that deviated from what was agreed. Name every folder or file you changed for this work in `paths`; " +
   "if you committed work in a path before its first review, say which commits. Don't argue for your solution; if the reviewer asks for changes and you disagree, give your reasons in the next round. " +

@@ -14,10 +14,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sameTo = (a, b) => !!a && a.app === b.app && a.id === b.id;
 
 // 0. a stale owner (older protocol, e.g. a helper left over from before an
-// update) steps down when a newer client calls, and the client takes over
+// update) steps down when a newer client calls, and the client takes over.
+// It runs the version before this one, as after a real update.
 const brokerUrl = new URL("../src/broker.mjs", import.meta.url).href;
 const stale = spawn(process.execPath, ["--input-type=module", "-e", `const b=await import(${JSON.stringify(brokerUrl)});await b.call("status");console.log("owner");setInterval(()=>{},1000);`], {
-  env: { ...process.env, PEER_BRIDGE_TEST_PROTOCOL: "1" },
+  env: { ...process.env, PEER_BRIDGE_TEST_PROTOCOL: "15" },
 });
 await new Promise((r) => stale.stdout.once("data", r));
 const { call, inlineText, nextStep } = await import("../src/broker.mjs");
@@ -906,6 +907,47 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   await call("advise", { endpoint: C, requestId: idOf(b.id), decision: "approved" });
   assert.equal((await runHook("claude", "start", { session_id: C.id, source: "resume" })).out, "", "nothing waiting, auto mode off: nothing");
   console.log("34 a Claude reviewer's session start lists the reviews waiting for it with its role, plus auto mode's rules when on");
+}
+
+// 35. paths that would stay unreviewed for good: a plan review's paths aren't
+// tracked, and a path never approved that is gone drops out of the check;
+// ChatGPT's memory citations don't reach the requester
+{
+  const D = { app: "claude", id: "claude-stuck" };
+  const R = { app: "openai", id: "gpt-stuck" };
+  const key = `claude:${D.id}`;
+  const plan = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-plan-"));
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-temp-"));
+  fs.writeFileSync(path.join(temp, "f.txt"), "x");
+  await call("auto_set", { endpoint: D, on: true });
+  const answer = async (linkId, decision, note) =>
+    call("advise", { endpoint: R, requestId: state().messages.find((m) => m.linkId === linkId && m.kind === "review-request").id, decision, note, ...(decision === "changes_requested" && { blocking: [{ title: "x" }] }) });
+  const pl = await call("link_create", { primary: D, mode: "review", advisor: R, request: "plan", plan: true, reqPaths: [{ path: plan, fp: "f", head: null }] });
+  assert.ok(!(plan in state().auto[key].paths), "a plan review's paths aren't tracked");
+  await answer(pl.id, "changes_requested");
+  const pl2 = await call("link_continue", { primary: D, roundOf: pl.id, request: "again", reqPaths: [{ path: plan, fp: "f", head: null }] });
+  assert.ok(!(plan in state().auto[key].paths), "nor its next round's");
+  await answer(pl2.id, "approved");
+  const code = await call("link_create", { primary: D, mode: "review", advisor: R, request: "code", reqPaths: [{ path: temp, fp: "f", head: null }] });
+  assert.equal(state().auto[key].paths[temp].approved, null, "a code review's path is tracked");
+  await answer(code.id, "changes_requested", "Fix it.\n<oai-mem-citation>\n<citation_entries>\nMEMORY.md:1-2|note=[x]\n</citation_entries>\n</oai-mem-citation>");
+  const result = state().messages.find((m) => m.linkId === code.id && m.kind === "review-result");
+  assert.match(result.text, /Fix it\./);
+  assert.doesNotMatch(result.text, /oai-mem-citation|citation_entries/, "the citation block is taken out");
+  const stopOut = async () => (await runHook("claude", "stop", { session_id: D.id })).out;
+  assert.match(JSON.parse(await stopOut()).reason, /peer-bridge-temp-\w+/, "still there and unreviewed: named");
+  fs.rmSync(temp, { recursive: true, force: true });
+  await runHook("claude", "prompt", { session_id: D.id, prompt: "next" }); // a new prompt clears what was told
+  assert.equal(await stopOut(), "", "never approved and gone: nothing left to review");
+  await call("auto_set", { endpoint: D, on: false });
+  fs.rmSync(plan, { recursive: true, force: true });
+  // a failed review: a retry of its own only in auto mode, and only once
+  const failed = { kind: "failed", retry: "L9" };
+  assert.match(nextStep(failed), /Tell the user, in their language.*Ask again only if the user wants to \(after the reset time, if one is given\): to ask the same reviewer, use bridge_review\(round_of="L9"\)\./);
+  assert.match(nextStep({ ...failed, auto: true }), /Auto mode: if a reset time is given, it's less than an hour away and you're still working then, ask the same reviewer once more yourself with bridge_review\(round_of="L9"\); if that fails too, tell the user and don't retry again\./);
+  assert.doesNotMatch(nextStep({ ...failed, auto: true, retried: true }), /Auto mode/, "a failed retry gives no new one");
+  assert.doesNotMatch(nextStep({ kind: "failed", auto: true }), /Auto mode/, "not a review: nothing to retry");
+  console.log("35 plan paths aren't tracked, a never-approved path that is gone drops out, citations are taken out, a failed review's retry rule");
 }
 
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));

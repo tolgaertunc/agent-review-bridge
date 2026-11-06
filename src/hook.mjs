@@ -69,6 +69,16 @@ const t0 = Date.now();
 // stop a turn only once (a new user prompt clears it)
 const guardFile = (endpoint) => turnFile(endpoint).replace(/\.json$/, ".auto-guard.json");
 
+// a path that isn't there (not one that can't be read: that stays a failed check)
+const gone = (p) => {
+  try {
+    fs.lstatSync(p);
+    return false;
+  } catch (e) {
+    return e.code === "ENOENT" || e.code === "ENOTDIR";
+  }
+};
+
 const advisedPrimary = (state) => activeLinks(state).find((l) => l.mode === "advisor" && sameEndpoint(l.primary, endpoint));
 // a review this chat asked for is still waiting for its answer
 const reviewPending = (state) => activeLinks(state).some((l) => l.mode === "review" && sameEndpoint(l.primary, endpoint));
@@ -110,6 +120,8 @@ if (event === "stop") {
     const unreviewed = [];
     const unchecked = [];
     for (const [p, v] of Object.entries(auto.paths ?? {})) {
+      // never approved and gone: nothing is left for the reviewer to judge
+      if (v.approved == null && gone(p)) continue;
       const fp = fingerprint(p);
       if (fp.error) unchecked.push(`${p} (${fp.error})`);
       else if (fp.hash !== v.approved) unreviewed.push(p);
