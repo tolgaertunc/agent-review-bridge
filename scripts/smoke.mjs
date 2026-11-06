@@ -1,7 +1,7 @@
 // End to end over MCP: two real server processes (Claude side with a session
 // id in its env, ChatGPT side identified by _meta.threadId per call), the
 // hooks as subprocesses, a throwaway git repo for diffs, a throwaway broker.
-// Codex delivery is faked (PEER_BRIDGE_FAKE_CODEX).
+// Codex delivery is faked (AGENT_REVIEW_BRIDGE_FAKE_CODEX).
 
 import os from "node:os";
 import fs from "node:fs";
@@ -11,13 +11,13 @@ import { spawn, execFileSync } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-smoke-"));
-const repo = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-repo-"));
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-smoke-"));
+const repo = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-repo-"));
 // ChatGPT counts as running and nothing is really opened, unless a step says otherwise
-const env = { ...process.env, PEER_BRIDGE_DIR: dir, PEER_BRIDGE_PORT: "7496", PEER_BRIDGE_FAKE_CODEX: "1", PEER_BRIDGE_CONFIG_DIR: path.join(dir, "config"), PEER_BRIDGE_FAKE_CHATGPT_RUNNING: "1", PEER_BRIDGE_FAKE_OPEN: "1" };
+const env = { ...process.env, AGENT_REVIEW_BRIDGE_DIR: dir, AGENT_REVIEW_BRIDGE_PORT: "7496", AGENT_REVIEW_BRIDGE_FAKE_CODEX: "1", AGENT_REVIEW_BRIDGE_CONFIG_DIR: path.join(dir, "config"), AGENT_REVIEW_BRIDGE_FAKE_CHATGPT_RUNNING: "1", AGENT_REVIEW_BRIDGE_FAKE_OPEN: "1" };
 delete env.CLAUDE_CODE_HOST_SESSION_ID; // a server run from inside Claude Desktop would inherit its own
-fs.mkdirSync(env.PEER_BRIDGE_CONFIG_DIR);
-fs.writeFileSync(path.join(env.PEER_BRIDGE_CONFIG_DIR, "rules.md"), "Never commit without asking me.\n");
+fs.mkdirSync(env.AGENT_REVIEW_BRIDGE_CONFIG_DIR);
+fs.writeFileSync(path.join(env.AGENT_REVIEW_BRIDGE_CONFIG_DIR, "rules.md"), "Never commit without asking me.\n");
 const server = path.resolve(import.meta.dirname, "../src/server.mjs");
 const hook = path.resolve(import.meta.dirname, "../src/hook.mjs");
 const SESSION = "claude-session-smoke";
@@ -117,7 +117,7 @@ console.log("3 review request shown in full in the ChatGPT thread: question, ans
 // 4. advisor raises a concern → Claude gets it
 const advised = textOf(await call(openai, "bridge_advise", { request_id: reqId, decision: "changes_requested", blocking: [{ title: "Empty fields are kept; filter them out?" }] }, asGpt(THREAD)));
 assert.match(advised, /write this as your reply, unchanged:\n\n\[CHANGES REQUESTED\]\n\nMust fix:\n- Empty fields are kept[^\n]*$/, "the advisor gets its answer back to show the user, with nothing after it");
-assert.match(advised, /^\[PEER-BRIDGE\] Your user's own standing rules[\s\S]*Never commit without asking me\./, "the user's rules come with the tool result, before the answer");
+assert.match(advised, /^\[AGENT-REVIEW-BRIDGE\] Your user's own standing rules[\s\S]*Never commit without asking me\./, "the user's rules come with the tool result, before the answer");
 assert.doesNotMatch(req, /Never commit without asking me/, "the rules never travel inside a peer message");
 assert.match(await receiveUntil(claude, undefined, /kind=advisory/), /Empty fields are kept[\s\S]*Never commit without asking me\./);
 console.log("4 concern delivered to the Claude primary; the advisor is told to show it in its chat");
@@ -166,7 +166,7 @@ assert.doesNotMatch(planReq, /Where the changes are/, "a plan review names no pa
 await call(openai, "bridge_advise", { request_id: planReq.match(/Plan review request (m\d+)/)[1], decision: "changes_requested", blocking: [{ title: "Tests first." }] }, asGpt("gpt-thread-planner"));
 const planRes = await receiveUntil(claude, undefined, /kind=review-result plan/);
 assert.match(planRes, /Tests first\./);
-assert.match(planRes, /wait for the user's explicit approval in this chat before implementing anything\.\n\n\[PEER-BRIDGE\] Your user's own standing rules/, "the gate, then the user's rules");
+assert.match(planRes, /wait for the user's explicit approval in this chat before implementing anything\.\n\n\[AGENT-REVIEW-BRIDGE\] Your user's own standing rules/, "the gate, then the user's rules");
 console.log(`5a2 plan review ${planRev.id}: no diff, plan guidance sent, requester told to wait for the user's approval`);
 
 // 5a3. a plan result read together with a review request (this chat is also
@@ -244,7 +244,7 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
 {
   const events = () => fs.readFileSync(path.join(dir, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
   const opened = () => events().filter((e) => e.op === "report" && e.event === "opened");
-  const closedGpt = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-open", CLAUDE_CODE_HOST_SESSION_ID: "local_open-1", CLAUDE_PROJECT_DIR: repo, PEER_BRIDGE_FAKE_CHATGPT_RUNNING: "0" });
+  const closedGpt = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-open", CLAUDE_CODE_HOST_SESSION_ID: "local_open-1", CLAUDE_PROJECT_DIR: repo, AGENT_REVIEW_BRIDGE_FAKE_CHATGPT_RUNNING: "0" });
   const links = async () => JSON.parse(textOf(await call(closedGpt, "bridge_status"))).links.length;
   const before = await links();
   const asked = textOf(await call(closedGpt, "bridge_review", { reviewer: "openai", thread_id: "gpt-closed", include_diff: false, request: "Check A." }));
@@ -253,7 +253,7 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   await call(closedGpt, "bridge_review", { reviewer: "openai", thread_id: "gpt-closed", include_diff: false, request: "Check B.", open: true });
   assert.ok(opened().some((e) => e.data.target.app === "openai"));
   await deliveredTo("gpt-closed", /Check B\./);
-  assert.ok(!fs.existsSync(path.join(env.PEER_BRIDGE_CONFIG_DIR, "config.json")), "open alone doesn't change the setting");
+  assert.ok(!fs.existsSync(path.join(env.AGENT_REVIEW_BRIDGE_CONFIG_DIR, "config.json")), "open alone doesn't change the setting");
 
   // a round asked for while ChatGPT is closed isn't used up
   const rq = (await call(closedGpt, "bridge_review", { reviewer: "join", include_diff: false, request: "Round test." })).structuredContent;
@@ -264,14 +264,14 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   assert.equal((await call(closedGpt, "bridge_review", { round_of: rq.id, request: "Fixed.", open: true })).structuredContent.round, 2, "the round wasn't used up by asking");
 
   await call(closedGpt, "bridge_review", { reviewer: "openai", thread_id: "gpt-closed", include_diff: false, request: "Check C.", open: true, remember: true });
-  assert.equal(JSON.parse(fs.readFileSync(path.join(env.PEER_BRIDGE_CONFIG_DIR, "config.json"), "utf8")).openClosedApps, "always");
+  assert.equal(JSON.parse(fs.readFileSync(path.join(env.AGENT_REVIEW_BRIDGE_CONFIG_DIR, "config.json"), "utf8")).openClosedApps, "always");
   const n = opened().length;
   await call(closedGpt, "bridge_review", { reviewer: "openai", thread_id: "gpt-closed", include_diff: false, request: "Check D." });
   assert.equal(opened().length, n + 1, "always: opened without asking");
-  fs.rmSync(path.join(env.PEER_BRIDGE_CONFIG_DIR, "config.json"));
+  fs.rmSync(path.join(env.AGENT_REVIEW_BRIDGE_CONFIG_DIR, "config.json"));
   await closedGpt.close();
 
-  const failing = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-open-fail", CLAUDE_PROJECT_DIR: repo, PEER_BRIDGE_FAKE_CHATGPT_RUNNING: "0", PEER_BRIDGE_FAKE_OPEN: "fail" });
+  const failing = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-open-fail", CLAUDE_PROJECT_DIR: repo, AGENT_REVIEW_BRIDGE_FAKE_CHATGPT_RUNNING: "0", AGENT_REVIEW_BRIDGE_FAKE_OPEN: "fail" });
   assert.match(textOf(await call(failing, "bridge_review", { reviewer: "openai", thread_id: "gpt-closed", include_diff: false, request: "Check E.", open: true })), /^Nothing was sent: opening ChatGPT Desktop failed/);
   await failing.close();
   assert.ok(!events().some((e) => e.op === "fake-codex-deliver" && /Check (A|E)\./.test(e.text)), "nothing sent while closed or when opening failed");
@@ -333,7 +333,7 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   await call(ac, "bridge_auto", { on: true, model: "gpt-6.1-sol", effort: "ultra" });
   const first = (await call(ac, "bridge_review", { request: "Goal: route. Step: first." })).structuredContent;
   assert.equal(made().at(-1).threadId, first.threadId, "the first review makes auto mode's chat");
-  assert.match(made().at(-1).name, /^Peer bridge · Review: Goal: route/);
+  assert.match(made().at(-1).name, /^Agent review bridge · Review: Goal: route/);
   assert.equal(await autoThread(), first.threadId);
   // the same model however it's written goes to auto mode's chat
   const same = (await call(ac, "bridge_review", { model: "GPT 6.1 Sol", request: "Goal: route. Step: same model." })).structuredContent;
@@ -347,7 +347,7 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   assert.doesNotMatch(textOf(other), /Auto mode keeps using this reviewer chat/);
   // a name: a chat of its own too, and the name keeps the prefix
   await call(ac, "bridge_review", { name: "Slean scan plan", request: "Goal: route. Step: named." });
-  assert.equal(made().at(-1).name, "Peer bridge · Slean scan plan");
+  assert.equal(made().at(-1).name, "Agent review bridge · Slean scan plan");
   assert.equal(made().at(-1).model, null, "auto mode's model isn't carried over either");
   assert.equal(await autoThread(), first.threadId, "auto mode's chat is unchanged");
   // the next plain review goes back to auto mode's chat
@@ -361,7 +361,7 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   const firstOwn = (await call(ac, "bridge_review", { model: "gpt-6-astra", name: "Field fixes", request: "Goal: route. Step: first with a model." })).structuredContent;
   const st = JSON.parse(textOf(await call(ac, "bridge_status"))).auto;
   assert.deepEqual([st.thread, st.model], [firstOwn.threadId, "gpt-6-astra"], "the first review's chat is auto mode's");
-  assert.equal(made().at(-1).name, "Peer bridge · Field fixes");
+  assert.equal(made().at(-1).name, "Agent review bridge · Field fixes");
   assert.equal((await call(ac, "bridge_review", { request: "Goal: route. Step: next." })).structuredContent.threadId, firstOwn.threadId);
   await call(ac, "bridge_auto", { on: false });
   await ac.close();
@@ -373,7 +373,7 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
 {
   const many = (n) =>
     Array.from({ length: n }, (_, i) => {
-      const d = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-many-"));
+      const d = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-many-"));
       execFileSync("git", ["-C", d, "init", "-q"]);
       // names long enough that nine full lists can't fit one message
       for (let j = 0; j < 60; j++) fs.writeFileSync(path.join(d, `${"n".repeat(200)}-${i}-${j}.txt`), "x\n");
@@ -418,9 +418,9 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   const events = () => fs.readFileSync(path.join(dir, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
   const openedCount = () => events().filter((e) => e.op === "report" && e.event === "opened").length;
   const linkCount = () => Object.keys(JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8")).links).length;
-  const configFile = path.join(env.PEER_BRIDGE_CONFIG_DIR, "config.json");
+  const configFile = path.join(env.AGENT_REVIEW_BRIDGE_CONFIG_DIR, "config.json");
   const big = "x".repeat(37_000);
-  const closed = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-big", CLAUDE_PROJECT_DIR: repo, PEER_BRIDGE_FAKE_CHATGPT_RUNNING: "0" });
+  const closed = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-big", CLAUDE_PROJECT_DIR: repo, AGENT_REVIEW_BRIDGE_FAKE_CHATGPT_RUNNING: "0" });
   const first = (await call(closed, "bridge_review", { reviewer: "join", request: "Small first round." })).structuredContent;
   assert.deepEqual(Object.keys(first).sort(), ["id", "joinCode"], "a join's result fields");
   await call(openai, "bridge_link_join", { code: first.joinCode }, asGpt("gpt-big"));

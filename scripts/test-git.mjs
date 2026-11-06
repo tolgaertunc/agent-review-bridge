@@ -10,10 +10,10 @@ import { execFileSync } from "node:child_process";
 import { baseline, turnDiff, pathInfo, reviewSummary, fingerprint, usableBase } from "../src/git.mjs";
 
 // the fingerprint keeps a small cache in the bridge's data folder: a throwaway one here
-process.env.PEER_BRIDGE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-gitdata-"));
+process.env.AGENT_REVIEW_BRIDGE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-gitdata-"));
 
 function repo({ commit = true } = {}) {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-git-"));
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-git-"));
   const git = (...a) => execFileSync("git", ["-C", d, "-c", "user.name=t", "-c", "user.email=t@t", ...a], { stdio: "ignore" });
   git("init", "-q");
   if (commit) {
@@ -192,7 +192,7 @@ function repo({ commit = true } = {}) {
     }
   }
   // folders outside git, with the same secret rule
-  const plain = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-plain-"));
+  const plain = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-plain-"));
   fs.writeFileSync(path.join(plain, "x.txt"), "1");
   const p1 = fingerprint(plain).hash;
   fs.writeFileSync(path.join(plain, ".env"), "TOPSECRET");
@@ -200,7 +200,7 @@ function repo({ commit = true } = {}) {
   fs.writeFileSync(path.join(plain, "x.txt"), "2");
   assert.notEqual(fingerprint(plain).hash, p1, "an edit outside git counts");
   // a path named through a link to a folder is that folder, in git or not
-  const links = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-links-"));
+  const links = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-links-"));
   const kind = process.platform === "win32" ? "junction" : "dir";
   try {
     const toRepo = path.join(links, "repo-link");

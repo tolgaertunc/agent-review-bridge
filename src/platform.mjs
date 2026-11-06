@@ -19,17 +19,17 @@ const macAppSupport = path.join(home, "Library", "Application Support");
 
 // Broker state shared by both apps' servers (one per user, not per checkout)
 export function dataDir() {
-  if (process.env.PEER_BRIDGE_DIR) return process.env.PEER_BRIDGE_DIR;
-  if (IS_WIN) return path.join(winLocalAppData(), "peer-bridge");
-  if (IS_MAC) return path.join(macAppSupport, "peer-bridge");
-  return path.join(process.env.XDG_STATE_HOME || path.join(home, ".local", "state"), "peer-bridge");
+  if (process.env.AGENT_REVIEW_BRIDGE_DIR) return process.env.AGENT_REVIEW_BRIDGE_DIR;
+  if (IS_WIN) return path.join(winLocalAppData(), "agent-review-bridge");
+  if (IS_MAC) return path.join(macAppSupport, "agent-review-bridge");
+  return path.join(process.env.XDG_STATE_HOME || path.join(home, ".local", "state"), "agent-review-bridge");
 }
 
 // The user's own settings for the bridge (rules.md), apart from its state
 export function configDir() {
-  if (process.env.PEER_BRIDGE_CONFIG_DIR) return process.env.PEER_BRIDGE_CONFIG_DIR;
-  if (IS_WIN) return path.join(winAppData(), "peer-bridge");
-  return path.join(process.env.XDG_CONFIG_HOME || path.join(home, ".config"), "peer-bridge");
+  if (process.env.AGENT_REVIEW_BRIDGE_CONFIG_DIR) return process.env.AGENT_REVIEW_BRIDGE_CONFIG_DIR;
+  if (IS_WIN) return path.join(winAppData(), "agent-review-bridge");
+  return path.join(process.env.XDG_CONFIG_HOME || path.join(home, ".config"), "agent-review-bridge");
 }
 export const rulesFile = () => path.join(configDir(), "rules.md");
 
@@ -82,17 +82,17 @@ const firstExisting = (paths) => paths.find((p) => p && fs.existsSync(p)) ?? nul
 // Claude Code CLI: a standalone install, or the copy bundled with Claude
 // Desktop (<version>/<hash>/claude.exe on Windows, .../claude.app on macOS)
 export function findClaudeCli() {
-  if (process.env.PEER_BRIDGE_CLAUDE_BIN) return process.env.PEER_BRIDGE_CLAUDE_BIN;
+  if (process.env.AGENT_REVIEW_BRIDGE_CLAUDE_BIN) return process.env.AGENT_REVIEW_BRIDGE_CLAUDE_BIN;
   const bundled = IS_WIN ? path.join(winAppData(), "Claude", "claude-code") : IS_MAC ? path.join(macAppSupport, "Claude", "claude-code") : null;
   const file = IS_MAC ? path.join("claude.app", "Contents", "MacOS", "claude") : exe("claude");
   return onPath("claude") ?? (bundled && newestIn(bundled, 2, file)) ?? process.env.CLAUDE_CODE_EXECPATH ?? null;
 }
 
 // Codex CLI bundled with ChatGPT Desktop (the app server API we drive), and
-// where it came from: "override" (PEER_BRIDGE_CODEX_BIN), "app", or "path". A
+// where it came from: "override" (AGENT_REVIEW_BRIDGE_CODEX_BIN), "app", or "path". A
 // codex on PATH is a separate install whose version can differ from the app's.
 export function locateCodexCli() {
-  if (process.env.PEER_BRIDGE_CODEX_BIN) return { path: process.env.PEER_BRIDGE_CODEX_BIN, source: "override" };
+  if (process.env.AGENT_REVIEW_BRIDGE_CODEX_BIN) return { path: process.env.AGENT_REVIEW_BRIDGE_CODEX_BIN, source: "override" };
   const app = IS_WIN
     ? newestIn(path.join(winLocalAppData(), "OpenAI", "Codex", "bin"), 1, "codex.exe")
     : IS_MAC
@@ -128,7 +128,7 @@ function codexEntrypoint(dir) {
 // executable, not by name alone: the bundled codex CLI and app-server don't
 // count.
 export function chatgptRunning() {
-  const fake = process.env.PEER_BRIDGE_FAKE_CHATGPT_RUNNING;
+  const fake = process.env.AGENT_REVIEW_BRIDGE_FAKE_CHATGPT_RUNNING;
   if (fake !== undefined) return fake === "1" ? true : fake === "0" ? false : null;
   try {
     if (IS_WIN) {
@@ -157,9 +157,9 @@ export function openChatgpt() {
   else openUrl("codex://");
 }
 
-// Tests: PEER_BRIDGE_FAKE_OPEN=1 opens nothing, =fail fails
+// Tests: AGENT_REVIEW_BRIDGE_FAKE_OPEN=1 opens nothing, =fail fails
 function fakeOpen() {
-  const fake = process.env.PEER_BRIDGE_FAKE_OPEN;
+  const fake = process.env.AGENT_REVIEW_BRIDGE_FAKE_OPEN;
   if (fake === "fail") throw new Error("can't open (test)");
   return fake === "1";
 }

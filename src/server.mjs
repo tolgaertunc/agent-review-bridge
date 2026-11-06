@@ -1,4 +1,4 @@
-// Peer bridge MCP server (stdio):
+// Agent review bridge MCP server (stdio):
 //   node src/server.mjs --side claude   (Claude Code, one per session)
 //   node src/server.mjs --side openai   (ChatGPT Desktop)
 //
@@ -23,7 +23,7 @@ import { readConfig, writeConfig } from "./config.mjs";
 import { chatgptRunning, openChatgpt, openUrl, dataDir } from "./platform.mjs";
 
 const sideArg = process.argv.indexOf("--side");
-const SIDE = sideArg > -1 ? process.argv[sideArg + 1] : process.env.PEER_BRIDGE_SIDE;
+const SIDE = sideArg > -1 ? process.argv[sideArg + 1] : process.env.AGENT_REVIEW_BRIDGE_SIDE;
 if (!SIDES.includes(SIDE)) {
   console.error(`usage: server.mjs --side ${SIDES.join("|")}`);
   process.exit(2);
@@ -120,7 +120,7 @@ async function chatgptBlocked() {
 
 // Every chat the bridge makes is named so the user can tell it apart in
 // ChatGPT's sidebar, whatever name the agent gave it
-export const THREAD_PREFIX = "Peer bridge · ";
+export const THREAD_PREFIX = "Agent review bridge · ";
 export const threadName = (name) => (name.startsWith(THREAD_PREFIX) ? name : THREAD_PREFIX + name);
 
 // The same model however it's written: "GPT 6.1 Sol" and "gpt-6.1-sol"
@@ -130,7 +130,7 @@ const sameModel = (a, b) => modelKey(a) === modelKey(b);
 // A new ChatGPT thread, read-only: it reviews, it doesn't touch the project
 async function newThread({ model, effort, name, seed }) {
   // tests: the chats that would be made are listed in <data dir>/fake-threads.json
-  if (process.env.PEER_BRIDGE_FAKE_CODEX) {
+  if (process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX) {
     const file = path.join(dataDir(), "fake-threads.json");
     let made = [];
     try {
@@ -152,7 +152,7 @@ async function newThread({ model, effort, name, seed }) {
   }
 }
 
-const server = new McpServer({ name: "peer-bridge", version: "0.1.0" });
+const server = new McpServer({ name: "agent-review-bridge", version: "0.1.0" });
 
 server.registerTool(
   "bridge_send",
@@ -216,7 +216,7 @@ const DECIDING =
   "In a later round, judge it against your earlier findings, and don't raise new blocking points on parts you already accepted unless they are serious. ";
 
 const ADVISOR_BRIEF =
-  "You are the advisor in a peer-bridge link: another AI agent (the primary) works with the user in its own chat, " +
+  "You are the advisor in an agent-review-bridge link: another AI agent (the primary) works with the user in its own chat, " +
   "and after each of its turns a review request arrives in full in this chat. " +
   "For each one: review the primary's turn, call bridge_advise exactly once with request_id set to the request's id, then write the text it returns as your reply so the user can read it. " +
   DECIDING +
@@ -228,7 +228,7 @@ server.registerTool(
   {
     title: "Link an advisor to this chat",
     description:
-      "Make this chat the primary of a peer-bridge link: after each of your turns, an advisor chat in the other app reviews it. " +
+      "Make this chat the primary of an agent-review-bridge link: after each of your turns, an advisor chat in the other app reviews it. " +
       (SIDE === "claude"
         ? `advisor='openai' creates a new ChatGPT thread for it (optionally pick the model and effort; ${MODEL_CHOICE}) or binds an existing one (thread_id). `
         : "") +
@@ -597,7 +597,7 @@ server.registerTool(
   "bridge_link_join",
   {
     title: "Become an advisor",
-    description: "Make this chat the advisor or reviewer of a peer-bridge link, using the join code from bridge_link or bridge_review.",
+    description: "Make this chat the advisor or reviewer of an agent-review-bridge link, using the join code from bridge_link or bridge_review.",
     inputSchema: { code: z.string().describe("Join code from bridge_link or bridge_review") },
     annotations: LOCAL,
   },
@@ -619,7 +619,7 @@ server.registerTool(
 server.registerTool(
   "bridge_unlink",
   {
-    title: "End peer-bridge links",
+    title: "End agent-review-bridge links",
     description: "Stop reviews: close every active link this chat is part of (as primary or advisor).",
     inputSchema: {},
     annotations: LOCAL,
@@ -684,10 +684,10 @@ const serverInfo = {
   pid: process.pid,
   ppid: process.ppid,
   session: Object.fromEntries(SESSION_VARS.filter((k) => process.env[k]).map((k) => [k, process.env[k]])),
-  hostEnvNames: Object.keys(process.env).filter((k) => /^(CLAUDE|CODEX|OPENAI|MCP|PEER_BRIDGE)/i.test(k)),
+  hostEnvNames: Object.keys(process.env).filter((k) => /^(CLAUDE|CODEX|OPENAI|MCP|AGENT_REVIEW_BRIDGE)/i.test(k)),
 };
 call("report", { side: SIDE, event: "server-start", data: serverInfo }).catch(() => {});
 keepOwner();
 
 await server.connect(new StdioServerTransport());
-console.error(`[peer-bridge] stdio server ready (side=${SIDE}, pid=${process.pid})`);
+console.error(`[agent-review-bridge] stdio server ready (side=${SIDE}, pid=${process.pid})`);

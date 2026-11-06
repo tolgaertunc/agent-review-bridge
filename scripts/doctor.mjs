@@ -17,7 +17,7 @@ const asJson = process.argv.includes("--json");
 const root = path.resolve(import.meta.dirname, "..");
 const SERVER = path.join(root, "src", "server.mjs");
 const HOOK = path.join(root, "src", "hook.mjs");
-const PORT = Number(process.env.PEER_BRIDGE_PORT || 7457);
+const PORT = Number(process.env.AGENT_REVIEW_BRIDGE_PORT || 7457);
 
 const results = [];
 const add = (area, name, status, detail, fix) => results.push({ area, name, status, detail, ...(fix && { fix }) });
@@ -87,7 +87,7 @@ function ping() {
     fs.rmSync(probe);
     ok(A, "data folder", DATA_DIR);
   } catch (e) {
-    fail(A, "data folder", `${DATA_DIR}: ${e.message}`, "Make the folder writable, or set PEER_BRIDGE_DIR.");
+    fail(A, "data folder", `${DATA_DIR}: ${e.message}`, "Make the folder writable, or set AGENT_REVIEW_BRIDGE_DIR.");
   }
   const r = await ping();
   if (r.ok && r.result.protocol === PROTOCOL) ok(A, "owner", `pid ${r.result.pid}, protocol ${r.result.protocol}`);
@@ -95,7 +95,7 @@ function ping() {
     warn(A, "owner", `pid ${r.result.pid} runs protocol ${r.result.protocol ?? "unknown"}, this checkout ${PROTOCOL}`, "Restart both apps so their servers load the current code.");
   else if (r.error === "ECONNREFUSED")
     warn(A, "owner", "none running", "Normal while neither app is open; otherwise open a chat in Claude Code or ChatGPT (their servers keep one alive).");
-  else fail(A, "owner", r.error ?? r.error, "Another program may be using the port; set PEER_BRIDGE_PORT for both apps.");
+  else fail(A, "owner", r.error ?? r.error, "Another program may be using the port; set AGENT_REVIEW_BRIDGE_PORT for both apps.");
   let stale = [];
   try {
     stale = fs.readdirSync(OUTBOX_DIR).filter((f) => f.endsWith(".json") && Date.now() - fs.statSync(path.join(OUTBOX_DIR, f)).mtimeMs > 10_000);
@@ -134,11 +134,11 @@ function runs(cmd, shell) {
 {
   const A = "Claude Code";
   const cli = findClaudeCli();
-  if (!cli) warn(A, "CLI", "not found; registration can't be checked", "Install Claude Code or set PEER_BRIDGE_CLAUDE_BIN.");
+  if (!cli) warn(A, "CLI", "not found; registration can't be checked", "Install Claude Code or set AGENT_REVIEW_BRIDGE_CLAUDE_BIN.");
   else {
     let out = "";
     try {
-      out = execFileSync(cli, ["mcp", "get", "peer-bridge"], { encoding: "utf8", timeout: 60_000, stdio: ["ignore", "pipe", "pipe"] });
+      out = execFileSync(cli, ["mcp", "get", "agent-review-bridge"], { encoding: "utf8", timeout: 60_000, stdio: ["ignore", "pipe", "pipe"] });
     } catch (e) {
       out = String(e.stdout ?? "") + String(e.stderr ?? "");
     }
@@ -154,8 +154,8 @@ function runs(cmd, shell) {
   } catch {
     // missing settings: reported below
   }
-  settings.permissions?.allow?.includes("mcp__peer-bridge")
-    ? ok(A, "tool permission", "mcp__peer-bridge allowed")
+  settings.permissions?.allow?.includes("mcp__agent-review-bridge")
+    ? ok(A, "tool permission", "mcp__agent-review-bridge allowed")
     : warn(A, "tool permission", "bridge tools will ask for approval", "A woken session can't wait for a click. " + REINSTALL);
   const want = [
     ["Stop", "stop", false],
@@ -179,6 +179,7 @@ function runs(cmd, shell) {
     if (checkCommand(A, label, h.command) !== true) continue;
     runs(h.command) ? ok(A, label, rewake ? "asyncRewake, runs" : "runs") : fail(A, label, "command fails", REINSTALL);
   }
+  // older versions registered there, under the earlier name
   try {
     readJson(claudeDesktopConfig()).mcpServers?.["peer-bridge"]
       ? warn(A, "old Claude Desktop entry", "still registered there (no session identity)", REINSTALL)
@@ -193,13 +194,13 @@ function runs(cmd, shell) {
   const A = "ChatGPT Desktop";
   const codex = locateCodexCli();
   const cli = codex?.path ?? null;
-  if (!codex) fail(A, "bundled codex", "not found", "Install ChatGPT Desktop, or set PEER_BRIDGE_CODEX_BIN.");
+  if (!codex) fail(A, "bundled codex", "not found", "Install ChatGPT Desktop, or set AGENT_REVIEW_BRIDGE_CODEX_BIN.");
   else if (codex.source === "app") ok(A, "bundled codex", cli);
-  else if (codex.source === "override") ok(A, "bundled codex", `${cli} (set by PEER_BRIDGE_CODEX_BIN)`);
-  else warn(A, "bundled codex", `not found, using ${cli} from PATH`, "Its version can differ from the app's; set PEER_BRIDGE_CODEX_BIN to the app's own codex.");
+  else if (codex.source === "override") ok(A, "bundled codex", `${cli} (set by AGENT_REVIEW_BRIDGE_CODEX_BIN)`);
+  else warn(A, "bundled codex", `not found, using ${cli} from PATH`, "Its version can differ from the app's; set AGENT_REVIEW_BRIDGE_CODEX_BIN to the app's own codex.");
   const cfgFile = path.join(codexHome(), "config.toml");
   const toml = fs.existsSync(cfgFile) ? fs.readFileSync(cfgFile, "utf8") : "";
-  const block = toml.match(/# >>> peer-bridge[\s\S]*?# <<< peer-bridge/)?.[0];
+  const block = toml.match(/# >>> agent-review-bridge[\s\S]*?# <<< agent-review-bridge/)?.[0];
   if (!block) fail(A, "MCP server", `not in ${cfgFile}`, REINSTALL);
   else if (!block.includes(SERVER)) fail(A, "MCP server", "registered for another checkout", REINSTALL);
   else {
@@ -211,7 +212,7 @@ function runs(cmd, shell) {
   }
   if (cli && block) {
     try {
-      execFileSync(cli, ["mcp", "get", "peer_bridge", "--json"], { encoding: "utf8", timeout: 30_000, stdio: ["ignore", "pipe", "pipe"] });
+      execFileSync(cli, ["mcp", "get", "agent_review_bridge", "--json"], { encoding: "utf8", timeout: 30_000, stdio: ["ignore", "pipe", "pipe"] });
       ok(A, "config", "codex accepts config.toml");
     } catch (e) {
       fail(A, "config", String(e.stderr || e.message).trim().split("\n").slice(-2).join(" "), "Fix the error in config.toml (a backup sits next to it).");
@@ -259,7 +260,7 @@ function runs(cmd, shell) {
       continue;
     }
     if (h.trustStatus !== "trusted" && h.trustStatus !== "managed") {
-      fail(A, label, `${h.trustStatus}: Codex skips it`, "Open ChatGPT Desktop normally (with a window), review and trust the peer-bridge hooks in its hook settings, then restart it.");
+      fail(A, label, `${h.trustStatus}: Codex skips it`, "Open ChatGPT Desktop normally (with a window), review and trust the agent-review-bridge hooks in its hook settings, then restart it.");
       continue;
     }
     const shells = IS_WIN ? ["cmd", "powershell"].filter((sh) => runs(h.command, sh)) : runs(h.command) ? ["sh"] : [];

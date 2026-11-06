@@ -1,8 +1,8 @@
-# peer-bridge
+# agent-review-bridge
 
-**Let Claude Code and ChatGPT Desktop review each other's work, from their own desktop apps.**
+**AI agents review each other's work: Claude Code ↔ ChatGPT Desktop, in their own desktop apps, through your own subscriptions, with no API keys.**
 
-peer-bridge connects a chat in the Code tab of Claude Desktop with a chat in ChatGPT Desktop. One chat writes the code; the other reviews it, either after every turn or when asked. Both are ordinary chats in the official apps, using your own subscriptions: no model APIs and no API keys. Either app can take either role, and you can read both sides of the conversation in the chats themselves.
+agent-review-bridge connects a chat in the Code tab of Claude Desktop with a chat in ChatGPT Desktop. One chat writes the code; the other reviews it, either after every turn or when asked. Both are ordinary chats in the official apps, using your own subscriptions: no model APIs and no API keys. Either app can take either role, and you can read both sides of the conversation in the chats themselves.
 
 It is built and tested with the desktop apps. The Claude Code CLI uses the same setup (MCP server and hooks) but hasn't been tested yet; the Codex CLI isn't supported yet.
 
@@ -12,7 +12,7 @@ It is built and tested with the desktop apps. The Claude Code CLI uses the same 
 
 ## Contents
 
-Using peer-bridge:
+Using agent-review-bridge:
 
 - [What it does](#what-it-does)
 - [Install](#install)
@@ -49,13 +49,13 @@ Requirements: Node.js 22 or newer, git, and both desktop apps, signed in: Claude
 1. Get the code and install it:
 
    ```bash
-   git clone https://github.com/tolgaertunc/peer-bridge.git
-   cd peer-bridge
+   git clone https://github.com/tolgaertunc/agent-review-bridge.git
+   cd agent-review-bridge
    npm install
    node scripts/install.mjs
    ```
 
-   The installer registers the bridge's MCP server in both apps, adds its hooks, and allows the bridge's own tools without approval prompts (a woken chat can't wait for a click). It backs up every file it changes and leaves your other settings and hooks alone. The hooks point at this folder, so re-run it if you move the folder. If it can't find the Claude Code CLI, it prints the command to register the server by hand (or set `PEER_BRIDGE_CLAUDE_BIN`).
+   The installer registers the bridge's MCP server in both apps, adds its hooks, and allows the bridge's own tools without approval prompts (a woken chat can't wait for a click). It backs up every file it changes and leaves your other settings and hooks alone. The hooks point at this folder, so re-run it if you move the folder. If it can't find the Claude Code CLI, it prints the command to register the server by hand (or set `AGENT_REVIEW_BRIDGE_CLAUDE_BIN`).
 
 2. Restart both apps. Restart ChatGPT Desktop normally, with its window open: it reads hooks only at startup, and it silently skips a new or changed hook until it trusts it.
 
@@ -82,7 +82,7 @@ You talk to your agent as usual and ask it to use the bridge; it calls the bridg
 
 You can pick the model and reasoning effort of a new ChatGPT chat ("…with gpt-6.1-sol, high effort"). The bridge checks the name against the models your ChatGPT Desktop offers; an unknown one is refused with the list, and nothing is created.
 
-From ChatGPT, or to use an existing chat of either app as the reviewer, ask for a **join code** and paste it into the other chat: *"join the peer-bridge link with code 3fa9c1"*.
+From ChatGPT, or to use an existing chat of either app as the reviewer, ask for a **join code** and paste it into the other chat: *"join the agent-review-bridge link with code 3fa9c1"*.
 
 Open the ChatGPT chat at any time to read the whole exchange: requests arrive starting with `CLAUDE:`, and the reviewer writes its answer there too.
 
@@ -109,7 +109,7 @@ An approval with must-fix items, or a rejection without any, is refused, so the 
 - **One-off review:** the agent asks for the next round of the same review (*Round 2 of review L7*). It goes to the same reviewer with the same kind (a plan review stays one).
 - **Advisor:** the agent's next turn is reviewed again. A new message from you starts the count over. When an approval ends a fix loop, it comes with your next message, so you see the loop end; routine approvals stay silent. An answer about a turn from before your latest message no longer steers the loop, but it comes once with your next message, marked as being about an earlier turn.
 
-**Emergency stop.** If two agents go 20 rounds in a row without approval, the loop stops and the agent is told to ask you (`PEER_BRIDGE_MAX_ROUNDS` changes the number).
+**Emergency stop.** If two agents go 20 rounds in a row without approval, the loop stops and the agent is told to ask you (`AGENT_REVIEW_BRIDGE_MAX_ROUNDS` changes the number).
 
 **Plan reviews.** The reviewer's `[APPROVED]` is not your approval: after a plan review the bridge tells the agent to show you the plan and the verdict and to wait for your explicit go-ahead.
 
@@ -133,8 +133,8 @@ Standing instructions for every agent working through the bridge, in either app,
 
 | System | File |
 |---|---|
-| macOS, Linux | `~/.config/peer-bridge/rules.md` (or `$XDG_CONFIG_HOME/peer-bridge/rules.md`) |
-| Windows | `%APPDATA%\peer-bridge\rules.md` |
+| macOS, Linux | `~/.config/agent-review-bridge/rules.md` (or `$XDG_CONFIG_HOME/agent-review-bridge/rules.md`) |
+| Windows | `%APPDATA%\agent-review-bridge\rules.md` |
 
 Write plain sentences:
 
@@ -171,9 +171,9 @@ Run `npm run doctor` first; it prints a fix for each problem it finds.
 | ChatGPT never reviews anything | Its hooks may be untrusted. Restart ChatGPT Desktop normally, with its window open, and run `doctor`. |
 | "Claude session isn't listening" | Open that Claude Code session in Claude Desktop; it picks up waiting messages when it starts. |
 | Nothing happens after an update | Re-run `node scripts/install.mjs` and restart both apps. |
-| The bundled `codex` isn't found | Set `PEER_BRIDGE_CODEX_BIN` to ChatGPT Desktop's own `codex`; `doctor` shows which one is used. |
+| The bundled `codex` isn't found | Set `AGENT_REVIEW_BRIDGE_CODEX_BIN` to ChatGPT Desktop's own `codex`; `doctor` shows which one is used. |
 
-Other settings, read by the bridge's processes: `PEER_BRIDGE_CLAUDE_BIN` (Claude Code CLI), `PEER_BRIDGE_CONFIG_DIR` (where `rules.md` and `config.json` live), `PEER_BRIDGE_DIR` (state), `PEER_BRIDGE_PORT` (broker port, default 7457), `PEER_BRIDGE_MAX_ROUNDS` (default 20).
+Other settings, read by the bridge's processes: `AGENT_REVIEW_BRIDGE_CLAUDE_BIN` (Claude Code CLI), `AGENT_REVIEW_BRIDGE_CONFIG_DIR` (where `rules.md` and `config.json` live), `AGENT_REVIEW_BRIDGE_DIR` (state), `AGENT_REVIEW_BRIDGE_PORT` (broker port, default 7457), `AGENT_REVIEW_BRIDGE_MAX_ROUNDS` (default 20).
 
 ## Known limits
 

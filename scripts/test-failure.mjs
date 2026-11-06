@@ -9,13 +9,13 @@ import path from "node:path";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-failure-"));
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-failure-"));
 Object.assign(process.env, {
-  PEER_BRIDGE_DIR: dir,
-  PEER_BRIDGE_PORT: "7487",
-  PEER_BRIDGE_FAKE_CODEX: "1",
-  PEER_BRIDGE_TEST_WATCH_SCALE: "0.0002",
-  PEER_BRIDGE_CONFIG_DIR: path.join(dir, "config"),
+  AGENT_REVIEW_BRIDGE_DIR: dir,
+  AGENT_REVIEW_BRIDGE_PORT: "7487",
+  AGENT_REVIEW_BRIDGE_FAKE_CODEX: "1",
+  AGENT_REVIEW_BRIDGE_TEST_WATCH_SCALE: "0.0002",
+  AGENT_REVIEW_BRIDGE_CONFIG_DIR: path.join(dir, "config"),
 });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const state = () => JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
@@ -52,7 +52,7 @@ const GPT = { app: "openai", id: "gpt-fail-thread" };
 {
   const { readLimits, turnOf, summarizeLimits } = await import("../src/codex.mjs");
   if (process.platform !== "win32") {
-    const bins = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-fakebin-"));
+    const bins = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-fakebin-"));
     const script = (name, body) => {
       const f = path.join(bins, name);
       fs.writeFileSync(f, `#!${process.execPath}\n${body}\n`, { mode: 0o755 });
@@ -76,23 +76,23 @@ const GPT = { app: "openai", id: "gpt-fail-thread" };
          const result = m.method === "thread/turns/list" ? turns : m.method === "thread/queue/list" ? queue : {};
          process.stdout.write(JSON.stringify({ id: m.id, result }) + "\\n"); });`,
     );
-    delete process.env.PEER_BRIDGE_FAKE_CODEX;
+    delete process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX;
     try {
-      process.env.PEER_BRIDGE_CODEX_BIN = replies;
+      process.env.AGENT_REVIEW_BRIDGE_CODEX_BIN = replies;
       assert.deepEqual(await turnOf("t", "mine"), { state: "failed", error: { message: "limit", codexErrorInfo: "usageLimitExceeded" }, completedAt: 4 });
       assert.deepEqual(await turnOf("t", "queued-one"), { state: "queued" });
       assert.deepEqual(await turnOf("t", "nope"), { state: "unknown" });
-      process.env.PEER_BRIDGE_CODEX_BIN = silent;
+      process.env.AGENT_REVIEW_BRIDGE_CODEX_BIN = silent;
       let t0 = Date.now();
       await assert.rejects(readLimits({ timeoutMs: 300 }), /didn't answer initialize|no answer/);
       assert.ok(Date.now() - t0 < 2000, "an initialize that never answers is given up on");
-      process.env.PEER_BRIDGE_CODEX_BIN = dies;
+      process.env.AGENT_REVIEW_BRIDGE_CODEX_BIN = dies;
       t0 = Date.now();
       await assert.rejects(turnOf("t", "c", { timeoutMs: 2000 }), /exited/);
       assert.ok(Date.now() - t0 < 1500, "a server that dies mid-read fails the read at once");
     } finally {
-      delete process.env.PEER_BRIDGE_CODEX_BIN;
-      process.env.PEER_BRIDGE_FAKE_CODEX = "1";
+      delete process.env.AGENT_REVIEW_BRIDGE_CODEX_BIN;
+      process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX = "1";
       fs.rmSync(bins, { recursive: true, force: true });
     }
   }
@@ -128,7 +128,7 @@ fake({ deliverRejectAfter: 1500 });
 const second = spawn(
   process.execPath,
   ["--input-type=module", "-e", `const b=await import(${JSON.stringify(brokerUrl)});const r=await b.call("link_create",{primary:${JSON.stringify(CLAUDE)},advisor:${JSON.stringify(GPT)},mode:"review",request:"Review by an older owner."});console.log(r.id);setInterval(()=>{},1000);`],
-  { env: { ...process.env, PEER_BRIDGE_TEST_PROTOCOL: "13" } },
+  { env: { ...process.env, AGENT_REVIEW_BRIDGE_TEST_PROTOCOL: "13" } },
 );
 const olderLink = (await new Promise((r) => second.stdout.once("data", r))).toString().trim();
 const olderReq = await until(() => reqOf(olderLink)?.dispatch?.clientId && reqOf(olderLink));
@@ -159,7 +159,7 @@ const failedFor = (id) => state().messages.filter((m) => m.kind === "failed" && 
   assert.equal(failedFor(m.id).length, 1, "one notice, however many checks run");
   assert.equal(state().messages.find((x) => x.id === n.id).watch, undefined, "a notice is never watched itself");
   const { inlineText } = await import("../src/broker.mjs");
-  assert.match(inlineText(n), /^PEER-BRIDGE: No answer is coming to m\d+/);
+  assert.match(inlineText(n), /^AGENT-REVIEW-BRIDGE: No answer is coming to m\d+/);
   assert.match(inlineText(n), /Tell the user, in their language, and don't wait for that answer/);
   console.log("2 a failed ChatGPT turn (usage limit) reaches the requester once, after a broker takeover too; the review closes; a stepped-down owner's late send error changes nothing");
 }
@@ -366,7 +366,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   await call("receive", { side: "claude", endpoint: J });
   assert.ok(state().messages.find((x) => x.id === m.id).wokenAt, "handed over by bridge_receive");
   // auto mode with a change nobody approved: the first Stop is blocked
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-failure-work-"));
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-failure-work-"));
   fs.writeFileSync(path.join(work, "a.txt"), "x");
   await call("auto_set", { endpoint: J, on: true, paths: [{ path: work, fp: "not-this", head: null }] });
   const blocked = await runHook("claude", "stop", { session_id: J.id });
@@ -438,7 +438,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   const first = await call("round_info", { primary: CLAUDE, roundOf: f1.id });
   assert.deepEqual([first.round, first.retry, first.previous], [1, true, { none: true }]);
   // at the round cap a retry is still allowed, a further round isn't
-  process.env.PEER_BRIDGE_MAX_ROUNDS = "2";
+  process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS = "2";
   try {
     const c1 = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Cap one." });
     await call("advise", { endpoint: GPT, requestId: reqOf(c1.id).id, decision: "changes_requested", blocking: [{ title: "a" }] });
@@ -452,7 +452,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
     await call("advise", { endpoint: GPT, requestId: reqOf(c3.id).id, decision: "changes_requested", blocking: [{ title: "b" }] });
     await assert.rejects(call("link_continue", { primary: CLAUDE, roundOf: c3.id, request: "Cap three." }), /rounds without approval/);
   } finally {
-    delete process.env.PEER_BRIDGE_MAX_ROUNDS;
+    delete process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS;
   }
   console.log("13 a review that got no answer is asked again with round_of: same reviewer and round, the last real findings, the plan gate kept, once only, allowed at the cap");
 }

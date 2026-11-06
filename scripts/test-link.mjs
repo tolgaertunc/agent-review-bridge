@@ -1,6 +1,6 @@
 // End-to-end test of links and hooks against a throwaway data dir: the broker
 // runs in this process, src/hook.mjs runs as a real subprocess with hook JSON
-// on stdin, Codex delivery is faked (PEER_BRIDGE_FAKE_CODEX).
+// on stdin, Codex delivery is faked (AGENT_REVIEW_BRIDGE_FAKE_CODEX).
 
 import os from "node:os";
 import fs from "node:fs";
@@ -8,8 +8,8 @@ import path from "node:path";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 
-const dir = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-link-"));
-Object.assign(process.env, { PEER_BRIDGE_DIR: dir, PEER_BRIDGE_PORT: "7498", PEER_BRIDGE_FAKE_CODEX: "1", PEER_BRIDGE_CONFIG_DIR: path.join(dir, "config") });
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-link-"));
+Object.assign(process.env, { AGENT_REVIEW_BRIDGE_DIR: dir, AGENT_REVIEW_BRIDGE_PORT: "7498", AGENT_REVIEW_BRIDGE_FAKE_CODEX: "1", AGENT_REVIEW_BRIDGE_CONFIG_DIR: path.join(dir, "config") });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sameTo = (a, b) => !!a && a.app === b.app && a.id === b.id;
 
@@ -18,7 +18,7 @@ const sameTo = (a, b) => !!a && a.app === b.app && a.id === b.id;
 // It runs the version before this one, as after a real update.
 const brokerUrl = new URL("../src/broker.mjs", import.meta.url).href;
 const stale = spawn(process.execPath, ["--input-type=module", "-e", `const b=await import(${JSON.stringify(brokerUrl)});await b.call("status");console.log("owner");setInterval(()=>{},1000);`], {
-  env: { ...process.env, PEER_BRIDGE_TEST_PROTOCOL: "15" },
+  env: { ...process.env, AGENT_REVIEW_BRIDGE_TEST_PROTOCOL: "15" },
 });
 await new Promise((r) => stale.stdout.once("data", r));
 const { call, inlineText, nextStep } = await import("../src/broker.mjs");
@@ -257,8 +257,8 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
 // ingests the hook's request (this process stops owning by exiting the child
 // test below, so run it on a fresh port + dir)
 {
-  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-owner-"));
-  const env2 = { ...process.env, PEER_BRIDGE_DIR: dir2, PEER_BRIDGE_PORT: "7497" };
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-owner-"));
+  const env2 = { ...process.env, AGENT_REVIEW_BRIDGE_DIR: dir2, AGENT_REVIEW_BRIDGE_PORT: "7497" };
   const proc = (code) => spawn(process.execPath, ["--input-type=module", "-e", code], { env: env2 });
   const ownerA = proc(`const b=await import(${JSON.stringify(brokerUrl)});await b.call("link_create",{primary:{app:"claude",id:"S9"},advisor:{app:"claude",id:"A9"}});console.log("ready");setInterval(()=>{},1000);`);
   await new Promise((r) => ownerA.stdout.once("data", r));
@@ -283,9 +283,9 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
 // 15. a failed ChatGPT delivery reaches the waiting primary, and an owner
 // loading week-old state prunes it (fresh broker so the failing fake applies)
 {
-  const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-fail-"));
+  const dir3 = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-fail-"));
   fs.copyFileSync(path.join(dir, "state.json.aged"), path.join(dir3, "state.json"));
-  const env3 = { ...process.env, PEER_BRIDGE_DIR: dir3, PEER_BRIDGE_PORT: "7495", PEER_BRIDGE_FAKE_CODEX: "fail" };
+  const env3 = { ...process.env, AGENT_REVIEW_BRIDGE_DIR: dir3, AGENT_REVIEW_BRIDGE_PORT: "7495", AGENT_REVIEW_BRIDGE_FAKE_CODEX: "fail" };
   const P = { app: "claude", id: "claude-fail" };
   const owner = spawn(process.execPath, ["--input-type=module", "-e",
     `const b=await import(${JSON.stringify(brokerUrl)});await b.call("link_create",{primary:${JSON.stringify(P)},advisor:{app:"openai",id:"gpt-gone"}});console.log("ready");setInterval(()=>{},1000);`], { env: env3 });
@@ -312,7 +312,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
 // 18. a review request handed to a ChatGPT thread counts as read, but stays
 // answerable until answered: not pruned after a day, nor by the read cap
 {
-  const dir4 = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-open-"));
+  const dir4 = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-open-"));
   const P = { app: "claude", id: "claude-slow" };
   const G = { app: "openai", id: "gpt-slow" };
   const old = Date.now() - 2 * 24 * 3600_000;
@@ -324,7 +324,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   };
   try {
     fs.writeFileSync(path.join(dir4, "state.json"), JSON.stringify(seeded));
-    const env4 = { ...process.env, PEER_BRIDGE_DIR: dir4, PEER_BRIDGE_PORT: "7494" };
+    const env4 = { ...process.env, AGENT_REVIEW_BRIDGE_DIR: dir4, AGENT_REVIEW_BRIDGE_PORT: "7494" };
     const out = await new Promise((resolve) => {
       const p = spawn(process.execPath, ["--input-type=module", "-e",
         `const b=await import(${JSON.stringify(brokerUrl)});await b.call("status");` +
@@ -361,7 +361,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
 // kind; one continuation per round; none after approval, for someone else's
 // review, or past the cap
 {
-  process.env.PEER_BRIDGE_MAX_ROUNDS = "3";
+  process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS = "3";
   const RQ = { app: "claude", id: "claude-rounds" };
   const RV = { app: "openai", id: "gpt-rounds" };
   const answer = async (linkId, decision) => {
@@ -393,7 +393,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   const k1 = await call("link_create", { primary: RQ, mode: "review", advisor: RV, request: "Code." });
   await answer(k1.id, "approved");
   await assert.rejects(call("link_continue", { primary: RQ, roundOf: k1.id, request: "more" }), /was approved; there is nothing to re-review/);
-  delete process.env.PEER_BRIDGE_MAX_ROUNDS;
+  delete process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS;
   console.log("20 review rounds: same reviewer and kind, round header, one continuation per round, refused after approval, for others, past the cap");
 }
 
@@ -402,7 +402,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
 // ask the user, and isn't reviewed until the user writes; answers to requests
 // from before the user's latest prompt don't steer
 {
-  process.env.PEER_BRIDGE_MAX_ROUNDS = "2";
+  process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS = "2";
   const P = { app: "openai", id: "gpt-loop" };
   const A = { app: "claude", id: "claude-loop-advisor" };
   const l = await call("link_create", { primary: P, advisor: A });
@@ -464,7 +464,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   );
   assert.equal((await lateAnswer("u7b", { decision: "approved" })).delivered, "none", "a routine late approval stays silent");
   assert.equal((await lateAnswer("u8", { decision: "approved", nits: [{ title: "rename" }] })).delivered, "next prompt");
-  delete process.env.PEER_BRIDGE_MAX_ROUNDS;
+  delete process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS;
   console.log("21 advisor loop: bridge prompts don't reset, user prompts do; stop at the cap, no reviews until the user writes; late answers come once as a note");
 }
 
@@ -492,7 +492,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   assert.equal(state().messages.filter((m) => m.kind === "review-request" && m.linkId === l.id).length, 1, "a replayed Stop is one review, not two rounds");
   assert.ok(events().some((e) => e.op === "outbox-replay-skipped" && e.file === "0000000000002-1-bbbbbb.json"));
   const req = state().messages.find((m) => m.kind === "review-request" && m.linkId === l.id);
-  process.env.PEER_BRIDGE_FAKE_CODEX = "slow";
+  process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX = "slow";
   const adv = await call("advise", { endpoint: A, requestId: req.id, decision: "changes_requested", blocking: [{ title: "no" }] });
   const msg = () => state().messages.find((m) => m.id === adv.id);
   assert.equal(msg().dispatch.state, "sending", "sending is saved before the delivery is handed over");
@@ -503,23 +503,23 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   assert.equal(gen(), 2);
   assert.ok(!(await call("turn_start", { endpoint: P, turnId: "u3", prompt: delivered.split("\n")[0] })).fromBridge, "a header alone is the user's");
   await until(() => msg().dispatch.state === "sent");
-  process.env.PEER_BRIDGE_FAKE_CODEX = "1";
+  process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX = "1";
   for (const bad of ["oops", "Infinity", "0", "-3", "2.5"]) {
-    process.env.PEER_BRIDGE_MAX_ROUNDS = bad;
+    process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS = bad;
     const RQ = { app: "claude", id: `claude-cap-${bad}` };
     const prev = await call("link_create", { primary: RQ, mode: "review", advisor: A, request: "x" });
     const id = state().messages.find((m) => m.linkId === prev.id).id;
     await call("advise", { endpoint: A, requestId: id, decision: "changes_requested", blocking: [{ title: "x" }] });
     assert.equal((await call("link_continue", { primary: RQ, roundOf: prev.id, request: "y" })).round, 2, `cap "${bad}" falls back to 20`);
   }
-  delete process.env.PEER_BRIDGE_MAX_ROUNDS;
+  delete process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS;
   console.log("22 bridge prompts: exact text, once per delivery, counted while still sending; hook events applied once; a bad cap falls back to 20");
 }
 
 // 23. an owner that takes over doesn't resend a delivery whose turn already
 // ran: it was stuck in "sending", but its prompt was matched
 {
-  const dir5 = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-resend-"));
+  const dir5 = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-resend-"));
   try {
     const P = { app: "openai", id: "gpt-resend" };
     const old = Date.now() - 5 * 60_000;
@@ -532,7 +532,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
         messages: [m("m1", { dispatch: { state: "sending", at: old }, promptMatched: old }), m("m2", { dispatch: { state: "sending", at: old } })],
       }),
     );
-    const env5 = { ...process.env, PEER_BRIDGE_DIR: dir5, PEER_BRIDGE_PORT: "7493", PEER_BRIDGE_FAKE_CODEX: "1" };
+    const env5 = { ...process.env, AGENT_REVIEW_BRIDGE_DIR: dir5, AGENT_REVIEW_BRIDGE_PORT: "7493", AGENT_REVIEW_BRIDGE_FAKE_CODEX: "1" };
     await new Promise((resolve) => {
       const p = spawn(process.execPath, ["--input-type=module", "-e", `const b=await import(${JSON.stringify(brokerUrl)});await b.call("status");setTimeout(()=>process.exit(0),300);`], { env: env5 });
       p.on("close", resolve);
@@ -552,7 +552,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
 // (linked, or answered after its review link closed) through the prompt hook,
 // never inside a peer message, and nothing reaches an unrelated chat
 {
-  const rules = path.join(process.env.PEER_BRIDGE_CONFIG_DIR, "rules.md");
+  const rules = path.join(process.env.AGENT_REVIEW_BRIDGE_CONFIG_DIR, "rules.md");
   fs.mkdirSync(path.dirname(rules), { recursive: true });
   fs.writeFileSync(rules, "Always answer in Turkish.\n");
   const ctx = async (endpoint) => {
@@ -562,7 +562,7 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   assert.equal(await ctx({ app: "openai", id: "gpt-unrelated" }), "", "an unrelated chat gets nothing");
   const P = { app: "openai", id: "gpt-rules" };
   await call("link_create", { primary: P, advisor: { app: "claude", id: "claude-rules" } });
-  assert.match(await ctx(P), /Your user's own standing rules for work through peer-bridge \(from .*rules\.md\)[\s\S]*Always answer in Turkish\./);
+  assert.match(await ctx(P), /Your user's own standing rules for work through agent-review-bridge \(from .*rules\.md\)[\s\S]*Always answer in Turkish\./);
   const RQ = { app: "openai", id: "gpt-rules-requester" };
   const RV = { app: "claude", id: "claude-rules-reviewer" };
   const rl = await call("link_create", { primary: RQ, mode: "review", advisor: RV, request: "Check." });
@@ -573,13 +573,13 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
   assert.doesNotMatch(delivered.text, /Always answer in Turkish/, "rules never travel inside a peer message");
   // an answer written two days ago but handed over just now still counts
   {
-    const dir6 = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-late-"));
+    const dir6 = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-late-"));
     try {
       const old = Date.now() - 2 * 24 * 3600_000;
       const late = { id: "m1", from: "claude", to: "openai", toEndpoint: RQ, kind: "review-result", linkId: "L1", text: "x", ts: old, readAt: Date.now(), dispatch: { state: "sent", at: Date.now() } };
       fs.writeFileSync(path.join(dir6, "state.json"), JSON.stringify({ seq: 1, linkSeq: 1, notes: [], links: { L1: { id: "L1", mode: "review", active: false, primary: RQ, advisor: RV, createdAt: old, closedAt: old } }, messages: [late] }));
       const out = await new Promise((resolve) => {
-        const p = spawn(process.execPath, [hook, "--app", "openai", "--event", "prompt"], { env: { ...process.env, PEER_BRIDGE_DIR: dir6 } });
+        const p = spawn(process.execPath, [hook, "--app", "openai", "--event", "prompt"], { env: { ...process.env, AGENT_REVIEW_BRIDGE_DIR: dir6 } });
         let o = "";
         p.stdout.on("data", (d) => (o += d));
         p.on("close", () => resolve(o));
@@ -751,7 +751,7 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
 {
   const { execFileSync } = await import("node:child_process");
   const { fingerprint } = await import("../src/git.mjs");
-  const work = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-auto-"));
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-auto-"));
   try {
     const g = (...a) => execFileSync("git", ["-C", work, "-c", "user.name=t", "-c", "user.email=t@t", ...a], { encoding: "utf8" });
     g("init", "-q");
@@ -771,7 +771,7 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
     fs.writeFileSync(path.join(work, "a.js"), "2\n");
     const blocked = await stop();
     assert.equal(blocked.decision, "block");
-    assert.match(blocked.reason, /hasn't approved the current changes in .*peer-bridge-auto-/);
+    assert.match(blocked.reason, /hasn't approved the current changes in .*agent-review-bridge-auto-/);
     assert.equal(await stop({ stop_hook_active: true }), null, "stopping again over the same changes goes through");
     // a turn the bridge's own wake started (stop_hook_active set) is still checked
     fs.writeFileSync(path.join(work, "a.js"), "2b\n");
@@ -820,7 +820,7 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
     if (process.platform !== "win32" && process.getuid?.() !== 0) {
       fs.chmodSync(path.join(work, "sub"), 0);
       try {
-        assert.match((await stop()).reason, /couldn't check .*peer-bridge-auto-.*can't read .*f\.js \(EACCES\)/);
+        assert.match((await stop()).reason, /couldn't check .*agent-review-bridge-auto-.*can't read .*f\.js \(EACCES\)/);
       } finally {
         fs.chmodSync(path.join(work, "sub"), 0o755);
       }
@@ -864,7 +864,7 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   const { fingerprint } = await import("../src/git.mjs");
   const B = { app: "claude", id: "claude-rules" };
   const R = { app: "openai", id: "gpt-rules" };
-  const gone = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-gone-"));
+  const gone = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-gone-"));
   fs.writeFileSync(path.join(gone, "f.txt"), "x");
   await call("auto_set", { endpoint: B, on: true, paths: [{ path: gone, fp: fingerprint(gone).hash, head: null }] });
   const start = await runHook("claude", "start", { session_id: B.id, source: "compact" });
@@ -879,7 +879,7 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   // a deleted tracked folder
   fs.rmSync(gone, { recursive: true, force: true });
   const blocked = JSON.parse((await runHook("claude", "stop", { session_id: B.id })).out);
-  assert.match(blocked.reason, /peer-bridge-gone-\w+ \(no longer there\)/);
+  assert.match(blocked.reason, /agent-review-bridge-gone-\w+ \(no longer there\)/);
   const l = await call("link_create", { primary: B, mode: "review", advisor: R, request: "deleted it", reqPaths: [{ path: gone, fp: fingerprint(gone).hash, head: null }] });
   await call("advise", { endpoint: R, requestId: state().messages.find((m) => m.linkId === l.id).id, decision: "approved" });
   assert.equal((await runHook("claude", "stop", { session_id: B.id })).out, "", "the approved deletion ends the check");
@@ -916,8 +916,8 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   const D = { app: "claude", id: "claude-stuck" };
   const R = { app: "openai", id: "gpt-stuck" };
   const key = `claude:${D.id}`;
-  const plan = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-plan-"));
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "peer-bridge-temp-"));
+  const plan = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-plan-"));
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-temp-"));
   fs.writeFileSync(path.join(temp, "f.txt"), "x");
   await call("auto_set", { endpoint: D, on: true });
   const answer = async (linkId, decision, note) =>
@@ -935,7 +935,7 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   assert.match(result.text, /Fix it\./);
   assert.doesNotMatch(result.text, /oai-mem-citation|citation_entries/, "the citation block is taken out");
   const stopOut = async () => (await runHook("claude", "stop", { session_id: D.id })).out;
-  assert.match(JSON.parse(await stopOut()).reason, /peer-bridge-temp-\w+/, "still there and unreviewed: named");
+  assert.match(JSON.parse(await stopOut()).reason, /agent-review-bridge-temp-\w+/, "still there and unreviewed: named");
   fs.rmSync(temp, { recursive: true, force: true });
   await runHook("claude", "prompt", { session_id: D.id, prompt: "next" }); // a new prompt clears what was told
   assert.equal(await stopOut(), "", "never approved and gone: nothing left to review");

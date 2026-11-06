@@ -1,5 +1,5 @@
 {
-  "name": "peer-bridge",
+  "name": "agent-review-bridge",
   "version": "0.1.0",
   "private": true,
   "description": "Let Claude Code (Claude Desktop) and ChatGPT Desktop review each other: an advisor chat in one app checks every turn of a primary chat in the other.",
