@@ -915,5 +915,25 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   console.log("34 a Claude reviewer's session start lists the reviews waiting for it with its role, plus auto mode's rules when on");
 }
 
+// bridge_read_chat's gate: a chat the bridge created to review or advise stays
+// refused after its link closes; one that joined only while its link is open
+{
+  const made = { app: "openai", id: "gpt-made-reviewer" };
+  const joined = { app: "openai", id: "gpt-joined-reviewer" };
+  const P = { app: "claude", id: "claude-gate" };
+  assert.ok((await call("read_chat_allowed", { endpoint: P })).allowed, "an ordinary chat may read");
+  await call("reviewer_chat", { endpoint: made });
+  const a = await call("link_create", { primary: P, mode: "review", advisor: made, request: "x" });
+  const b = await call("link_create", { primary: P, mode: "review", advisor: joined, request: "x" });
+  assert.ok(!(await call("read_chat_allowed", { endpoint: made })).allowed);
+  assert.ok(!(await call("read_chat_allowed", { endpoint: joined })).allowed, "an open link's reviewer may not");
+  await call("link_close", { linkId: a.id });
+  await call("link_close", { linkId: b.id });
+  assert.ok(!(await call("read_chat_allowed", { endpoint: made })).allowed, "closing the link grants nothing to a chat the bridge made");
+  assert.ok((await call("read_chat_allowed", { endpoint: joined })).allowed, "the user's own chat is theirs again");
+  assert.ok((await call("read_chat_allowed", { endpoint: P })).allowed, "the requester was never a reviewer");
+  console.log("35 read_chat gate: bridge-made reviewers stay refused; a joined chat only while its link is open");
+}
+
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));
 process.exit(0);

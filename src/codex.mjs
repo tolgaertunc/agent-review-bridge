@@ -14,6 +14,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { findCodexCli, openUrl, dataDir } from "./platform.mjs";
+import { assemble, normalizeName, inFolder } from "./readchat.mjs";
 
 // No call waits for ever: an app-server that doesn't answer is given up on
 const RPC_MS = 60_000;
@@ -271,17 +272,14 @@ export async function turnOf(threadId, clientId, { timeoutMs = 15_000, ...opts }
 
 // ------------------------------------------------- chats, for bridge_read_chat
 // Read-only calls (measured on 0.166, also with the app closed): thread/list
-// (names, paged, archived too), thread/search (message text, not names),
-// thread/items/list (sortDirection "desc" pages newest first; a cursor gives
-// the same page again) and thread/read.
+// (names, paged, archived too), thread/items/list (sortDirection "desc" pages
+// newest first; a cursor gives the same page again) and thread/read.
 
 // One app-server session for a whole bridge_read_chat call
 export const withChatgpt = (fn, opts) => withServer(fn, { deadlineMs: 60_000, ...opts });
 
 export class ChatMovedError extends Error {}
 
-const MAX_THREADS = 500;
-const MAX_HITS = 50;
 const RAW_PAGE = 50;
 export const RAW_BUDGET = 20; // raw pages per read call
 
@@ -307,52 +305,26 @@ export async function chatgptMeta(s, id) {
   }
 }
 
-// { candidates, complete, scope, next }: names over thread/list (up to
-// MAX_THREADS per call, archived ones in a second pass), text over
-// thread/search (up to MAX_HITS). `pos` continues a search that stopped.
-export async function findChatgpt(s, { name, search, folder, self, archived, pos = {} }, { normalize, inFolder }) {
-  const want = name ? normalize(name) : null;
-  const keep = (c) => c.id !== self && (!folder || inFolder(c.folder, folder)) && (!want || normalize(c.name).includes(want));
-  const candidates = [];
+// By name and/or folder, over every thread (archived ones in a second pass),
+// newest first. Only the deadline stops it, and then it says so.
+export async function findChatgpt(s, { name, folder, self, archived, add, deadline = Infinity }) {
+  const want = name ? normalizeName(name) : null;
+  let seen = 0;
   try {
-    if (search) {
-      let cursor = pos.search ?? null;
-      let hits = 0;
-      do {
-        const r = await s.rpc("thread/search", { searchTerm: search, ...(cursor && { cursor }) });
-        for (const h of r.data ?? []) {
-          hits++;
-          const c = { ...asChat(h.thread), snippet: String(h.snippet ?? "").replace(/^\.\.\.\s*|\s*\.\.\.$/g, "").replace(/\s+/g, " ") };
-          if (keep(c)) candidates.push(c);
-        }
-        cursor = r.nextCursor ?? null;
-      } while (cursor && hits < MAX_HITS);
-      // a full hit budget counts as stopping early, also when filters then
-      // took hits out
-      const complete = !cursor && hits < MAX_HITS;
-      return { candidates, complete, scope: `${hits} text matches${complete ? "" : ", the first ones"}`, next: complete ? null : { search: cursor } };
-    }
-    const next = {};
-    let seen = 0;
     for (const arch of archived ? [false, true] : [false]) {
-      const k = arch ? "archived" : "list";
-      if (pos[k] === "done") continue;
-      let cursor = pos[k] ?? null;
-      let n = 0;
+      let cursor = null;
       do {
+        if (Date.now() > deadline) return { complete: false, scope: `${seen} chats, the newest (time limit reached)` };
         const r = await s.rpc("thread/list", { limit: 100, ...(arch && { archived: true }), ...(cursor && { cursor }) });
         for (const t of r.data ?? []) {
-          n++;
+          seen++;
           const c = asChat(t, arch);
-          if (keep(c)) candidates.push(c);
+          if (c.id !== self && (!folder || inFolder(c.folder, folder)) && (!want || normalizeName(c.name).includes(want))) add(c);
         }
         cursor = r.nextCursor ?? null;
-      } while (cursor && n < MAX_THREADS);
-      seen += n;
-      next[k] = cursor ?? "done";
+      } while (cursor);
     }
-    const complete = Object.values(next).every((v) => v === "done");
-    return { candidates, complete, scope: `${seen} chats${archived ? " (archived too)" : ""}${complete ? "" : ", the newest"}`, next: complete ? null : next };
+    return { complete: true, scope: `${seen} chats${archived ? " (archived too)" : ""}` };
   } catch (e) {
     throw cantList(e);
   }
@@ -454,7 +426,6 @@ export async function* chatgptStream(s, threadId, resume, { budget = RAW_BUDGET 
 
 // One page of a thread on a given session: { meta, page }, or { moved: true }
 export async function readChatgptPage(s, id, { resume, limit, includeTools, budget }) {
-  const { assemble } = await import("./readchat.mjs");
   try {
     const meta = await chatgptMeta(s, id);
     return { meta, page: await assemble(chatgptStream(s, id, resume, { budget }), { limit, includeTools }) };
