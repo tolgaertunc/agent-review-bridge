@@ -16,7 +16,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { claudeConfigDir } from "./platform.mjs";
-import { normalizeName, inFolder, MAX_COMMAND, assemble } from "./readchat.mjs";
+import { normalizeName, inFolder, MAX_COMMAND, MAX_MESSAGE, assemble } from "./readchat.mjs";
 
 const CHUNK = 256 * 1024;
 export const MAX_RECORD = 8 * 1024 * 1024;
@@ -481,7 +481,7 @@ export async function* claudeStream(file, resume, { includeTools = true, budget 
       if (!open) open = { id, uses: [], text: "", at: at(r), moreTools: 0, before: previous };
       open.pos = recordPos(rec);
       open.at = at(r) ?? open.at;
-      if (b.type === "text") open.text = (open.text ? `${b.text}\n${open.text}` : b.text).slice(0, 8_000);
+      if (b.type === "text") open.text = (open.text ? `${b.text}\n${open.text}` : b.text).slice(0, MAX_MESSAGE + 1); // one over, so the cut is noticed
       if (b.type === "tool_use") {
         open.uses.unshift(b);
         if (open.uses.length > MAX_TOOL_LINES) {
