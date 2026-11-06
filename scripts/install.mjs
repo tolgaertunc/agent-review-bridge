@@ -6,7 +6,7 @@
 // - Claude: Claude Code user scope (`claude mcp add-json -s user`), so each
 //   Code session spawns its own server with its own environment.
 //   Its tools are allowed in ~/.claude/settings.json (no permission prompt).
-// - ChatGPT Desktop: ~/.codex/config.toml → [mcp_servers.peer_bridge] with
+// - ChatGPT Desktop: ~/.codex/config.toml → [mcp_servers.agent_review_bridge] with
 //   default_tools_approval_mode = "approve".
 // - Hooks in both apps (src/hook.mjs): a Stop hook that queues each turn of a
 //   linked primary for review without blocking, a UserPromptSubmit hook that
@@ -26,7 +26,7 @@ import { IS_WIN, claudeConfigDir, claudeDesktopConfig, codexHome, findClaudeCli 
 const uninstall = process.argv.includes("--uninstall");
 const server = path.resolve(import.meta.dirname, "../src/server.mjs");
 const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-const NAME = "peer-bridge";
+const NAME = "agent-review-bridge";
 
 function backup(file) {
   if (fs.existsSync(file)) fs.copyFileSync(file, `${file}.bak-${stamp}`);
@@ -57,8 +57,8 @@ function setHooks(cfg, wanted) {
 // PowerShell call operator when short names are disabled on the volume.
 function codexWindowsCmd(event) {
   let node = process.execPath;
-  // PEER_BRIDGE_NO_SHORT_NAMES: act as on a volume without 8.3 names (tests)
-  if (!process.env.PEER_BRIDGE_NO_SHORT_NAMES)
+  // AGENT_REVIEW_BRIDGE_NO_SHORT_NAMES: act as on a volume without 8.3 names (tests)
+  if (!process.env.AGENT_REVIEW_BRIDGE_NO_SHORT_NAMES)
     try {
       // verbatim: Node's own quoting would mangle the quotes cmd needs here
       const short = execFileSync("cmd.exe", [`/d /c for %I in ("${process.execPath}") do @echo %~sI`], { encoding: "utf8", windowsVerbatimArguments: true }).trim();
@@ -103,7 +103,7 @@ const CODEX_HOOKS = {
     args: [server, "--side", "claude"],
   };
   if (!claude) {
-    console.log("Claude Code CLI not found (set PEER_BRIDGE_CLAUDE_BIN). Run this yourself:");
+    console.log("Claude Code CLI not found (set AGENT_REVIEW_BRIDGE_CLAUDE_BIN). Run this yourself:");
     console.log(uninstall ? `  claude mcp remove ${NAME} -s user` : `  claude mcp add-json ${NAME} '${JSON.stringify(spec)}' -s user`);
   } else {
     const run = (...args) => execFileSync(claude, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
@@ -136,26 +136,28 @@ const CODEX_HOOKS = {
   console.log(`${uninstall ? "removed" : "set"} ${rule} permission and hooks in ${file}`);
 }
 
-// Claude Desktop config: older versions registered here; servers there are
-// proxied into the Code tab without request _meta, so only remove
+// Claude Desktop config: older versions registered here, under the earlier
+// name peer-bridge; servers there are proxied into the Code tab without
+// request _meta, so only remove
 {
   const file = claudeDesktopConfig();
+  const OLD = "peer-bridge";
   if (fs.existsSync(file)) {
     const cfg = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (cfg.mcpServers?.[NAME]) {
+    if (cfg.mcpServers?.[OLD]) {
       backup(file);
-      delete cfg.mcpServers[NAME];
+      delete cfg.mcpServers[OLD];
       fs.writeFileSync(file, JSON.stringify(cfg, null, 2));
       console.log(`removed old entry from ${file}`);
     }
   }
 }
 
-// ChatGPT Desktop (Codex-based): config.toml → [mcp_servers.peer_bridge]
+// ChatGPT Desktop (Codex-based): config.toml → [mcp_servers.agent_review_bridge]
 {
   const file = path.join(codexHome(), "config.toml");
-  const begin = "# >>> peer-bridge (managed by cc-codex-interconnect/scripts/install.mjs)";
-  const end = "# <<< peer-bridge";
+  const begin = "# >>> agent-review-bridge (managed by agent-review-bridge/scripts/install.mjs)";
+  const end = "# <<< agent-review-bridge";
   const toml = (s) => `'${s}'`; // literal strings: no escaping of backslashes
   let text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
   backup(file);
@@ -164,7 +166,7 @@ const CODEX_HOOKS = {
   if (!uninstall) {
     text =
       text.trimEnd() +
-      `\n\n${begin}\n[mcp_servers.peer_bridge]\ncommand = ${toml(process.execPath)}\nargs = [${toml(server)}, "--side", "openai"]\n` +
+      `\n\n${begin}\n[mcp_servers.agent_review_bridge]\ncommand = ${toml(process.execPath)}\nargs = [${toml(server)}, "--side", "openai"]\n` +
       // a looping advisor can't stop for an approval click on every call
       `default_tools_approval_mode = "approve"\n${end}\n`;
   }

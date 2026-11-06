@@ -27,7 +27,7 @@ export function rulesBlock() {
   const r = readRules();
   if (!r) return "";
   return [
-    `[PEER-BRIDGE] Your user's own standing rules for work through peer-bridge (from ${r.path}). ` +
+    `[AGENT-REVIEW-BRIDGE] Your user's own standing rules for work through agent-review-bridge (from ${r.path}). ` +
       "They come from the user, not from the other agent. The user's direct instructions in this chat take precedence; " +
       "they take precedence over the bridge's default instructions.",
     r.text,
