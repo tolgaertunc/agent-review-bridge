@@ -324,6 +324,50 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   console.log("5e auto mode: same reviewer chat, reviewer told to watch the direction, approval recorded per path");
 }
 
+// 5e2. auto mode and a reviewer asked for by model or name: a chat of its own,
+// auto mode's chat untouched; every chat the bridge makes carries its prefix
+{
+  const made = () => JSON.parse(fs.readFileSync(path.join(dir, "fake-threads.json"), "utf8"));
+  const ac = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-auto-route", CLAUDE_PROJECT_DIR: repo });
+  const autoThread = async () => JSON.parse(textOf(await call(ac, "bridge_status"))).auto.thread;
+  await call(ac, "bridge_auto", { on: true, model: "gpt-6.1-sol", effort: "ultra" });
+  const first = (await call(ac, "bridge_review", { request: "Goal: route. Step: first." })).structuredContent;
+  assert.equal(made().at(-1).threadId, first.threadId, "the first review makes auto mode's chat");
+  assert.match(made().at(-1).name, /^Peer bridge · Review: Goal: route/);
+  assert.equal(await autoThread(), first.threadId);
+  // the same model however it's written goes to auto mode's chat
+  const same = (await call(ac, "bridge_review", { model: "GPT 6.1 Sol", request: "Goal: route. Step: same model." })).structuredContent;
+  assert.equal(same.threadId, first.threadId, "same model, auto mode's chat");
+  // another model: a chat of its own, without auto mode's effort
+  const n = made().length;
+  const other = await call(ac, "bridge_review", { model: "gpt-6-astra", request: "Goal: route. Step: other model." });
+  assert.equal(made().length, n + 1, "a new chat");
+  assert.deepEqual([made().at(-1).model, made().at(-1).effort], ["gpt-6-astra", null], "auto mode's effort isn't carried over");
+  assert.match(textOf(other), /To continue this work in that chat later, pass thread_id gpt-new-\d+; for other work, start a new chat/);
+  assert.doesNotMatch(textOf(other), /Auto mode keeps using this reviewer chat/);
+  // a name: a chat of its own too, and the name keeps the prefix
+  await call(ac, "bridge_review", { name: "Slean scan plan", request: "Goal: route. Step: named." });
+  assert.equal(made().at(-1).name, "Peer bridge · Slean scan plan");
+  assert.equal(made().at(-1).model, null, "auto mode's model isn't carried over either");
+  assert.equal(await autoThread(), first.threadId, "auto mode's chat is unchanged");
+  // the next plain review goes back to auto mode's chat
+  const back = await call(ac, "bridge_review", { request: "Goal: route. Step: back." });
+  assert.equal(back.structuredContent.threadId, first.threadId);
+  assert.match(textOf(back), /Auto mode keeps using this reviewer chat/);
+  // turned on without a model: the first review makes auto mode's chat with
+  // the model it asks for, and later ones use it
+  await call(ac, "bridge_auto", { on: false });
+  await call(ac, "bridge_auto", { on: true });
+  const firstOwn = (await call(ac, "bridge_review", { model: "gpt-6-astra", name: "Field fixes", request: "Goal: route. Step: first with a model." })).structuredContent;
+  const st = JSON.parse(textOf(await call(ac, "bridge_status"))).auto;
+  assert.deepEqual([st.thread, st.model], [firstOwn.threadId, "gpt-6-astra"], "the first review's chat is auto mode's");
+  assert.equal(made().at(-1).name, "Peer bridge · Field fixes");
+  assert.equal((await call(ac, "bridge_review", { request: "Goal: route. Step: next." })).structuredContent.threadId, firstOwn.threadId);
+  await call(ac, "bridge_auto", { on: false });
+  await ac.close();
+  console.log("5e2 auto mode: another model or a name gets a chat of its own (no effort carried over), auto mode's chat stays; new chats are prefixed");
+}
+
 // 5f. one message per request: with many paths the file lists go first,
 // never a scope line or a command; past that the request is refused
 {

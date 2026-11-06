@@ -12,6 +12,7 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import fs from "node:fs";
 import path from "node:path";
 import { call, keepOwner, SIDES, MAX_DIFF, MAX_TEXT, HOST_ID, REVIEWER_ROLE, nextStep } from "./broker.mjs";
 import { identify, endpointOf } from "./caller.mjs";
@@ -19,7 +20,7 @@ import { pathInfo, usableBase, reviewSummary, pathDiff, fingerprint } from "./gi
 import { AUTO_RULES, AUTO_REVIEWER } from "./auto.mjs";
 import { rulesBlock } from "./rules.mjs";
 import { readConfig, writeConfig } from "./config.mjs";
-import { chatgptRunning, openChatgpt, openUrl } from "./platform.mjs";
+import { chatgptRunning, openChatgpt, openUrl, dataDir } from "./platform.mjs";
 
 const sideArg = process.argv.indexOf("--side");
 const SIDE = sideArg > -1 ? process.argv[sideArg + 1] : process.env.PEER_BRIDGE_SIDE;
@@ -113,15 +114,38 @@ async function chatgptBlocked() {
   if (!l?.blocked) return null;
   return text(
     `Nothing was sent: ChatGPT's usage limit is reached${l.resetsAt ? ` until ${when(l.resetsAt)}` : ""}. ` +
-      "Tell the user; ask again after that, or once they have added credits.",
+      "Tell the user, in their language; ask again after that, or once they have added credits.",
   );
 }
 
+// Every chat the bridge makes is named so the user can tell it apart in
+// ChatGPT's sidebar, whatever name the agent gave it
+export const THREAD_PREFIX = "Peer bridge · ";
+export const threadName = (name) => (name.startsWith(THREAD_PREFIX) ? name : THREAD_PREFIX + name);
+
+// The same model however it's written: "GPT 6.1 Sol" and "gpt-6.1-sol"
+const modelKey = (m) => String(m ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+const sameModel = (a, b) => modelKey(a) === modelKey(b);
+
 // A new ChatGPT thread, read-only: it reviews, it doesn't touch the project
 async function newThread({ model, effort, name, seed }) {
+  // tests: the chats that would be made are listed in <data dir>/fake-threads.json
+  if (process.env.PEER_BRIDGE_FAKE_CODEX) {
+    const file = path.join(dataDir(), "fake-threads.json");
+    let made = [];
+    try {
+      made = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      // none yet
+    }
+    const threadId = `gpt-new-${made.length + 1}`;
+    made.push({ threadId, model: model ?? null, effort: effort ?? null, name: threadName(name) });
+    fs.writeFileSync(file, JSON.stringify(made));
+    return { threadId, model };
+  }
   const { createThread, ModelChoiceError } = await import("./codex.mjs");
   try {
-    return await createThread({ model, effort, name, seed, sandbox: "read-only" });
+    return await createThread({ model, effort, name: threadName(name), seed, sandbox: "read-only" });
   } catch (e) {
     if (e instanceof ModelChoiceError) return { refused: e.message };
     throw e;
@@ -233,7 +257,7 @@ server.registerTool(
     if (stop) return stop;
     let threadId = thread_id;
     if (!threadId) {
-      const t = await newThread({ model, effort, name: name ?? "Peer bridge · Advisor", seed: ADVISOR_BRIEF });
+      const t = await newThread({ model, effort, name: name ?? "Advisor", seed: ADVISOR_BRIEF });
       if (t.refused) return text(t.refused);
       threadId = t.threadId;
     }
@@ -422,7 +446,10 @@ server.registerTool(
       "After [CHANGES REQUESTED], ask for the next round with round_of (the previous review's link id): same reviewer and kind, and say what you changed and where you disagree; " +
       "after a review that got no answer, round_of asks the same reviewer again. " +
       (SIDE === "claude"
-        ? `reviewer='openai' opens a new ChatGPT thread for it (pick the model and effort; ${MODEL_CHOICE}), or continues in an earlier one (thread_id), which keeps that chat's context; `
+        ? `reviewer='openai' opens a new ChatGPT thread for it (pick the model and effort; ${MODEL_CHOICE}), or continues in an earlier one (thread_id), which keeps that chat's context. ` +
+          "Use thread_id only to go on with the same work (a later round, or a follow-up of it); for other work open a new thread, even with the same model. " +
+          "A reviewer the user names by model (\"ask Astra\") means a new thread with that model, unless they point to an earlier chat. " +
+          "In auto mode a review without thread_id goes to auto mode's reviewer chat, unless you give another model or a name: then it gets a chat of its own. "
         : "") +
       "reviewer='join' returns a code for an existing chat, which then calls bridge_link_join. The answer arrives as a new turn.",
     inputSchema: {
@@ -441,7 +468,7 @@ server.registerTool(
         thread_id: z
           .string()
           .optional()
-          .describe("Existing ChatGPT thread to review in, e.g. an earlier reviewer's; it keeps its own model and permissions (model/effort/name are ignored)"),
+          .describe("Existing ChatGPT thread to review in, for the same work only (an earlier reviewer of it); it keeps its own model and permissions (model/effort/name are ignored)"),
       }),
     },
     annotations: LOCAL,
@@ -450,17 +477,27 @@ server.registerTool(
     const primary = await self(extra);
     if (!primary) return text("Can't tell which chat this is, so the review can't be routed back.");
     const auto = await autoOf(primary);
+    if (!name?.trim()) name = undefined;
     // 1. Where it goes, with no side effects: the earlier round's reviewer,
     // auto mode's reviewer chat, or the one asked for (a join has none yet)
     let round = null;
     let target = null;
+    let separate = false;
     if (round_of) round = await call("round_info", { primary, roundOf: round_of });
     else {
       if (auto && SIDE === "claude" && reviewer !== "join") {
         reviewer = "openai";
-        thread_id ??= auto.thread;
-        model ??= auto.model;
-        effort ??= auto.effort;
+        // a chat asked for by another model or by name is a chat of its own;
+        // auto mode's reviewer chat stays as it is. The first review makes
+        // auto mode's chat with what it asks for, unless that is another
+        // model than the one auto mode was turned on with.
+        const other = model !== undefined && !sameModel(model, auto.model);
+        separate = !thread_id && (auto.thread ? name !== undefined || other : other && auto.model != null);
+        if (!separate) {
+          thread_id ??= auto.thread;
+          model ??= auto.model;
+          effort ??= auto.effort;
+        }
       }
       if (!reviewer) return text("Say where the reviewer runs (reviewer), or continue an earlier review with round_of.");
     }
@@ -493,17 +530,19 @@ server.registerTool(
     }
     let threadId = thread_id;
     if (!threadId) {
-      const t = await newThread({ model, effort, name: name ?? `Peer bridge · ${what}: ${request.trim().slice(0, 40)}`, seed: REVIEWER_BRIEF });
+      const t = await newThread({ model, effort, name: name ?? `${what}: ${request.trim().slice(0, 40)}`, seed: REVIEWER_BRIEF });
       if (t.refused) return text(t.refused);
       threadId = t.threadId;
       model = t.model ?? model;
-      if (auto) await call("auto_thread", { endpoint: primary, thread: threadId });
+      if (auto && !separate) await call("auto_thread", { endpoint: primary, thread: threadId, model, effort });
     }
     const r = await call("link_create", { primary, mode: "review", advisor: { app: "openai", id: threadId }, request: req.text, plan, noGate, reqPaths: req.reqPaths });
     const where = thread_id ? `ChatGPT thread ${threadId}` : `a new ChatGPT thread (${threadId}${model ? `, ${model}` : ""}${effort ? `, effort ${effort}` : ""})`;
     return withRules(
       `${what} ${r.id} sent to ${where}. The answer arrives as a new turn when it's ready. ${WAIT}` +
-        (auto ? " Auto mode keeps using this reviewer chat." : ` To continue in that chat later, pass thread_id ${threadId}.`),
+        (auto && !separate && (thread_id ?? null) === (auto.thread ?? null)
+          ? " Auto mode keeps using this reviewer chat."
+          : ` To continue this work in that chat later, pass thread_id ${threadId}; for other work, start a new chat.`),
       { ...r, threadId },
     );
   },
