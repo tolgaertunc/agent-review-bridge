@@ -36,14 +36,6 @@ export const rulesFile = () => path.join(configDir(), "rules.md");
 export const codexHome = () => process.env.CODEX_HOME || path.join(home, ".codex");
 export const claudeConfigDir = () => process.env.CLAUDE_CONFIG_DIR || path.join(home, ".claude");
 
-// Legacy: Claude Desktop's own MCP config (servers there are proxied into the
-// Code tab without request _meta, so the bridge no longer registers there)
-export function claudeDesktopConfig() {
-  if (IS_WIN) return path.join(winAppData(), "Claude", "claude_desktop_config.json");
-  if (IS_MAC) return path.join(macAppSupport, "Claude", "claude_desktop_config.json");
-  return path.join(process.env.XDG_CONFIG_HOME || path.join(home, ".config"), "Claude", "claude_desktop_config.json");
-}
-
 const exe = (name) => (IS_WIN ? `${name}.exe` : name);
 
 function onPath(name) {

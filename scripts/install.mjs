@@ -15,13 +15,12 @@
 //   that tells whoever waits when an API error (a usage limit) ends a turn,
 //   and a SessionStart hook that gives auto mode's rules again after a
 //   compaction or a resumed session.
-// - Cleans up what older versions registered: the Claude Desktop config entry
-//   and the blocking Codex Stop hook.
+// - Cleans up the blocking Codex Stop hook that older versions registered.
 
 import fs from "node:fs";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { IS_WIN, claudeConfigDir, claudeDesktopConfig, codexHome, findClaudeCli } from "../src/platform.mjs";
+import { IS_WIN, claudeConfigDir, codexHome, findClaudeCli } from "../src/platform.mjs";
 
 const uninstall = process.argv.includes("--uninstall");
 const server = path.resolve(import.meta.dirname, "../src/server.mjs");
@@ -134,23 +133,6 @@ const CODEX_HOOKS = {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(cfg, null, 2) + "\n");
   console.log(`${uninstall ? "removed" : "set"} ${rule} permission and hooks in ${file}`);
-}
-
-// Claude Desktop config: older versions registered here, under the earlier
-// name peer-bridge; servers there are proxied into the Code tab without
-// request _meta, so only remove
-{
-  const file = claudeDesktopConfig();
-  const OLD = "peer-bridge";
-  if (fs.existsSync(file)) {
-    const cfg = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (cfg.mcpServers?.[OLD]) {
-      backup(file);
-      delete cfg.mcpServers[OLD];
-      fs.writeFileSync(file, JSON.stringify(cfg, null, 2));
-      console.log(`removed old entry from ${file}`);
-    }
-  }
 }
 
 // ChatGPT Desktop (Codex-based): config.toml → [mcp_servers.agent_review_bridge]
