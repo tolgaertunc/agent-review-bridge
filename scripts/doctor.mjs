@@ -11,7 +11,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { DATA_DIR, OUTBOX_DIR, LISTENERS_DIR, PROTOCOL, readState, activeLinks } from "../src/broker.mjs";
 import { readRules, MAX_RULES } from "../src/rules.mjs";
 import { readConfig } from "../src/config.mjs";
-import { IS_WIN, rulesFile, claudeConfigDir, claudeDesktopConfig, codexHome, findClaudeCli, locateCodexCli } from "../src/platform.mjs";
+import { IS_WIN, rulesFile, claudeConfigDir, codexHome, findClaudeCli, locateCodexCli } from "../src/platform.mjs";
 
 const asJson = process.argv.includes("--json");
 const root = path.resolve(import.meta.dirname, "..");
@@ -178,14 +178,6 @@ function runs(cmd, shell) {
     }
     if (checkCommand(A, label, h.command) !== true) continue;
     runs(h.command) ? ok(A, label, rewake ? "asyncRewake, runs" : "runs") : fail(A, label, "command fails", REINSTALL);
-  }
-  // older versions registered there, under the earlier name
-  try {
-    readJson(claudeDesktopConfig()).mcpServers?.["peer-bridge"]
-      ? warn(A, "old Claude Desktop entry", "still registered there (no session identity)", REINSTALL)
-      : ok(A, "old Claude Desktop entry", "none");
-  } catch {
-    ok(A, "old Claude Desktop entry", "none");
   }
 }
 
