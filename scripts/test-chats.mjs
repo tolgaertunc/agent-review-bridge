@@ -10,7 +10,8 @@ import assert from "node:assert/strict";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-chats-"));
 process.env.CLAUDE_CONFIG_DIR = root;
 const rc = await import("../src/readchat.mjs");
-const { claudeSession, claudeSessions, claudeMeta, claudeStream, findClaude, readClaudePage, deepTitles, clearTitleMemo, MAX_RECORD } = await import("../src/chats.mjs");
+const { claudeSession, claudeSessions, claudeMeta, claudeStream, findClaude, lookupClaude, readClaudePage, deepTitles, clearTitleMemo, MAX_RECORD } = await import("../src/chats.mjs");
+const { openIndex } = await import("../src/chatindex.mjs");
 const { findChatgpt, readChatgptPage, itemUnit, RAW_BUDGET } = await import("../src/codex.mjs");
 
 // ------------------------------------------------------------ Claude fixtures
@@ -27,19 +28,37 @@ const R = {
   queued: (prompt) => ({ type: "attachment", timestamp: ts(), attachment: { type: "queued_command", prompt, origin: { kind: "human" } } }),
 };
 const lines = (records) => records.map((r) => (typeof r === "string" ? r : JSON.stringify(r))).join("\n") + "\n";
+// As the app writes them: each record names the one before it
+let uuids = 0;
+function chained(records, from = null) {
+  let tip = from;
+  const out = records.map((r) => {
+    if (typeof r === "string" || !["user", "assistant", "attachment"].includes(r.type) || r.uuid) return r;
+    const rec = { ...r, uuid: `r${++uuids}`, parentUuid: tip };
+    if (!r.isSidechain) tip = rec.uuid;
+    return rec;
+  });
+  return { out, tip };
+}
 let seq = 0;
 function session(records, { key = "proj", id = `s${++seq}`, titleJson, mtime } = {}) {
   const dir = path.join(root, "projects", key);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${id}.jsonl`);
-  fs.writeFileSync(file, lines(records));
+  const { out, tip } = chained(records);
+  fs.writeFileSync(file, lines(out));
   if (titleJson) {
     fs.mkdirSync(path.join(dir, id), { recursive: true });
     fs.writeFileSync(path.join(dir, id, "custom-title.json"), JSON.stringify({ customTitle: titleJson }));
   }
   const t = (mtime ?? clock) / 1000;
   fs.utimesSync(file, t, t);
-  return { id, file };
+  return { id, file, tip };
+}
+function append(s, records) {
+  const { out, tip } = chained(records, s.tip);
+  s.tip = tip;
+  fs.appendFileSync(s.file, lines(out));
 }
 const clean = () => fs.rmSync(path.join(root, "projects"), { recursive: true, force: true });
 const sessionOf = (id) => claudeSession(id);
@@ -50,9 +69,15 @@ const find = async (crit) => {
 };
 const claudeFind = findClaude;
 async function units(file, opts) {
-  const out = [];
-  for await (const s of claudeStream(file, undefined, opts)) if (s.unit) out.push(s.unit);
-  return out.reverse();
+  const { view } = await openIndex(file);
+  const fh = await fs.promises.open(file, "r");
+  try {
+    const out = [];
+    for await (const s of claudeStream(view, fh, opts)) if (s.unit) for (let n = s.unit.n ?? 1; n > 0; n--) out.push(s.unit);
+    return out.reverse();
+  } finally {
+    await fh.close();
+  }
 }
 const page = async (id, opts) => readClaudePage(await sessionOf(id), { limit: 20, includeTools: false, ...opts });
 
@@ -179,7 +204,7 @@ async function readAll(pageFn) {
   assert.ok(first.page.more && first.page.count < 60, "the page cap cut the page");
   assert.ok(first.page.text.length <= rc.MAX_PAGE);
   // new messages arrive after the first page
-  fs.appendFileSync(s.file, lines([R.user("late question"), R.asst("late", [R.text("late answer")])]));
+  append(s, [R.user("late question"), R.asst("late", [R.text("late answer")])]);
   const rest = await readAll(async (resume) => (resume === undefined ? first : page(s.id, { resume, limit: 60 })));
   assert.equal(rest.length, expected, "every message exactly once");
   assert.equal(new Set(rest.map((b) => b.split("\n")[1].slice(0, 12))).size, expected, "no message twice");
@@ -192,18 +217,19 @@ async function readAll(pageFn) {
 // 5 a cursor is checked against the record it stopped at: removing an earlier
 // message, rewriting the file or cutting it stops the read; nothing repeats
 {
-  const same = (t) => ({ type: "user", timestamp: "2026-11-01T10:00:00Z", cwd: "/w", message: { role: "user", content: t } });
-  const s = session(["A", "B", "C", "D"].map(same));
+  const same = (t, parent) => ({ type: "user", timestamp: "2026-11-01T10:00:00Z", cwd: "/w", uuid: t, parentUuid: parent, message: { role: "user", content: t } });
+  const row = (...names) => names.map((t, i) => same(t, i ? names[i - 1] : null));
+  const s = session(row("A", "B", "C", "D"));
   const p1 = await page(s.id, { limit: 2 });
   assert.match(p1.page.text, /C[\s\S]*D/);
-  fs.writeFileSync(s.file, lines(["B", "C", "D"].map(same)));
+  fs.writeFileSync(s.file, lines(row("B", "C", "D")));
   assert.ok((await page(s.id, { resume: p1.page.pos, limit: 2 })).moved, "an earlier record gone: stops, doesn't repeat C");
-  fs.writeFileSync(s.file, lines(["A", "B", "X", "D"].map(same)));
+  fs.writeFileSync(s.file, lines(row("A", "B", "X", "D")));
   assert.ok((await page(s.id, { resume: p1.page.pos, limit: 2 })).moved, "the record at the cursor changed");
-  fs.writeFileSync(s.file, lines(["A"].map(same)));
+  fs.writeFileSync(s.file, lines(row("A")));
   assert.ok((await page(s.id, { resume: p1.page.pos, limit: 2 })).moved, "the file is shorter than the cursor");
-  fs.writeFileSync(s.file, lines(["A", "B", "C", "D"].map(same)));
-  fs.appendFileSync(s.file, lines(["E"].map(same)));
+  fs.writeFileSync(s.file, lines(row("A", "B", "C", "D")));
+  fs.appendFileSync(s.file, lines([same("E", "D")]));
   const p2 = await page(s.id, { resume: p1.page.pos, limit: 2 });
   assert.match(p2.page.text, /A[\s\S]*B/, "an addition at the end changes nothing");
   // a tool step on the next page keeps the result that lies past the cursor
@@ -221,8 +247,8 @@ async function readAll(pageFn) {
 }
 
 // 6 size: a huge record is never held or parsed, a large last record doesn't
-// lose the folder, what can't be settled within the limits is reported, and
-// the event loop keeps turning (the process may own the broker)
+// lose the folder, and the event loop keeps turning (the process may own the
+// broker). More in scripts/test-chat-graph.mjs.
 {
   clean();
   const big = session([R.user("first", { cwd: "/early" }), R.user("y".repeat(600_000), { cwd: "/wanted" })], { titleJson: "Big" });
@@ -246,59 +272,16 @@ async function readAll(pageFn) {
   assert.deepEqual(byFolder.problems, ["folder not found within the limit"]);
   // two records alike for their first 64 KiB are still two records
   clean();
-  const alike = (i) => ({ type: "user", message: { role: "user", content: "a".repeat(70_000) }, uuid: `uuid-${i}`, timestamp: `2026-11-01T10:00:0${i}Z`, cwd: "/w" });
+  const alike = (i) => ({ type: "user", message: { role: "user", content: "a".repeat(70_000) }, uuid: `uuid-${i}`, parentUuid: i ? `uuid-${i - 1}` : null, timestamp: `2026-11-01T10:00:0${i}Z`, cwd: "/w" });
   const twins = session([0, 1, 2, 3].map(alike), { id: "twins" });
   const t1 = await page(twins.id, { limit: 2 });
   fs.writeFileSync(twins.file, lines([1, 2, 3].map(alike)));
   assert.ok((await page(twins.id, { resume: t1.page.pos, limit: 2 })).moved, "an earlier record gone, with the same first 64 KiB at the cursor: stops");
-  // the same with a huge record that differs only in the middle of nowhere
-  const hugeAlike = (end) => ({ type: "user", message: { role: "user", content: "h".repeat(MAX_RECORD + 1_000) + end }, cwd: "/w" });
-  const two = session([R.user("old"), hugeAlike("A"), R.user("new")], { id: "huge-alike" });
-  const h1 = await page(two.id, { limit: 1 });
-  assert.ok(h1.page.pos.n > MAX_RECORD, "the page ended by passing the huge record, so its cursor sits on it");
-  assert.ok(!(await page(two.id, { limit: 1, resume: h1.page.pos })).moved, "unchanged, it holds");
-  const hugeBytes = fs.readFileSync(two.file);
-  const tailAt = hugeBytes.lastIndexOf('A"}', hugeBytes.length);
-  hugeBytes[hugeBytes.indexOf('hA"', h1.page.pos.o) + 1] = "B".charCodeAt(0);
-  assert.ok(tailAt > 0);
-  fs.writeFileSync(two.file, hugeBytes);
-  assert.ok((await page(two.id, { limit: 1, resume: h1.page.pos })).moved, "the same length and start but another end is another record");
-  // a stretch of metadata longer than the budget: pages go on, none stands still
+  // a stretch with nothing to show costs nothing and hides nothing
   clean();
-  const md = (i) => ({ type: "progress", i, pad: "m".repeat(1_000_000) });
-  const metaOnly = session([R.user("oldest"), ...Array.from({ length: 12 }, (_, i) => md(i)), R.user("newest")], { id: "meta-only" });
-  const stops = [];
-  const metaAll = await readAll(async (resume) => {
-    const r = await readClaudePage(await sessionOf(metaOnly.id), { resume, limit: 5, includeTools: false, budget: 3_000_000 });
-    if (r.page.more) stops.push(r.page.pos.o);
-    return r;
-  });
-  assert.deepEqual(metaAll.map((b) => b.split("\n")[1]), ["oldest", "newest"]);
-  assert.ok(stops.length >= 2, "several pages through the stretch");
-  assert.ok(stops.every((o, i) => !i || o < stops[i - 1]), "each one further back");
-  // a message is never shown in part: one split by the budget comes whole on
-  // the next page; one wider than a whole budget is left out and said so
-  clean();
-  const part = (id, n) => R.asst(id, [R.text(`${id}-part${n} ${"t".repeat(800_000)}`)]);
-  const fits = session([R.user("q"), part("m", 1), part("m", 2), ...Array.from({ length: 2 }, (_, i) => md(i)), R.user("newest")], { id: "fits" });
-  for (const includeTools of [false, true]) {
-    const got = await readAll(async (resume) => readClaudePage(await sessionOf(fits.id), { resume, limit: 5, includeTools, budget: 2_500_000 }));
-    const m = got.filter((b) => /m-part/.test(b));
-    assert.equal(m.length, 1, "one message, one block");
-    assert.match(m[0], /m-part1/, "starting from its first record");
-    assert.match(m[0], /^### Assistant ·/, "an answer, whole");
-  }
-  const wide = session([R.user("before it"), ...Array.from({ length: 10 }, (_, i) => part("w", i)), R.user("after it")], { id: "wide" });
-  for (const includeTools of [false, true]) {
-    let spread = 0;
-    const got = await readAll(async (resume) => {
-      const r = await readClaudePage(await sessionOf(wide.id), { resume, limit: 5, includeTools, budget: 2_500_000 });
-      spread += r.page.dropped["messages spread too far to read"] ?? 0;
-      return r;
-    });
-    assert.deepEqual(got.map((b) => b.split("\n")[1]), ["before it", "after it"], "no fragment of it is shown");
-    assert.equal(spread, 1, "it is reported once");
-  }
+  const stretch = session([R.user("oldest"), ...Array.from({ length: 12 }, (_, i) => ({ type: "user", isSidechain: true, i, message: { role: "user", content: "s".repeat(1_000_000) } })), ...Array.from({ length: 12 }, (_, i) => ({ type: "progress", i, pad: "m".repeat(1_000_000) })), R.user("newest")], { id: "stretch" });
+  const all = await readAll(async (resume) => readClaudePage(await sessionOf(stretch.id), { resume, limit: 5, includeTools: false }));
+  assert.deepEqual(all.map((b) => b.split("\n")[1]), ["oldest", "newest"]);
   // the event loop while a page of a large file is read
   clean();
   const chunk = "w".repeat(1_000_000);
@@ -310,45 +293,10 @@ async function readAll(pageFn) {
     last = Date.now();
   }, 5);
   const lp = await readClaudePage(await sessionOf(large.id), { limit: 1, includeTools: false });
-  await page(large.id, { limit: 2, resume: lp.page.pos });
+  assert.ok(!lp.page.more);
   await find({ name: "large" });
   clearInterval(beat);
   assert.ok(worst < 500, `the event loop stayed responsive (worst gap ${worst} ms)`);
-  // a record larger than a page's whole read budget: each call stops inside
-  // it, the cursor goes on from there, and nothing around it is lost
-  const giant = session([R.user("older"), R.user("g".repeat(MAX_RECORD + 8_000_000)), R.user("newer")], { id: "giant" });
-  const g1 = await readClaudePage(await sessionOf(giant.id), { limit: 5, includeTools: false, budget: 3_000_000 });
-  assert.match(g1.page.text, /newer/);
-  assert.ok(g1.page.more && g1.page.pos.s, "stopped inside the record");
-  const g2 = await readClaudePage(await sessionOf(giant.id), { resume: g1.page.pos, limit: 5, includeTools: false, budget: 3_000_000 });
-  assert.ok(g2.page.more && g2.page.pos.s && g2.page.pos.o < g1.page.pos.o, "a later call goes further in, within its budget");
-  const gAll = await readAll(async (resume) => readClaudePage(await sessionOf(giant.id), { resume, limit: 5, includeTools: false, budget: 3_000_000 }));
-  assert.deepEqual(gAll.map((b) => b.split("\n")[1]), ["older", "newer"]);
-  // a cursor resting inside a huge record, or on one, still checks the bytes
-  const rawGiant = fs.readFileSync(giant.file);
-  fs.writeFileSync(giant.file, rawGiant.fill(120, g2.page.pos.o, g2.page.pos.o + 100));
-  assert.ok((await readClaudePage(await sessionOf(giant.id), { resume: g2.page.pos, limit: 5, budget: 3_000_000 })).moved);
-  const onHuge = session([R.user("first"), R.user("h".repeat(MAX_RECORD + 1_000)), R.user("last")], { id: "on-huge" });
-  const e1 = await readClaudePage(await sessionOf(onHuge.id), { limit: 1, includeTools: false });
-  const e0 = await readClaudePage(await sessionOf(onHuge.id), { limit: 2, includeTools: false });
-  assert.ok(e0.page.dropped["records too large to read"] === 1 && e1.page.pos, "the boundary can sit on a huge record");
-  const boundary = { type: "user", timestamp: "2026-11-01T10:00:00Z", cwd: "/w" };
-  const rewrite = session([{ ...boundary, message: { role: "user", content: "aaa" } }, { ...boundary, message: { role: "user", content: "H".repeat(MAX_RECORD + 1_000) } }, { ...boundary, message: { role: "user", content: "zzz" } }, { ...boundary, message: { role: "user", content: "yyy" } }], { id: "rewrite" });
-  const r1 = await readClaudePage(await sessionOf(rewrite.id), { limit: 2, includeTools: false });
-  assert.equal(r1.page.dropped["records too large to read"], 1, "the page ended by consuming the huge record, so its cursor sits on it");
-  const onRecord = r1.page.pos;
-  assert.ok(onRecord.h, "with a fingerprint of its first bytes");
-  assert.ok(!(await readClaudePage(await sessionOf(rewrite.id), { resume: onRecord, limit: 1, includeTools: false })).moved, "unchanged, it holds");
-  // the same range, another huge record of the same length in it
-  const before = fs.readFileSync(rewrite.file);
-  fs.writeFileSync(rewrite.file, Buffer.from(before.toString("latin1").replace("HHHHHHHH", "IIIIIIII"), "latin1"));
-  assert.ok((await readClaudePage(await sessionOf(rewrite.id), { resume: onRecord, limit: 1, includeTools: false })).moved, "a rewritten huge record at the cursor is caught");
-  // a stretch with nothing to show ends the page early, and the cursor goes on
-  const stretch = session([R.user("oldest"), ...Array.from({ length: 12 }, (_, i) => ({ type: "user", isSidechain: true, i, pad: "s".repeat(1_000_000) })), R.user("newest")], { id: "stretch" });
-  const s1 = await readClaudePage(await sessionOf(stretch.id), { limit: 5, includeTools: false, budget: 3_000_000 });
-  assert.ok(s1.page.more && s1.page.pos, "the read budget ran out, the cursor goes on");
-  const all = await readAll(async (resume) => readClaudePage(await sessionOf(stretch.id), { resume, limit: 5, includeTools: false, budget: 3_000_000 }));
-  assert.equal(all.length, 2, "and nothing is lost");
   clean();
   console.log(`chats 6 huge records skipped wherever they sit, a large last record keeps its folder, limits reported, event loop worst gap ${worst} ms`);
 }
@@ -539,7 +487,7 @@ const findG = async (s, crit) => {
   assert.equal(rc.pickOne(failed), null, "the app failed: ask");
   assert.match(rc.noneText(failed, { name: "notes" }), /ChatGPT Desktop's chats couldn't be read right now \(down\)/);
   assert.equal(rc.decodeCursor("garbage", "claude"), null);
-  const good = { k: "read", to: "claude", id: "x", t: 0, r: { o: 4, n: 2, h: "ab", l: true } };
+  const good = { k: "read", to: "claude", id: "x", t: 0, r: { u: "m", o: 4, n: 2, h: "ab", c: 3, d: "cd" } };
   assert.deepEqual(rc.decodeCursor(rc.encodeCursor(good), "claude"), good);
   assert.equal(rc.decodeCursor(rc.encodeCursor(good), "chatgpt"), null, "a cursor for the other app's chats is refused");
   assert.equal(rc.decodeCursor(rc.encodeCursor({ ...good, to: undefined, app: "claude" }), "claude"), null, "an app field selects nothing");
@@ -547,10 +495,14 @@ const findG = async (s, crit) => {
     { ...good, k: "find" },
     { ...good, id: 1 },
     { ...good, t: 2 },
-    { ...good, r: { o: -1, n: 2, h: "ab", l: true } },
+    { ...good, r: { ...good.r, o: -1 } },
     { ...good, r: { o: 1 } },
-    { ...good, r: { o: 1, n: 2, h: "", l: true } },
-    { ...good, r: { o: 1, n: 0, h: "ab", l: true, s: true } },
+    { ...good, r: { ...good.r, h: "" } },
+    { ...good, r: { ...good.r, n: 0 } },
+    { ...good, r: { ...good.r, u: 5 } },
+    { ...good, r: { ...good.r, d: "" } },
+    { ...good, r: { ...good.r, c: -1 } },
+    { ...good, r: { ...good.r, c: null } },
   ])
     assert.equal(rc.decodeCursor(rc.encodeCursor(bad), "claude"), null, JSON.stringify(bad));
   assert.equal(rc.decodeCursor(rc.encodeCursor({ ...good, to: "chatgpt", r: { pc: 1, b: "x" } }), "chatgpt"), null);

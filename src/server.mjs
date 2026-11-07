@@ -706,6 +706,8 @@ async function readOne({ id, includeTools, limit, resume }) {
       return cant(e.message);
     }
   }
+  if (r.status === "scanning") return text(rc.STILL_READING(r.scanned, r.total));
+  if (r.status === "tooLarge") return text(rc.TOO_LARGE);
   if (r.moved) return text(rc.MOVED);
   // a page that read nothing new keeps the cursor it came with
   const cursor = rc.encodeCursor({ k: "read", to: READ_TARGET, id, t: includeTools ? 1 : 0, r: r.page.pos ?? resume });

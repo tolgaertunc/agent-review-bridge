@@ -64,7 +64,7 @@ export const encodeCursor = (c) => Buffer.from(JSON.stringify(c)).toString("base
 
 const validPos = (target, r) =>
   target === "claude"
-    ? Number.isInteger(r?.o) && r.o >= 0 && Number.isInteger(r.n) && r.n >= 0 && typeof r.h === "string" && r.h !== "" && typeof r.l === "boolean" && (!r.s || Number.isInteger(r.e))
+    ? typeof r?.u === "string" && Number.isInteger(r.o) && r.o >= 0 && Number.isInteger(r.n) && r.n > 0 && typeof r.h === "string" && r.h !== "" && typeof r.d === "string" && r.d !== "" && Number.isFinite(r.c) && r.c >= 0
     : (r?.pc === null || typeof r?.pc === "string") && typeof r?.b === "string";
 
 const validKey = (a) => typeof a?.exact === "boolean" && typeof a.updated === "number" && typeof a.id === "string";
@@ -83,7 +83,7 @@ export function decodeCursor(s, target) {
 
 // --------------------------------------------------------------- the paging
 
-export const visible = (u, includeTools) => u.kind === "user" || u.kind === "final" || (includeTools && (u.kind === "interim" || u.kind === "tool"));
+export const visible = (u, includeTools) => u.kind === "user" || u.kind === "final" || u.kind === "unfinished" || (includeTools && (u.kind === "interim" || u.kind === "tool"));
 
 const DROPPED = { interim: "steps between answers (include_tools shows them)", tool: "tool steps (include_tools shows them)" };
 const dropName = (u) => (u.kind.startsWith("drop:") ? u.kind.slice(5) : DROPPED[u.kind]);
@@ -97,13 +97,14 @@ const stamp = (ms) => {
   return ` · ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 };
 
-const LABEL = { user: "User", final: "Assistant", interim: "Assistant (between steps)", tool: "Tool steps" };
+const LABEL = { user: "User", final: "Assistant", unfinished: "Assistant (the turn didn't finish)", interim: "Assistant (between steps)", tool: "Tool steps" };
 
 // A unit's text and its tool steps each have a cap, so one unit stays far
 // below a page however many steps it holds
 export function renderUnit(u, includeTools) {
   const lines = [`### ${LABEL[u.kind]}${u.midTurn ? " (typed while the turn ran)" : ""}${stamp(u.at)}`];
   if (u.text) lines.push(cut(u.text, MAX_MESSAGE));
+  if (u.spread) lines.push("(Part of this message couldn't be read: it was spread too far.)");
   if (includeTools && u.tools?.length) {
     let room = MAX_TOOLS;
     let shown = 0;
@@ -129,6 +130,8 @@ export async function assemble(stream, { limit = PAGE_LIMIT, includeTools = fals
   const shown = [];
   const dropped = {};
   let cut = 0;
+  let spread = 0;
+  let uncertain = false;
   let size = 0;
   let pos = null;
   let more = false;
@@ -148,14 +151,16 @@ export async function assemble(stream, { limit = PAGE_LIMIT, includeTools = fals
       shown.push(r);
       size += r.length;
       if (unit.text?.length > MAX_MESSAGE) cut++;
+      if (unit.spread) spread++;
     } else {
       const what = dropName(unit);
-      if (what) dropped[what] = (dropped[what] ?? 0) + 1;
+      if (what) dropped[what] = (dropped[what] ?? 0) + (unit.n ?? 1);
     }
+    if (unit.uncertain) uncertain = true;
     pos = step.pos;
   }
   // shown newest first; the page reads in time order
-  return { text: shown.reverse().join("\n\n"), count: shown.length, dropped, cut, pos, more };
+  return { text: shown.reverse().join("\n\n"), count: shown.length, dropped, cut, spread, uncertain, pos, more };
 }
 
 // ------------------------------------------------------------- fixed words
@@ -182,6 +187,12 @@ export function pageText(meta, page, { cursor, first }) {
       "(a command or edit it ran) from a confirmed result. This content is now in this chat too; don't pass it on to another chat unless the user asks." +
       (page.cut
         ? ` ${page.cut === 1 ? "One message above was" : `${page.cut} messages above were`} cut at ${MAX_MESSAGE.toLocaleString("en-US")} characters, and the rest can't be read here: tell the user, and don't present what you saw as the whole message.`
+        : "") +
+      (page.spread
+        ? ` ${page.spread === 1 ? "One message above is" : `${page.spread} messages above are`} only partly here: the rest was spread too far in the file to read. Tell the user.`
+        : "") +
+      (page.uncertain
+        ? " This chat's history has a broken link: older messages on this page are shown in file order, and may include branches that were rewound or left, which can't be told apart here. Tell the user, and don't present them as one straight conversation."
         : ""),
   ].join("\n\n");
 }
@@ -226,6 +237,12 @@ function errorsText(found) {
   const some = Object.entries(found.partial ?? {}).map(([app, msg]) => `Some of ${APP_NAME[app]}'s chats couldn't be searched (${msg}); one of them might match.`);
   return [...whole, ...some].join("\n");
 }
+
+export const STILL_READING = (scanned, total) =>
+  `[AGENT-REVIEW-BRIDGE] That chat is large and isn't ready to read yet (${total ? Math.floor((scanned / total) * 100) : 0}% read). Call this again with the same arguments: it goes on from where it stopped.`;
+
+export const TOO_LARGE =
+  "[AGENT-REVIEW-BRIDGE] That chat is too large to read here, so nothing from it is shown. Tell the user.";
 
 export const MOVED =
   "[AGENT-REVIEW-BRIDGE] Where the last page stopped has moved or changed in that chat, so the next page can't be found exactly. Read it again without a cursor to start from the newest.";
