@@ -329,11 +329,14 @@ export async function claudeMeta(s, { deadline = Infinity, inScope = () => true 
     }
   let titleKnown = !!custom || (scannedAll && !unresolved);
   if (!custom && !scannedAll) {
+    // The end of a file and the title file are the newest word. A forward scan's
+    // title isn't until it has read to the end: a newer rename may lie further on.
+    // Until then the name is only provisional.
     if (inScope(folder)) {
       const d = await deepTitles(s, { deadline });
       custom = d.custom;
       ai ??= d.ai;
-      titleKnown = !!custom || d.settled;
+      titleKnown = d.settled;
     } else titleKnown = false;
   }
   let name = custom ?? ai;
@@ -414,7 +417,8 @@ function toolLine(b, outcome) {
 const stampOf = (r) => (r.timestamp ? Date.parse(r.timestamp) || null : null);
 
 // A unit's text and tool steps, read by offset, newest record first. Reading stops
-// at `budget`: what was read is shown, and the unit says the rest wasn't, so one
+// once `budget` is reached (so over it by at most one record, itself bounded by
+// MAX_RECORD): what was read is shown, and the unit says the rest wasn't, so one
 // message can't hold a page up and a page always moves on.
 async function hydrate(unit, view, fh, budget) {
   const out = { kind: unit.kind, at: null, text: "", tools: [], moreTools: 0, midTurn: unit.midTurn, uncertain: unit.uncertain };

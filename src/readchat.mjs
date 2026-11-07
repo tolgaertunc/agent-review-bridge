@@ -239,7 +239,7 @@ function errorsText(found) {
 }
 
 export const STILL_READING = (scanned, total) =>
-  `[AGENT-REVIEW-BRIDGE] That chat is large and isn't ready to read yet (${total ? Math.floor((scanned / total) * 100) : 0}% read). Call this again with the same arguments: it goes on from where it stopped.`;
+  `[AGENT-REVIEW-BRIDGE] That chat is large and isn't ready to read yet (${total ? Math.floor((scanned / total) * 100) : 0}% read). Call this again with the same arguments: it normally goes on from where it stopped, or starts again if this server restarted or read other large chats meanwhile.`;
 
 export const TOO_LARGE =
   "[AGENT-REVIEW-BRIDGE] That chat is too large to read here, so nothing from it is shown. Tell the user.";

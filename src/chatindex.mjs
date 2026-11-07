@@ -427,7 +427,7 @@ class SessionIndex {
   }
   // true when it reached the end of the file. A line with no newline yet stays
   // pending, and a stop keeps everything needed to go on from that byte.
-  async scan(fh, st, { scanMs, maxChunks }) {
+  async scan(fh, st, { scanMs, maxChunks, onGrow }) {
     const until = Date.now() + scanMs;
     let chunks = 0;
     const chunk = Buffer.allocUnsafe(CHUNK);
@@ -442,6 +442,7 @@ class SessionIndex {
         this.markTooLarge();
         return true;
       }
+      onGrow();
       await pause();
     }
     return true;
@@ -492,7 +493,9 @@ export async function resolve(idx) {
   const stepBack = (rec) => {
     if (typeof rec.p === "string") return by(rec.p) ?? BREAK;
     if (rec.p === undefined) return BREAK;
-    if (rec.f & F.BOUNDARY && typeof rec.l === "string") return by(rec.l) ?? BREAK;
+    // a boundary continues the history before it: with no way back, that history
+    // isn't known to be gone, so this is a break, not a root
+    if (rec.f & F.BOUNDARY) return typeof rec.l === "string" ? (by(rec.l) ?? BREAK) : BREAK;
     return null;
   };
 
@@ -667,8 +670,11 @@ export async function resolve(idx) {
   }
 
   // what kind each is, by turn: newest to oldest, the first text of a turn is its
-  // answer, if nothing came after it. Text before a message typed mid-turn isn't
-  // an unfinished turn if the turn went on after that message.
+  // answer, if nothing came after it. A message typed mid-turn starts a new stretch.
+  // In the stretch before it, text with tool steps after it is between steps if the
+  // turn ran on past that message, and unfinished if it didn't. Text with nothing
+  // after it is an answer either way: the typed message may have been taken up only
+  // after that turn had ended, and hiding an answer is the worse mistake.
   let textSeen = false;
   let activity = false;
   let ranOn = false;
@@ -760,6 +766,10 @@ const memo = new Map();
 export const clearIndexMemo = () => memo.clear();
 export const memoStats = () => ({ sessions: memo.size, bytes: [...memo.values()].reduce((n, i) => n + i.retained(), 0) });
 
+// The least recently used make way for `keep`, whatever state they're in: ready,
+// paused or refused. Applied on every way out of a call and while a scan grows. One
+// evicted while another call is scanning it finishes that call and is then dropped,
+// so what is over the limit lasts only as long as a call. Its next read starts again.
 function evict(keep, maxMemoBytes) {
   for (const [file, idx] of memo) {
     if (memo.size <= MAX_MEMO && [...memo.values()].reduce((n, i) => n + i.retained(), 0) <= maxMemoBytes) return;
@@ -783,9 +793,9 @@ export async function openIndex(file, { scanMs = SCAN_MS, maxChunks = Infinity, 
 
 async function step(file, entry, { scanMs, maxChunks, maxBytes, maxMemoBytes }) {
   const fh = await fs.promises.open(file, "r");
+  let idx = entry;
   try {
     const st = await fh.stat();
-    let idx = entry;
     if (idx.id && !(await sameFile(fh, st, idx.id))) {
       idx = new SessionIndex(file, maxBytes);
       idx.busy = entry.busy;
@@ -799,7 +809,7 @@ async function step(file, entry, { scanMs, maxChunks, maxBytes, maxMemoBytes }) 
       idx.id = await fileIdentity(fh, st, 0);
       return { status: "tooLarge" };
     }
-    const done = await idx.scan(fh, st, { scanMs, maxChunks });
+    const done = await idx.scan(fh, st, { scanMs, maxChunks, onGrow: () => evict(idx, maxMemoBytes) });
     if (idx.tooLarge) {
       idx.id = await fileIdentity(fh, st, 0);
       return { status: "tooLarge" };
@@ -815,9 +825,9 @@ async function step(file, entry, { scanMs, maxChunks, maxBytes, maxMemoBytes }) 
       idx.markTooLarge();
       return { status: "tooLarge" };
     }
-    evict(idx, maxMemoBytes);
     return { status: "ready", view: idx.view };
   } finally {
+    evict(idx, maxMemoBytes);
     await fh.close();
   }
 }

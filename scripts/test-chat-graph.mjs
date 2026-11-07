@@ -3,7 +3,9 @@
 // should be shown, sharing no code with src/chatindex.mjs. Seeded random
 // transcripts (forks, rewinds, compactions, parallel calls, repeats, broken links)
 // must give exactly the oracle's messages, tool outcomes and counts, read in one
-// page or many, however the pages are cut.
+// page or many, for a range of page sizes and read budgets. The oracle states the
+// same rules another way, so it can share a mistaken rule with the code: the named
+// cases below say the answer outright.
 //
 //   node scripts/test-chat-graph.mjs [seeds]   (default 300)
 
@@ -49,7 +51,7 @@ function oracle(lines) {
   const main = all.filter((r) => !r.isSidechain);
   const get = (u) => main.find((r) => r.uuid === u);
   const back = (r) => {
-    if (r.parentUuid === null && r.type === "system" && r.subtype === "compact_boundary" && r.logicalParentUuid) return get(r.logicalParentUuid) ?? "break";
+    if (r.parentUuid === null && r.type === "system" && r.subtype === "compact_boundary") return (typeof r.logicalParentUuid === "string" && get(r.logicalParentUuid)) || "break";
     if (r.parentUuid === null) return null;
     return get(r.parentUuid) ?? "break";
   };
@@ -287,6 +289,7 @@ function generate(seed) {
         // compaction
         const before = tip;
         const b = { uuid: uid(), parentUuid: null, logicalParentUuid: before, type: "system", subtype: "compact_boundary" };
+        if (r(8) === 0) b.logicalParentUuid = [undefined, null, 5, `gone-${seed}`][r(4)];
         lines.push(b);
         tip = b.uuid;
         push({ type: "user", isCompactSummary: true, message: { role: "user", content: "summary" } });
@@ -368,7 +371,7 @@ for (let seed = 1; seed <= seeds; seed++) {
   if (o.broke) totals.broken++;
   for (const includeTools of [false, true]) {
     const expected = o.units.filter((u) => o.visible(u, includeTools)).map((u) => o.render(u, includeTools));
-    for (const opts of [{ limit: 60 }, { limit: 1 }, { limit: 2 }, { limit: 3 }, { limit: 60, budget: 1 }, { limit: 1, budget: 1 }]) {
+    for (const opts of [{ limit: 60 }, { limit: 1 }, { limit: 2 }, { limit: 3 }, { limit: 4 }, { limit: 5 }, { limit: 7 }, { limit: 60, budget: 1 }, { limit: 1, budget: 1 }, { limit: 3, budget: 300 }, { limit: 60, budget: 1000 }]) {
       const got = await readAll(w, { ...opts, includeTools });
       assert.deepEqual(got.blocks, expected, `seed ${seed}, tools ${includeTools}, ${JSON.stringify(opts)}`);
       assert.deepEqual(got.left, o.left, `seed ${seed} counts, tools ${includeTools}, ${JSON.stringify(opts)}`);
@@ -377,7 +380,7 @@ for (let seed = 1; seed <= seeds; seed++) {
   }
   if (seed % 50 === 0) clearIndexMemo();
 }
-console.log(`graph ${seeds} random transcripts, ${totals.units} messages, ${totals.rewound} with rewound branches, ${totals.broken} with broken links: every split of pages gives exactly the oracle's messages, outcomes and counts`);
+console.log(`graph ${seeds} random transcripts, ${totals.units} messages, ${totals.rewound} with rewound branches, ${totals.broken} with broken links: each page size and budget tried gives exactly the oracle's messages, outcomes and counts`);
 
 // ------------------------------------------------------------ the named cases
 
@@ -453,6 +456,13 @@ const texts = (blocks) => blocks.map((b) => b.split("\n")[1]);
   assert.deepEqual(texts(r.blocks), ["one", "two", "three", "four", "five"], "the history before a compaction is read back");
   assert.equal(r.left["compaction summaries"], 2);
   assert.equal(r.left[OTHER], 2);
+  // a boundary with no way back: what's before it isn't known to be gone
+  for (const [what, logical] of [["missing", undefined], ["null", null], ["a number", 5], ["gone", "no-such-record"]]) {
+    r = await read([U("u", null, "older"), A("a", "u", "ma", "reply"), { uuid: "b", parentUuid: null, ...(logical !== undefined && { logicalParentUuid: logical }), type: "system", subtype: "compact_boundary" }, U("v", "b", "newer")]);
+    assert.deepEqual(texts(r.blocks), ["older", "reply", "newer"], `logical parent ${what}: all shown`);
+    assert.ok(r.uncertain, `logical parent ${what}: with the warning`);
+    assert.ok(!r.left[OTHER], `logical parent ${what}: none called left`);
+  }
   // logicalParentUuid only at a boundary with no parent
   r = await read([U("u", null, "root"), A("x", "u", "mx", "off"), U("v", null, "second root", { logicalParentUuid: "x" }), A("w", "v", "mw", "end")]);
   assert.deepEqual(texts(r.blocks), ["second root", "end"], "a record that isn't a boundary doesn't follow it");
@@ -541,6 +551,10 @@ const texts = (blocks) => blocks.map((b) => b.split("\n")[1]);
   // and over a page boundary, a page at a time
   r = await read([U("u", null, "go"), A("a", "u", "m1", "working"), T("b", "a", "m1", "t1"), Res("c", "b", "t1"), A("d", "c", "m2", "the answer")], { limit: 1, includeTools: true });
   assert.deepEqual(kinds(r.blocks), ["### User", "### Assistant (between steps)", "### Assistant"]);
+  // an answer before a typed message stays an answer: it may have been taken up only
+  // after that turn ended
+  r = await read([U("u", null, "go"), A("a", "u", "m1", "first answer"), Q("q", "a", "and this"), A("d", "q", "m2", "second answer")]);
+  assert.deepEqual(kinds(r.blocks), ["### User", "### Assistant", "### User (typed while the turn ran)", "### Assistant"]);
   // text before a message typed mid-turn, when the turn went on after it
   r = await read([U("u", null, "go"), T("a", "u", "m1", "t1"), Q("q", "a", "faster"), A("d", "q", "m2", "done")], { includeTools: true });
   assert.deepEqual(kinds(r.blocks), ["### User", "### Tool steps", "### User (typed while the turn ran)", "### Assistant"]);
@@ -650,6 +664,13 @@ const texts = (blocks) => blocks.map((b) => b.split("\n")[1]);
   r = await read([U("u", null, "first"), A("a", "u", "m", "second"), bigBoundary, A("c", "bb", "n", "third")], { includeTools: true });
   assert.deepEqual(texts(r.blocks), ["first", "second", "third"]);
   assert.ok(!r.uncertain);
+  // one with no way back, read by the tokenizer too
+  for (const logical of [{}, { logicalParentUuid: null }, { logicalParentUuid: 5 }, { logicalParentUuid: "gone" }]) {
+    r = await read([U("u", null, "first"), { uuid: "bb", parentUuid: null, ...logical, type: "system", subtype: "compact_boundary", pad }, U("c", "bb", "third")]);
+    assert.deepEqual(texts(r.blocks), ["first", "third"], JSON.stringify(logical));
+    assert.ok(r.uncertain);
+    assert.ok(!r.left[OTHER]);
+  }
   // a broken one
   r = await read([U("u", null, "first"), `{"uuid":"z","type":"user","pad":"${pad}`, U("v", null, "second")]);
   assert.deepEqual(texts(r.blocks), ["second"]);
@@ -726,6 +747,32 @@ const texts = (blocks) => blocks.map((b) => b.split("\n")[1]);
   const one = memoStats().bytes;
   await openIndex(s2.file, { maxMemoBytes: one + 10 });
   assert.equal(memoStats().sessions, 1, "the other one made way");
+  // the limits hold for scans still under way too, and for a mix of any state
+  clearIndexMemo();
+  const bulk = Array.from({ length: 6 }, () => write(Array.from({ length: 1500 }, (_, i) => U(`b${i}`, i ? `b${i - 1}` : null, "p".repeat(500)))));
+  for (const s of bulk) assert.equal((await openIndex(s.file, { maxChunks: 1 })).status, "scanning");
+  assert.equal(memoStats().sessions, 2, "paused scans are kept no more than others");
+  clearIndexMemo();
+  await openIndex(bulk[0].file, { maxChunks: 1 });
+  const onePaused = memoStats().bytes;
+  for (const s of bulk) {
+    await openIndex(s.file, { maxChunks: 1, maxMemoBytes: onePaused + 100 });
+    assert.ok(memoStats().bytes <= onePaused + 100 || memoStats().sessions === 1, "nor over the shared budget");
+  }
+  clearIndexMemo();
+  assert.equal((await openIndex(bulk[0].file, { maxBytes: 1000 })).status, "tooLarge");
+  await openIndex(bulk[1].file, { maxChunks: 1 });
+  await openIndex(bulk[2].file);
+  await openIndex(bulk[3].file, { maxBytes: 1000 });
+  assert.ok(memoStats().sessions <= 2, "refused, paused and ready together");
+  assert.equal((await openIndex(bulk[0].file, { maxBytes: 1000 })).status, "tooLarge", "and a refused one is refused again, evicted or not");
+  // a paused scan evicted by others starts again, and still gets there
+  clearIndexMemo();
+  const again = bulk[4];
+  await openIndex(again.file, { maxChunks: 1 });
+  await openIndex(bulk[0].file);
+  await openIndex(bulk[1].file);
+  assert.equal((await openIndex(again.file)).status, "ready");
   // the same file only
   clearIndexMemo();
   const sw = write([U("a", null, "AAAA"), A("b", "a", "m", "x".repeat(10_000)), U("c", "b", "tail")]);
@@ -761,6 +808,32 @@ const texts = (blocks) => blocks.map((b) => b.split("\n")[1]);
   got = await readAll(growing, { limit: 60, includeTools: false });
   assert.deepEqual(texts(got.blocks), ["first", "second"]);
   console.log("graph resources: a wide message completes and says so, pages progress, a scan goes on from any byte, the budgets hold, a memo is for the same file");
+}
+
+// a long chain of records with nothing to show, near what a budget allows: resolving
+// walks it once, without holding the event loop for long
+{
+  clearIndexMemo();
+  const n = 150_000;
+  const file = path.join(dir, `g${++seq}.jsonl`);
+  const out = [JSON.stringify(U("u0", null, "start"))];
+  for (let i = 1; i < n; i++) out.push(JSON.stringify(Sys(`u${i}`, `u${i - 1}`)));
+  out.push(JSON.stringify(U("end", `u${n - 1}`, "finish")));
+  fs.writeFileSync(file, out.join("\n") + "\n");
+  out.length = 0;
+  const st = fs.statSync(file);
+  let worst = 0;
+  let last = Date.now();
+  const beat = setInterval(() => {
+    worst = Math.max(worst, Date.now() - last);
+    last = Date.now();
+  }, 5);
+  const p = await readClaudePage({ id: "chain", file, size: st.size, mtime: st.mtimeMs }, { limit: 5, includeTools: false });
+  clearInterval(beat);
+  assert.deepEqual(texts(p.page.text.split(/\n\n(?=### )/)), ["start", "finish"]);
+  assert.ok(!p.page.uncertain);
+  assert.ok(worst < 500, `a long chain: worst gap ${worst} ms`);
+  console.log(`graph a chain of ${n} metadata records: worst event-loop gap ${worst} ms`);
 }
 
 // what the index really holds, against what it says, and how the event loop fares

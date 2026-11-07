@@ -802,6 +802,79 @@ const findG = async (s, crit) => {
   console.log("chats 17 the title scan stops anywhere and goes on, reads only what grew, and a memo is for the same file only");
 }
 
+// 17b a title from a scan that hasn't finished is only provisional: a later rename
+// may lie further on, so it can't be what a chat is picked by
+{
+  clean();
+  clearTitleMemo();
+  const pad = (n) => Array.from({ length: n }, () => ({ type: "x", pad: "p".repeat(1_000_000) }));
+  const renamed = session([R.title("Old title"), R.user("x"), ...pad(2), R.title("Current title"), ...pad(5)], { id: "renamed" });
+  const paused = await deepTitles(await sessionOf(renamed.id), { maxChunks: 1 });
+  assert.equal(paused.custom, "Old title");
+  assert.ok(!paused.settled);
+  // a deadline that passes just as the scan would go on: the checks before it pass
+  const expiring = (checks) => {
+    let n = 0;
+    return { valueOf: () => (++n <= checks ? Infinity : 0) };
+  };
+  const meta = await claudeMeta(await sessionOf(renamed.id), { deadline: expiring(0) });
+  assert.equal(meta.name, "Old title", "the name so far");
+  assert.ok(!meta.titleKnown, "but not settled");
+  const stale = await rc.findChats({ name: "old title" }, "claude", claudeFind, { deadline: expiring(3) });
+  assert.equal(stale.total, 1);
+  assert.ok(!stale.complete);
+  assert.equal(rc.pickOne(stale), null, "the old name doesn't read it at once");
+  // finished, it's the newest
+  const finished = await claudeMeta(await sessionOf(renamed.id));
+  assert.equal(finished.name, "Current title");
+  assert.ok(finished.titleKnown);
+  // and a complete scan with a candidate it couldn't resolve doesn't settle either
+  clean();
+  clearTitleMemo();
+  session([R.title("Readable"), R.user("x"), '{"type":"custom-title","customTitle":"Cut of', ...pad(6)], { id: "doubt" });
+  const doubt = await claudeMeta(await sessionOf("doubt"));
+  assert.equal(doubt.name, "Readable");
+  assert.ok(!doubt.titleKnown, "there may be a newer title in the line it couldn't read");
+  clean();
+  clearTitleMemo();
+  console.log("chats 17b a title from an unfinished scan is provisional: it can't pick a chat");
+}
+
+// 17c the search's time limit against a real process: one that never answers is
+// reported, within the limit, and stopped
+{
+  const { withChatgpt } = await import("../src/codex.mjs");
+  const unix = process.platform !== "win32";
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-hang-"));
+  const script = (name, body) => {
+    const p = path.join(dir, name);
+    fs.writeFileSync(p, body, { mode: 0o755 });
+    return p;
+  };
+  // never answers, even to initialize. On Windows cmd.exe does that: it sits reading its stdin
+  const silent = unix ? script("silent", "#!/bin/sh\nexec sleep 300\n") : "cmd.exe";
+  const saved = process.env.AGENT_REVIEW_BRIDGE_CODEX_BIN;
+  try {
+    process.env.AGENT_REVIEW_BRIDGE_CODEX_BIN = silent;
+    let t = Date.now();
+    await assert.rejects(searchChatgpt({ name: "x", deadline: Date.now() + 800 }), /didn't answer/, "startup hangs");
+    assert.ok(Date.now() - t < 5_000, `within the limit (${Date.now() - t} ms)`);
+    await assert.rejects(rc.findChats({ name: "x" }, "chatgpt", searchChatgpt, { deadline: Date.now() + 800 }).then((f) => { throw new Error(f.errors.chatgpt); }), /didn't answer/, "and the search says so");
+    // answers initialize, then nothing. Needs a script as the binary, which Windows won't run directly
+    if (unix) {
+      process.env.AGENT_REVIEW_BRIDGE_CODEX_BIN = script("half", '#!/usr/bin/env node\nprocess.stdin.on("data",(d)=>{for(const l of String(d).split("\\n")){if(!l)continue;const m=JSON.parse(l);if(m.method==="initialize")process.stdout.write(JSON.stringify({id:m.id,result:{}})+"\\n");}});\n');
+      t = Date.now();
+      await assert.rejects(withChatgpt((s) => s.rpc("thread/list", {}), { deadlineMs: 800 }), /within 0\.8 s|didn't answer/, "the work hangs");
+      assert.ok(Date.now() - t < 5_000, `within the limit (${Date.now() - t} ms)`);
+    }
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_REVIEW_BRIDGE_CODEX_BIN;
+    else process.env.AGENT_REVIEW_BRIDGE_CODEX_BIN = saved;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  console.log(`chats 17c a ChatGPT that never answers is reported within the limit: at startup${unix ? " and during the work" : " (during the work: not on Windows, which won't run a script as the binary)"}`);
+}
+
 // 18 an id nobody has, on each side; a search's time limit on the ChatGPT side
 {
   const noThread = (message, code = -32600) => ({ rpc: async () => { throw Object.assign(new Error(message), { code }); } });
