@@ -18,7 +18,7 @@ const sameTo = (a, b) => !!a && a.app === b.app && a.id === b.id;
 // It runs the version before this one, as after a real update.
 const brokerUrl = new URL("../src/broker.mjs", import.meta.url).href;
 const stale = spawn(process.execPath, ["--input-type=module", "-e", `const b=await import(${JSON.stringify(brokerUrl)});await b.call("status");console.log("owner");setInterval(()=>{},1000);`], {
-  env: { ...process.env, AGENT_REVIEW_BRIDGE_TEST_PROTOCOL: "15" },
+  env: { ...process.env, AGENT_REVIEW_BRIDGE_TEST_PROTOCOL: "16" },
 });
 await new Promise((r) => stale.stdout.once("data", r));
 const { call, inlineText, nextStep } = await import("../src/broker.mjs");
@@ -689,10 +689,17 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   const P = { app: "claude", id: "claude-mid-turn" };
   const l = await call("link_create", { primary: P, advisor: { app: "openai", id: "gpt-mid-turn" } });
   const link = () => state().links[l.id];
+  // wait for this hook's own request to be applied, not for the outbox to
+  // shrink (files left from an earlier step would end the wait too early)
+  const outbox = () => new Set(fs.readdirSync(path.join(dir, "outbox")));
   const prompt = async (prompt_id, text) => {
-    const n = fs.readdirSync(path.join(dir, "outbox")).length;
+    const before = outbox();
     await runHook("claude", "prompt", { session_id: P.id, prompt: text, ...(prompt_id && { prompt_id }) });
-    await until(() => fs.readdirSync(path.join(dir, "outbox")).length <= n); // processed
+    const mine = [...outbox()].filter((f) => !before.has(f));
+    await until(() => {
+      const now = outbox();
+      return mine.every((f) => !now.has(f));
+    });
   };
   const base = () => JSON.parse(fs.readFileSync(turnFile(P), "utf8"));
   const review = async (prompt_id, answer) => {
@@ -907,6 +914,26 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   await call("advise", { endpoint: C, requestId: idOf(b.id), decision: "approved" });
   assert.equal((await runHook("claude", "start", { session_id: C.id, source: "resume" })).out, "", "nothing waiting, auto mode off: nothing");
   console.log("34 a Claude reviewer's session start lists the reviews waiting for it with its role, plus auto mode's rules when on");
+}
+
+// bridge_read_chat's gate: a chat the bridge created to review or advise stays
+// refused after its link closes; one that joined only while its link is open
+{
+  const made = { app: "openai", id: "gpt-made-reviewer" };
+  const joined = { app: "openai", id: "gpt-joined-reviewer" };
+  const P = { app: "claude", id: "claude-gate" };
+  assert.ok((await call("read_chat_allowed", { endpoint: P })).allowed, "an ordinary chat may read");
+  await call("reviewer_chat", { endpoint: made });
+  const a = await call("link_create", { primary: P, mode: "review", advisor: made, request: "x" });
+  const b = await call("link_create", { primary: P, mode: "review", advisor: joined, request: "x" });
+  assert.ok(!(await call("read_chat_allowed", { endpoint: made })).allowed);
+  assert.ok(!(await call("read_chat_allowed", { endpoint: joined })).allowed, "an open link's reviewer may not");
+  await call("link_close", { linkId: a.id });
+  await call("link_close", { linkId: b.id });
+  assert.ok(!(await call("read_chat_allowed", { endpoint: made })).allowed, "closing the link grants nothing to a chat the bridge made");
+  assert.ok((await call("read_chat_allowed", { endpoint: joined })).allowed, "the user's own chat is theirs again");
+  assert.ok((await call("read_chat_allowed", { endpoint: P })).allowed, "the requester was never a reviewer");
+  console.log("36 read_chat gate: bridge-made reviewers stay refused; a joined chat only while its link is open");
 }
 
 // 35. paths that would stay unreviewed for good: a plan review's paths aren't

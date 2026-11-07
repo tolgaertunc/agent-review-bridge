@@ -21,6 +21,8 @@ import { AUTO_RULES, AUTO_REVIEWER } from "./auto.mjs";
 import { rulesBlock } from "./rules.mjs";
 import { readConfig, writeConfig } from "./config.mjs";
 import { chatgptRunning, openChatgpt, openUrl, dataDir } from "./platform.mjs";
+import * as rc from "./readchat.mjs";
+import { lookupClaude, readClaudePage, findClaude } from "./chats.mjs";
 
 const sideArg = process.argv.indexOf("--side");
 const SIDE = sideArg > -1 ? process.argv[sideArg + 1] : process.env.AGENT_REVIEW_BRIDGE_SIDE;
@@ -141,11 +143,14 @@ async function newThread({ model, effort, name, seed }) {
     const threadId = `gpt-new-${made.length + 1}`;
     made.push({ threadId, model: model ?? null, effort: effort ?? null, name: threadName(name) });
     fs.writeFileSync(file, JSON.stringify(made));
+    await call("reviewer_chat", { endpoint: { app: "openai", id: threadId } });
     return { threadId, model };
   }
   const { createThread, ModelChoiceError } = await import("./codex.mjs");
   try {
-    return await createThread({ model, effort, name: threadName(name), seed, sandbox: "read-only" });
+    const t = await createThread({ model, effort, name: threadName(name), seed, sandbox: "read-only" });
+    await call("reviewer_chat", { endpoint: { app: "openai", id: t.threadId } });
+    return t;
   } catch (e) {
     if (e instanceof ModelChoiceError) return { refused: e.message };
     throw e;
@@ -655,6 +660,123 @@ server.registerTool(
     if (r.dup) return text("Same nits as before; not sent again.", r);
     // the user can't see tool calls, so the answer goes into the chat too
     return withRules(`${how[r.delivered]} The user can't see tool calls: write this as your reply, unchanged:\n\n${r.text}`, r, { first: true });
+  },
+);
+
+// ------------------------------------------------------------ reading chats
+// Find and read one of the user's chats on this computer, in either app, by
+// name or id. No link, no message, no wake; see src/readchat.mjs.
+
+// Which app's chats this server reads: always the other one. It comes from
+// --side, and nothing an agent passes can change it.
+const READ_TARGET = SIDE === "claude" ? "chatgpt" : "claude";
+const READ_TARGET_NAME = rc.APP_NAME[READ_TARGET];
+
+const READ_CHAT =
+  `Read one of the user's chats in the other app, ${READ_TARGET_NAME}, stored on this computer (${READ_TARGET === "chatgpt" ? "its Codex chats, archived ones too" : "its sessions"}). ` +
+  "Find it by its name (or part of it) or id. " +
+  "If the user names a chat without saying which app it's in, ask them which. This tool reads only the other app: for a chat in your own app, use your own tools if you have them, otherwise say this bridge doesn't cover it. " +
+  `Use this, not a web browser, for ${READ_TARGET_NAME}'s chats. ` +
+  "Chats that exist only on a website (ordinary chatgpt.com or claude.ai chats) aren't stored here: say so, and use another way only if the user asks for one. " +
+  "Only for a chat the user asked for; don't browse their chats on your own. " +
+  "Read-only: it creates no link, sends nothing, wakes no one, and works with the other app closed. " +
+  "Several matches, or a search that couldn't reach every chat: you get a list; ask the user which one, don't guess. Long chats and long lists come in pages: pass the returned cursor.";
+
+// ChatGPT is faked in the tests; they never read the real app's chats
+const chatgptOff = () => (process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX ? "ChatGPT is stood in for in tests" : null);
+
+async function readOne({ id, includeTools, limit, resume }) {
+  const opts = { resume, limit, includeTools };
+  let r;
+  if (READ_TARGET === "claude") {
+    try {
+      const { session, partial } = await lookupClaude(id);
+      if (!session) return text(partial ? `[AGENT-REVIEW-BRIDGE] No Claude Code session with id ${id} was found, but some of its sessions couldn't be read, so it may still exist.` : `[AGENT-REVIEW-BRIDGE] No Claude Code session with id ${id} on this computer.`);
+      r = await readClaudePage(session, opts);
+    } catch (e) {
+      return text(`[AGENT-REVIEW-BRIDGE] That Claude Code session couldn't be read right now (${e.message}).`);
+    }
+  } else {
+    const cant = (why) => text(`[AGENT-REVIEW-BRIDGE] ChatGPT Desktop's chats couldn't be read right now (${why}).`);
+    if (chatgptOff()) return cant(chatgptOff());
+    const { withChatgpt, readChatgptPage } = await import("./codex.mjs");
+    try {
+      r = await withChatgpt((s) => readChatgptPage(s, id, opts));
+    } catch (e) {
+      return cant(e.message);
+    }
+  }
+  if (r.missing) return text(`[AGENT-REVIEW-BRIDGE] No ChatGPT Desktop chat with id ${id} on this computer.`);
+  if (r.status === "scanning") return text(rc.STILL_READING(r.scanned, r.total));
+  if (r.status === "tooLarge") return text(rc.TOO_LARGE);
+  if (r.moved) return text(rc.MOVED);
+  // a page that read nothing new keeps the cursor it came with
+  const cursor = rc.encodeCursor({ k: "read", to: READ_TARGET, id, t: includeTools ? 1 : 0, r: r.page.pos ?? resume });
+  return text(rc.pageText(r.meta, r.page, { cursor, first: resume === undefined }));
+}
+
+const chatSource = () =>
+  READ_TARGET === "claude"
+    ? findClaude
+    : (chatgptOff() ??
+      (async (a) => {
+        const { searchChatgpt } = await import("./codex.mjs");
+        return searchChatgpt(a);
+      }));
+
+server.registerTool(
+  "bridge_read_chat",
+  {
+    title: "Read one of the user's chats",
+    description: READ_CHAT,
+    inputSchema: {
+      name: z.string().optional().describe("All or part of the chat's title"),
+      id: z.string().optional().describe(`A ${READ_TARGET === "chatgpt" ? "ChatGPT thread" : "Claude session"} id, to read that chat directly`),
+      folder: z.string().optional().describe("Only chats working in this folder or below it; relative to this chat's folder"),
+      ...(READ_TARGET === "chatgpt" && { archived: z.boolean().optional().describe("Also look in ChatGPT's archived chats") }),
+      cursor: z.string().optional().describe("The cursor a previous call returned: to read further back in the same chat, or to list more of the same matches"),
+      limit: z.number().int().min(1).max(rc.MAX_LIMIT).optional().describe(`Messages per page of a chat (default ${rc.PAGE_LIMIT})`),
+      include_tools: z.boolean().optional().describe("Also show the chat's tool steps and the text between them"),
+    },
+    annotations: READ_ONLY,
+  },
+  async (a, extra) => {
+    // before anything is searched: chats that review or advise for another
+    // chat don't read the user's other chats, unless the user's own setting
+    // says so. Nothing an agent passes can change this.
+    const me = await self(extra);
+    if (!me) return text("[AGENT-REVIEW-BRIDGE] Can't tell which chat this is, so it can't read other chats.");
+    if (readConfig().readChatsInReviewers !== "allow" && !(await call("read_chat_allowed", { endpoint: me })).allowed) return text(rc.READER_BLOCKED);
+    const limit = a.limit ?? rc.PAGE_LIMIT;
+    let crit = null;
+    let after = null;
+    if (a.cursor) {
+      const c = rc.decodeCursor(a.cursor, READ_TARGET);
+      if (!c) return text("[AGENT-REVIEW-BRIDGE] That cursor isn't one this tool returned. Leave it out to start again.");
+      const other = a.name !== undefined || a.folder !== undefined || a.archived !== undefined;
+      const conflict = c.k === "read" ? other || (a.id && a.id !== c.id) || (a.include_tools !== undefined && !!a.include_tools !== !!c.t) : other || a.id !== undefined;
+      if (conflict) return text("[AGENT-REVIEW-BRIDGE] A cursor goes on with the same chat or the same search; other arguments can't change that. Leave it out to start again.");
+      if (c.k === "read") return readOne({ id: c.id, includeTools: !!c.t, limit, resume: c.r });
+      crit = c.crit;
+      after = c.after;
+    }
+    if (!crit && a.id) return readOne({ id: a.id, includeTools: !!a.include_tools, limit });
+    if (!crit) {
+      if (!a.name) return text("[AGENT-REVIEW-BRIDGE] Say which chat: its name or its id.");
+      let folder = a.folder;
+      if (folder && !path.isAbsolute(folder)) {
+        const base = projectDir(extra);
+        if (!base) return text("[AGENT-REVIEW-BRIDGE] This chat's folder isn't known here: give the folder as a full path.");
+        folder = path.resolve(base, folder);
+      }
+      crit = { name: a.name, folder: folder ?? null, archived: !!a.archived };
+    }
+    const found = await rc.findChats(crit, READ_TARGET, chatSource(), { after });
+    if (!found.candidates.length) return text(rc.noneText(found, crit));
+    // a search that couldn't reach everything could have missed another match
+    const only = rc.pickOne(found);
+    if (only) return readOne({ id: only.id, includeTools: !!a.include_tools, limit });
+    return text(rc.listText(found, found.more ? rc.encodeCursor({ k: "list", to: READ_TARGET, crit, after: found.next }) : null));
   },
 );
 

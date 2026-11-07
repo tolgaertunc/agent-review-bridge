@@ -79,6 +79,7 @@ You talk to your agent as usual and ask it to use the bridge; it calls the bridg
 - *"Link a ChatGPT advisor to this chat."* From now on every turn is reviewed.
 - *"Use the same ChatGPT chat as last time."* The review continues in that chat, with its earlier context.
 - *"Stop the reviews."* The link is closed.
+- *"Read my ChatGPT chat 'Release checklist'."* The agent finds the chat on this computer by its name, however old it is, and reads it. No link and no review are needed, and ChatGPT Desktop can be closed. Each app reads the other's chats; for its own it uses its own tools, if it has them. If you don't say which app a chat is in, the agent asks.
 
 You can pick the model and reasoning effort of a new ChatGPT chat ("…with gpt-6.1-sol, high effort"). The bridge checks the name against the models your ChatGPT Desktop offers; an unknown one is refused with the list, and nothing is created.
 
@@ -160,6 +161,7 @@ Messages the bridge sends on its own, like an advisor's review of each turn, don
 - **Left out of diffs, summaries and the reviewer's commands:** files whose names suggest secrets, neither their content nor their names: `.env*`, keys and certificates, `*secret*`, `*credential*`, `.netrc`, `.npmrc`, and the folders `secrets/`, `.ssh/`, `.aws/` and any folder named like `*secret*` or `*credential*`. The reviewer is also told not to open them, and auto mode's check leaves them out too, in folders outside git as well. This goes by path only: secrets inside other files, in your messages or in the agents' answers are not removed.
 - **The other agent can't give orders.** Its messages are marked as agent messages, not user instructions, and can't authorize anything. Your rules come only from your own file, through local channels.
 - **Reviewer chats the bridge creates in ChatGPT run read-only.** A chat that joins with a code keeps its own permissions; it is only told not to act on the project.
+- **Reading a chat sends it to the reader's vendor.** When a Claude chat reads a ChatGPT chat, that chat's text goes to Anthropic, and the other way round. Agents are told to read only a chat you asked for; that is an instruction, which the bridge can't check. Chats that review or advise for another chat are refused outright: ones the bridge created for good (those created before this version only while their link is open), ones that joined with a code while their link is open. To allow them, set `"readChatsInReviewers": "allow"` in `config.json`. What is read is marked as data, not instructions, and agents are told not to pass it on to another chat unless you ask. Chat content isn't scanned for secrets; tool output is left out unless asked for.
 - **Local only.** The broker listens on `127.0.0.1` and requires a token. State lives in your user folder; old messages are pruned after a day (read) or a week.
 
 ## Troubleshooting
@@ -185,6 +187,8 @@ Other settings, read by the bridge's processes: `AGENT_REVIEW_BRIDGE_CLAUDE_BIN`
 - On macOS, ChatGPT as the primary with a Claude advisor hasn't been verified yet.
 - One-off reviews and auto mode: the reviewer reads the changes itself, so how carefully it reads is up to the model. In auto mode the bridge also makes sure an approval covers only what was there when the review was asked for.
 - Auto mode runs from Claude Code, with a ChatGPT reviewer. The end-of-turn check compares file contents with what the reviewer approved; it doesn't run git's filters, so a repository with line-ending conversion may ask for one review too many after a commit.
+- Reading chats covers only the other app's chats stored on this computer: from Claude, ChatGPT Desktop's Codex chats (through its app-server); from ChatGPT, Claude Code sessions (their transcript files). A chat in the agent's own app isn't read through the bridge. Ordinary chatgpt.com and claude.ai chats, and cloud sessions, aren't stored here. Both formats are the apps' own and undocumented. Reading with ChatGPT Desktop closed is verified on Windows only. Chats are found by name or id; the text inside them isn't searched. A search covers every chat, but stops and says so at about 30 seconds on Claude's sessions, and up to about 60 on ChatGPT's, where starting the app-server and the search each get the time left. A session that couldn't be checked in time is counted as not searched; a later search normally goes on from where its title scan stopped. A long list comes in pages, and a chat updated meanwhile moves to the top of it.
+- Reading a Claude session shows the conversation as it stands now: what was rewound is left out and counted. The first read of a session scans its file once (streamed, not held in memory); a very large one can take more than one call. A session whose index would need over 128 MiB is refused and says so, which is somewhat over 1 GB of transcript. If a session's history has a broken link, older messages are shown in file order with a warning, since rewound branches can't be told apart there. If its branch changes between pages (a rewind, or a record written again), the read stops and says so; new messages don't disturb it. This isn't a check of the content: transcripts are taken to be append-only, and an older message rewritten in place, at the same length, wouldn't be noticed. These rules come from fixtures and the Agent SDK's reader: no real rewound session has been read yet. Messages are cut at 25,000 characters and a message's tool steps at 2,000, with no way to read the rest (the agent is told to say so); a single record over 8 MB is left out and counted, and a message spread over more than 64 MB shows what was read and says so.
 - CLIs: the Claude Code CLI should work, since it reads the same MCP server and hooks, but it hasn't been tested. The bridge can only reopen closed sessions that run in Claude Desktop; a CLI session has to be resumed by hand. The Codex CLI isn't supported: messages for the ChatGPT side wake ChatGPT Desktop, not a terminal session.
 
 ---
@@ -204,6 +208,7 @@ The bridge's MCP tools, for agents. You normally don't call them yourself.
 | `bridge_send` | Send a free-form message to the chat on the other end of this chat's latest link. With `reply_to` (a message id) the answer goes to that message's sender, on its own link. |
 | `bridge_status` | This chat's open links and up to 5 closed in the last hour (older ones are only counted), their health, whether Claude sessions are listening, ChatGPT's usage limits, and the last observed failure of linked chats. |
 | `bridge_unlink` | Close this chat's links. |
+| `bridge_read_chat` | Find and read one of the user's chats in the other app, on this computer: by `name` (or part of it) or `id`, with `folder` (and `archived`, for ChatGPT's) to narrow it. A single exact match from a complete search is read at once; anything else gives a list to ask the user about, 15 at a time. A chat's pages go from the newest back; `cursor` gives the next page of either; each message comes once, though long ones are cut. A cursor that no longer fits the chat stops the read. `include_tools` also shows tool steps, each marked as done or only attempted. Read-only: no link, no message, no wake. Refused in chats that review or advise for another chat. |
 
 `bridge_review`, `bridge_link` and `bridge_send` also take `open` and `remember`, used only after the user agreed to open a closed app.
 
@@ -248,6 +253,8 @@ npm test
 |---|---|
 | `scripts/test-git.mjs` | Turn diffs (secret exclusion, repos without commits, untracked edits, size cap), review summaries and commands, and auto mode's fingerprint (edits, deletes, links, unreadable files, folders outside git). |
 | `scripts/test-codex.mjs` | Model choice for new ChatGPT threads: ids, picker names, unknown models and efforts refused. |
+| `scripts/test-chats.mjs` | Reading chats: titles anywhere in a session, finding every chat by name, lists and their memory, paging, huge records, what is left out, attempts vs results, errors that aren't "nothing found". |
+| `scripts/test-chat-graph.mjs` | What a Claude session shows, against an oracle sharing no code with it: seeded random transcripts (rewinds, parallel calls, compactions, repeats, broken links) over many ways of cutting the pages, plus named cases, changes between pages, the tokenizer and the resource limits. |
 | `scripts/test-platform.mjs` | Finding the apps' bundled CLIs. |
 | `scripts/smoke.mjs` | End to end over MCP: two real server processes, the hooks, a throwaway git repo. |
 | `scripts/test-link.mjs` | Links, reviews and rounds, the fix loop, hooks, rules, auto mode's approvals and end-of-turn check, pruning, broker handover. |
@@ -262,6 +269,7 @@ Repository layout:
 - `src/hook.mjs`: the hooks for both apps.
 - `src/auto.mjs`: auto mode's instructions and end-of-turn message.
 - `src/git.mjs`: turn diffs, review summaries and fingerprints. `src/codex.mjs`: ChatGPT thread driver. `src/caller.mjs`: caller identity.
+- `src/readchat.mjs`, `src/chats.mjs`: reading chats (shared paging and texts; Claude Code sessions). ChatGPT threads are read in `src/codex.mjs`.
 - `src/rules.mjs`, `src/config.mjs`: your rules and settings. `src/platform.mjs`: OS paths and app launching.
 - `scripts/`: installer, `doctor`, tests, and debugging helpers (`send.mjs`, `codex-thread.mjs`).
 
