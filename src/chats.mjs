@@ -486,7 +486,7 @@ export async function* claudeStream(view, fh, { from = 0, top = Infinity, includ
     } else yield { unit: { kind: u.kind, uncertain: u.uncertain }, pos: { i, c: cut } };
     await pause();
   }
-  yield* left(0, cut, view.units.length - 1, view.broke);
+  yield* left(0, cut, view.units.length - 1, view.units.at(-1)?.uncertain ?? false);
 }
 
 // Is that position still the same record, whole? A shifted or rewritten file fails

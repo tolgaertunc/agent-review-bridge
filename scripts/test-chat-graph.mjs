@@ -497,6 +497,16 @@ const texts = (blocks) => blocks.map((b) => b.split("\n")[1]);
   r = await read([U("m", null, "n", { isMeta: true }), { uuid: "s", parentUuid: "m", isSidechain: true, type: "user", message: { content: "x" } }]);
   assert.deepEqual(r.blocks, []);
   assert.deepEqual(r.left, { "the app's own notices": 1, "subagent records": 1 });
+  assert.ok(!r.uncertain, "nothing shown, nothing to warn about");
+  // a session of nothing but a subagent's records has no conversation to be broken
+  r = await read([{ uuid: "s1", parentUuid: null, isSidechain: true, type: "user", message: { content: "x" } }, { uuid: "s2", parentUuid: "s1", isSidechain: true, type: "assistant", message: { id: "m", content: [{ type: "text", text: "y" }] } }]);
+  assert.deepEqual(r.blocks, []);
+  assert.deepEqual(r.left, { "subagent records": 2 });
+  assert.ok(!r.uncertain, "and no warning, as on real data: 12 such sessions were told their history was broken");
+  // a break at the very first record, with something left out below nothing
+  r = await read([{ uuid: "s0", parentUuid: null, isSidechain: true, type: "user", message: { content: "x" } }, U("u", "gone", "only one")]);
+  assert.deepEqual(texts(r.blocks), ["only one"]);
+  assert.ok(!r.uncertain, "nothing older was shown, so nothing is in doubt");
   // an already non-monotonic file, a page at a time: the cut never rises
   {
     const w = write([U("v", "a", "after"), U("u", null, "before"), A("a", "u", "ma", "middle"), U("o1", "a", "other"), U("x", "v", "last")]);
