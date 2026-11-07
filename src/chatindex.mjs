@@ -6,7 +6,7 @@
 // file once into a small index (never the file's text), computes the current
 // branch from it, and pages by position in that result. The scan is streamed,
 // can stop at any chunk and go on from that byte, yields to the event loop, and
-// only reads what grew since last time. See plans for why: telling a late copy
+// only reads what grew since last time. A whole scan because telling a late copy
 // from a leaf takes knowing every record's children, which no read of a part of
 // the file can.
 //
@@ -792,7 +792,14 @@ export async function openIndex(file, { scanMs = SCAN_MS, maxChunks = Infinity, 
 }
 
 async function step(file, entry, { scanMs, maxChunks, maxBytes, maxMemoBytes }) {
-  const fh = await fs.promises.open(file, "r");
+  let fh;
+  try {
+    fh = await fs.promises.open(file, "r");
+  } catch (e) {
+    // nothing to remember of a file that can't be opened
+    if (memo.get(file) === entry) memo.delete(file);
+    throw e;
+  }
   let idx = entry;
   try {
     const st = await fh.stat();

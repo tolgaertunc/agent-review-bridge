@@ -773,6 +773,10 @@ const texts = (blocks) => blocks.map((b) => b.split("\n")[1]);
   await openIndex(bulk[0].file);
   await openIndex(bulk[1].file);
   assert.equal((await openIndex(again.file)).status, "ready");
+  // a file that can't be opened leaves nothing behind
+  clearIndexMemo();
+  for (let i = 0; i < 6; i++) await assert.rejects(openIndex(path.join(dir, `nothing-${i}.jsonl`)), { code: "ENOENT" });
+  assert.equal(memoStats().sessions, 0);
   // the same file only
   clearIndexMemo();
   const sw = write([U("a", null, "AAAA"), A("b", "a", "m", "x".repeat(10_000)), U("c", "b", "tail")]);
