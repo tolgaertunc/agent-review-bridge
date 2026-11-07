@@ -257,14 +257,13 @@ export async function claudeMeta(s) {
 // title or folder couldn't be settled within the limits is reported, whether
 // or not what is known of it matches, and so is one the deadline didn't reach:
 // then the search isn't complete.
-export async function findClaude({ name, folder, self, add, deadline = Infinity }) {
+export async function findClaude({ name, folder, add, deadline = Infinity }) {
   const { sessions, problems } = await scanSessions();
   const want = name ? normalizeName(name) : null;
   let looked = 0;
   for (const s of sessions) {
     if (Date.now() > deadline) break;
     looked++;
-    if (s.id === self) continue;
     try {
       const { titleKnown, folderKnown, ...chat } = await claudeMeta(s);
       if (want && !titleKnown) problems.push(`${s.file} (title not found within the limit)`);

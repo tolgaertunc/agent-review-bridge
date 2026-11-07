@@ -1,9 +1,9 @@
-// bridge_read_chat: find one of the user's chats stored on this computer (a
-// ChatGPT Desktop thread or a Claude Code session) by name or id, and read it,
-// page by page. Read-only: no link, no message, no wake. The two apps are
-// sources with the same shape (src/chats.mjs for Claude, src/codex.mjs for
-// ChatGPT); this module holds what they share: matching, the paging, the caps
-// and the bridge's fixed words around what is read.
+// bridge_read_chat: from one app, find one of the user's chats in the other (a
+// ChatGPT Desktop thread from Claude, a Claude Code session from ChatGPT) by
+// name or id, and read it, page by page. Read-only: no link, no message, no
+// wake. The two apps are sources with the same shape (src/chats.mjs for Claude,
+// src/codex.mjs for ChatGPT); this module holds what they share: matching, the
+// paging, the caps and the bridge's fixed words around what is read.
 //
 // A chat is read as units, newest first. A unit is one message or one tool
 // step: { kind, at, text, tools, moreTools }. kind is "user", "final" (the
@@ -58,21 +58,23 @@ export const chatEntry = (c) => ({ ...c, name: capped(c.name, MAX_NAME), folder:
 // Opaque to the agent, and checked. A read cursor continues reading one chat
 // with one set of options. A list cursor names the same search and the last
 // entry listed; each call scans every chat again, so nothing can be skipped
-// by a position in a list that moved.
+// by a position in a list that moved. `to` says which app's chats a cursor is
+// for: only checked against the server's own target, it never selects one.
 export const encodeCursor = (c) => Buffer.from(JSON.stringify(c)).toString("base64url");
 
-const validPos = (app, r) =>
-  app === "claude"
+const validPos = (target, r) =>
+  target === "claude"
     ? Number.isInteger(r?.o) && r.o >= 0 && Number.isInteger(r.n) && r.n >= 0 && typeof r.h === "string" && r.h !== "" && typeof r.l === "boolean" && (!r.s || Number.isInteger(r.e))
     : (r?.pc === null || typeof r?.pc === "string") && typeof r?.b === "string";
 
-const validKey = (a) => typeof a?.exact === "boolean" && typeof a.updated === "number" && typeof a.app === "string" && typeof a.id === "string";
+const validKey = (a) => typeof a?.exact === "boolean" && typeof a.updated === "number" && typeof a.id === "string";
 
-export function decodeCursor(s) {
+export function decodeCursor(s, target) {
   try {
     const c = JSON.parse(Buffer.from(String(s), "base64url").toString("utf8"));
-    if (c?.k === "read" && (c.app === "claude" || c.app === "chatgpt") && typeof c.id === "string" && (c.t === 0 || c.t === 1) && validPos(c.app, c.r)) return c;
-    if (c?.k === "list" && typeof c.crit?.name === "string" && validKey(c.after)) return c;
+    if (c?.to !== target) return null;
+    if (c.k === "read" && typeof c.id === "string" && (c.t === 0 || c.t === 1) && validPos(target, c.r)) return c;
+    if (c.k === "list" && typeof c.crit?.name === "string" && validKey(c.after)) return c;
   } catch {
     // not one of ours
   }
@@ -158,7 +160,7 @@ export async function assemble(stream, { limit = PAGE_LIMIT, includeTools = fals
 
 // ------------------------------------------------------------- fixed words
 
-const APP_NAME = { chatgpt: "ChatGPT Desktop", claude: "Claude Code" };
+export const APP_NAME = { chatgpt: "ChatGPT Desktop", claude: "Claude Code" };
 
 const droppedText = (dropped) => {
   const parts = Object.entries(dropped).map(([what, n]) => `${n} ${what}`);
@@ -235,8 +237,7 @@ export const READER_BLOCKED =
 
 // The one order lists use: exact names first, then newest, then a tie-break,
 // so "what comes after this entry" always has one answer
-const order = (a, b) =>
-  Number(b.exact) - Number(a.exact) || (b.updated ?? 0) - (a.updated ?? 0) || (a.app < b.app ? -1 : a.app > b.app ? 1 : 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+const order = (a, b) => Number(b.exact) - Number(a.exact) || (b.updated ?? 0) - (a.updated ?? 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
 // What a search keeps while it scans: every match is counted, and only one
 // page of the entries after `after` stays in memory, however many match or
@@ -272,33 +273,28 @@ export function collector({ name, after = null }) {
         peak,
         more: before + candidates.length < total,
         // where a next call goes on from
-        next: last ? { exact: last.exact, updated: last.updated ?? 0, app: last.app, id: last.id } : null,
+        next: last ? { exact: last.exact, updated: last.updated ?? 0, id: last.id } : null,
       };
     },
   };
 }
 
-// Both apps (or the one asked for). sources: { claude, chatgpt }, each
-// (args) => { complete, scope, problems } (or a promise of it), calling
-// args.add for each match, or a string saying why that app can't be searched.
-// An app that fails is reported as such, never as "no match", and makes the
-// search incomplete.
-export async function findChats(crit, self, sources, { after = null, deadline = Date.now() + SEARCH_MS } = {}) {
+// One app's chats. source: (args) => { complete, scope, problems } (or a
+// promise of it), calling args.add for each match, or a string saying why that
+// app can't be searched. An app that fails is reported as such, never as "no
+// match", and makes the search incomplete.
+export async function findChats(crit, app, source, { after = null, deadline = Date.now() + SEARCH_MS } = {}) {
   const c = collector({ name: crit.name, after });
   const out = { complete: true, scope: {}, errors: {}, partial: {}, continued: !!after };
-  for (const app of ["claude", "chatgpt"]) {
-    if (crit.app && crit.app !== app) continue;
-    const src = sources[app];
-    try {
-      if (typeof src === "string") throw new Error(src);
-      const r = await src({ ...crit, self, deadline, add: c.add });
-      out.scope[app] = r.scope;
-      if (r.problems?.length) out.partial[app] = `${r.problems.length} couldn't be read: ${r.problems.slice(0, 3).join("; ")}${r.problems.length > 3 ? "; …" : ""}`;
-      if (!r.complete) out.complete = false;
-    } catch (e) {
-      out.errors[app] = e.message;
-      out.complete = false;
-    }
+  try {
+    if (typeof source === "string") throw new Error(source);
+    const r = await source({ ...crit, deadline, add: c.add });
+    out.scope[app] = r.scope;
+    if (r.problems?.length) out.partial[app] = `${r.problems.length} couldn't be read: ${r.problems.slice(0, 3).join("; ")}${r.problems.length > 3 ? "; …" : ""}`;
+    if (!r.complete) out.complete = false;
+  } catch (e) {
+    out.errors[app] = e.message;
+    out.complete = false;
   }
   return { ...out, ...c.result() };
 }

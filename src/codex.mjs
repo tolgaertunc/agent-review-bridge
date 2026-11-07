@@ -307,7 +307,7 @@ export async function chatgptMeta(s, id) {
 
 // By name and/or folder, over every thread (archived ones in a second pass),
 // newest first. Only the deadline stops it, and then it says so.
-export async function findChatgpt(s, { name, folder, self, archived, add, deadline = Infinity }) {
+export async function findChatgpt(s, { name, folder, archived, add, deadline = Infinity }) {
   const want = name ? normalizeName(name) : null;
   let seen = 0;
   try {
@@ -319,7 +319,7 @@ export async function findChatgpt(s, { name, folder, self, archived, add, deadli
         for (const t of r.data ?? []) {
           seen++;
           const c = asChat(t, arch);
-          if (c.id !== self && (!folder || inFolder(c.folder, folder)) && (!want || normalizeName(c.name).includes(want))) add(c);
+          if ((!folder || inFolder(c.folder, folder)) && (!want || normalizeName(c.name).includes(want))) add(c);
         }
         cursor = r.nextCursor ?? null;
       } while (cursor);
