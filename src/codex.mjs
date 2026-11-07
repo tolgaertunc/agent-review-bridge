@@ -280,6 +280,20 @@ export const withChatgpt = (fn, opts) => withServer(fn, { deadlineMs: 60_000, ..
 
 export class ChatMovedError extends Error {}
 
+// A search of ChatGPT's chats, in the time it has left: startup and the work get
+// that time each, so about twice that at worst. With none left, nothing starts.
+export async function searchChatgpt(args, { open = withChatgpt } = {}) {
+  const left = args.deadline - Date.now();
+  if (!(left > 0)) return { complete: false, scope: "none searched (time limit reached)" };
+  return open((s) => findChatgpt(s, args), { deadlineMs: left });
+}
+
+// What thread/read answers, as measured, for a well-formed id it doesn't have and
+// for a malformed one (it does read existing and archived threads that weren't
+// loaded). Anything else is the app not answering, never "no such chat".
+const NO_SUCH_THREAD = /^(?:thread not loaded: |invalid thread id: )/;
+class NoSuchThread extends Error {}
+
 const RAW_PAGE = 50;
 export const RAW_BUDGET = 20; // raw pages per read call
 
@@ -301,6 +315,7 @@ export async function chatgptMeta(s, id) {
   try {
     return asChat((await s.rpc("thread/read", { threadId: id })).thread);
   } catch (e) {
+    if (e.code === -32600 && NO_SUCH_THREAD.test(e.message ?? "")) throw new NoSuchThread();
     throw cantList(e);
   }
 }
@@ -424,13 +439,15 @@ export async function* chatgptStream(s, threadId, resume, { budget = RAW_BUDGET 
   }
 }
 
-// One page of a thread on a given session: { meta, page }, or { moved: true }
+// One page of a thread on a given session: { meta, page }, { moved: true }, or
+// { missing: true } if there's no such thread
 export async function readChatgptPage(s, id, { resume, limit, includeTools, budget }) {
   try {
     const meta = await chatgptMeta(s, id);
     return { meta, page: await assemble(chatgptStream(s, id, resume, { budget }), { limit, includeTools }) };
   } catch (e) {
     if (e instanceof ChatMovedError) return { moved: true };
+    if (e instanceof NoSuchThread) return { missing: true };
     throw e;
   }
 }

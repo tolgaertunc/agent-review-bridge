@@ -12,7 +12,7 @@ process.env.CLAUDE_CONFIG_DIR = root;
 const rc = await import("../src/readchat.mjs");
 const { claudeSession, claudeSessions, claudeMeta, claudeStream, findClaude, lookupClaude, readClaudePage, deepTitles, clearTitleMemo, MAX_RECORD } = await import("../src/chats.mjs");
 const { openIndex } = await import("../src/chatindex.mjs");
-const { findChatgpt, readChatgptPage, itemUnit, RAW_BUDGET } = await import("../src/codex.mjs");
+const { findChatgpt, readChatgptPage, searchChatgpt, itemUnit, RAW_BUDGET } = await import("../src/codex.mjs");
 
 // ------------------------------------------------------------ Claude fixtures
 let clock = Date.parse("2026-11-01T10:00:00Z");
@@ -800,6 +800,52 @@ const findG = async (s, crit) => {
   clean();
   clearTitleMemo();
   console.log("chats 17 the title scan stops anywhere and goes on, reads only what grew, and a memo is for the same file only");
+}
+
+// 18 an id nobody has, on each side; a search's time limit on the ChatGPT side
+{
+  const noThread = (message, code = -32600) => ({ rpc: async () => { throw Object.assign(new Error(message), { code }); } });
+  assert.deepEqual(await readChatgptPage(noThread("thread not loaded: 00000000-0000-7000-8000-000000000001"), "00000000-0000-7000-8000-000000000001", { limit: 1 }), { missing: true });
+  assert.deepEqual(await readChatgptPage(noThread("invalid thread id: invalid character"), "nope", { limit: 1 }), { missing: true });
+  for (const other of [noThread("something else broke"), noThread("thread not loaded: x", -32000), noThread("not thread not loaded: x")])
+    await assert.rejects(readChatgptPage(other, "x", { limit: 1 }), "anything else is the app not answering, not a missing chat");
+  assert.ok((await readChatgptPage(stand({ threads: [{ id: "A", name: "A", cwd: "/w", updatedAt: 1, items: [I.user("hi")] }] }), "A", { limit: 1 })).page);
+  // on the Claude side, not found proves nothing if something couldn't be read
+  clean();
+  session([R.title("There"), R.user("x")], { id: "there" });
+  assert.deepEqual(await lookupClaude("nobody"), { session: null, partial: false });
+  fs.mkdirSync(path.join(root, "projects", "proj", "broken.jsonl"));
+  assert.deepEqual(await lookupClaude("nobody"), { session: null, partial: true });
+  assert.equal((await lookupClaude("there")).session.id, "there");
+  clean();
+  fs.writeFileSync(path.join(root, "projects"), "not a folder");
+  await assert.rejects(lookupClaude("nobody"), /can't read the sessions folder/, "a failed scan isn't taken for absence");
+  fs.rmSync(path.join(root, "projects"), { force: true });
+  // the time limit: with none left nothing starts; with some, that's what it gets
+  let opened = 0;
+  const open = async () => {
+    opened++;
+    return { complete: true, scope: "x" };
+  };
+  const expired = await searchChatgpt({ name: "x", deadline: Date.now() - 1 }, { open });
+  assert.equal(opened, 0, "no process, no work");
+  assert.ok(!expired.complete);
+  assert.match(expired.scope, /time limit/);
+  let given;
+  await searchChatgpt({ name: "x", deadline: Date.now() + 10_000 }, { open: async (_fn, opts) => ((given = opts.deadlineMs), { complete: true, scope: "x" }) });
+  assert.ok(given > 9_000 && given <= 10_000, `it gets what's left (${given})`);
+  // and a list's cursor goes to the end on the ChatGPT side too
+  const threads = Array.from({ length: 40 }, (_, i) => ({ id: `t${i}`, name: `Chat ${i}`, cwd: "/a", updatedAt: 100 - i, items: [] }));
+  const seen = [];
+  let after = null;
+  for (let n = 0; n < 10; n++) {
+    const f = await rc.findChats({ name: "chat" }, "chatgpt", (a) => findChatgpt(stand({ threads }), a), { after });
+    seen.push(...f.candidates.map((c) => c.id));
+    if (!f.more) break;
+    after = f.next;
+  }
+  assert.equal(new Set(seen).size, 40);
+  console.log("chats 18 an unknown id is said to be unknown only if that's known; a search with no time left starts nothing; lists page to the end on each side");
 }
 
 fs.rmSync(root, { recursive: true, force: true });

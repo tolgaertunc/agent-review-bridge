@@ -500,7 +500,9 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   sess("c-notes-1", "Notes", repo, [["user", "one"]]);
   sess("c-notes-2", "Notes", repo, [["user", "two"]]);
   const reader = (args) => call(openai, "bridge_read_chat", args, asGpt("gpt-reader"));
-  const state = fs.readFileSync(path.join(dir, "state.json"));
+  // (a watch from an earlier step can finish at any moment: not this read's doing)
+  const stateNow = () => JSON.stringify(JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8")), (k, v) => (k === "watch" ? undefined : v));
+  const state = stateNow();
   const links = (await call(claude, "bridge_status")).content[0].text.match(/"id": "L\d+"/g)?.length;
   let t = textOf(await reader({ name: "release checklist" }));
   assert.match(t, /^\[AGENT-REVIEW-BRIDGE\] Chat "Release checklist" \(Claude Code, [^)]*sub[^)]*\): 2 messages, the newest/);
@@ -513,6 +515,11 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   t = textOf(await call(openai, "bridge_read_chat", { name: "release", folder: "sub" }, { ...asGpt("gpt-reader"), "x-codex-turn-metadata": { cwd: repo } }));
   assert.match(t, /Tests, tag, then release notes/, "a relative folder is the calling chat's");
   assert.match(textOf(await reader({ cursor: "not-ours" })), /isn't one this tool returned/);
+  // an id nobody has; and one that may exist behind something unreadable
+  assert.match(textOf(await reader({ id: "no-such-session" })), /No Claude Code session with id no-such-session on this computer\./);
+  fs.mkdirSync(path.join(projects, "broken.jsonl"));
+  assert.match(textOf(await reader({ id: "no-such-session" })), /was found, but some of its sessions couldn't be read, so it may still exist/);
+  fs.rmSync(path.join(projects, "broken.jsonl"), { recursive: true });
   // the Claude side goes to ChatGPT: never to its own app's sessions, whatever it's given
   for (const args of [{ name: "release checklist" }, { name: "release checklist", app: "claude" }]) {
     t = textOf(await call(claude, "bridge_read_chat", args));
@@ -570,7 +577,7 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   else fs.writeFileSync(cfg, had);
   // no way to tell who is asking on the shared ChatGPT server: no read
   assert.match(textOf(await call(openai, "bridge_read_chat", { id: "c-notes-1" })), /Can't tell which chat this is/);
-  assert.ok(fs.readFileSync(path.join(dir, "state.json")).equals(state), "reading changes no bridge state");
+  assert.equal(stateNow(), state, "reading changes no bridge state");
   assert.equal((await call(claude, "bridge_status")).content[0].text.match(/"id": "L\d+"/g)?.length, links, "and makes no link");
   console.log("5i bridge_read_chat over MCP: each side reads only the other app; a list when ambiguous, where it looked when nothing matches, the caller's folder, cursors checked, advisors refused; no state change");
 }

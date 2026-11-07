@@ -22,7 +22,7 @@ import { rulesBlock } from "./rules.mjs";
 import { readConfig, writeConfig } from "./config.mjs";
 import { chatgptRunning, openChatgpt, openUrl, dataDir } from "./platform.mjs";
 import * as rc from "./readchat.mjs";
-import { claudeSession, readClaudePage, findClaude } from "./chats.mjs";
+import { lookupClaude, readClaudePage, findClaude } from "./chats.mjs";
 
 const sideArg = process.argv.indexOf("--side");
 const SIDE = sideArg > -1 ? process.argv[sideArg + 1] : process.env.AGENT_REVIEW_BRIDGE_SIDE;
@@ -690,9 +690,9 @@ async function readOne({ id, includeTools, limit, resume }) {
   let r;
   if (READ_TARGET === "claude") {
     try {
-      const s = await claudeSession(id);
-      if (!s) return text(`[AGENT-REVIEW-BRIDGE] No Claude Code session with id ${id} on this computer.`);
-      r = await readClaudePage(s, opts);
+      const { session, partial } = await lookupClaude(id);
+      if (!session) return text(partial ? `[AGENT-REVIEW-BRIDGE] No Claude Code session with id ${id} was found, but some of its sessions couldn't be read, so it may still exist.` : `[AGENT-REVIEW-BRIDGE] No Claude Code session with id ${id} on this computer.`);
+      r = await readClaudePage(session, opts);
     } catch (e) {
       return text(`[AGENT-REVIEW-BRIDGE] That Claude Code session couldn't be read right now (${e.message}).`);
     }
@@ -706,6 +706,7 @@ async function readOne({ id, includeTools, limit, resume }) {
       return cant(e.message);
     }
   }
+  if (r.missing) return text(`[AGENT-REVIEW-BRIDGE] No ChatGPT Desktop chat with id ${id} on this computer.`);
   if (r.status === "scanning") return text(rc.STILL_READING(r.scanned, r.total));
   if (r.status === "tooLarge") return text(rc.TOO_LARGE);
   if (r.moved) return text(rc.MOVED);
@@ -719,8 +720,8 @@ const chatSource = () =>
     ? findClaude
     : (chatgptOff() ??
       (async (a) => {
-        const { withChatgpt, findChatgpt } = await import("./codex.mjs");
-        return withChatgpt((s) => findChatgpt(s, a));
+        const { searchChatgpt } = await import("./codex.mjs");
+        return searchChatgpt(a);
       }));
 
 server.registerTool(
