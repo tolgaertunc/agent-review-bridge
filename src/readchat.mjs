@@ -290,7 +290,7 @@ export async function findChats(crit, app, source, { after = null, deadline = Da
     if (typeof source === "string") throw new Error(source);
     const r = await source({ ...crit, deadline, add: c.add });
     out.scope[app] = r.scope;
-    if (r.problems?.length) out.partial[app] = `${r.problems.length} couldn't be read: ${r.problems.slice(0, 3).join("; ")}${r.problems.length > 3 ? "; …" : ""}`;
+    if (r.problems?.length) out.partial[app] = `${r.problems.length} couldn't be checked: ${[...new Set(r.problems)].join("; ")}`;
     if (!r.complete) out.complete = false;
   } catch (e) {
     out.errors[app] = e.message;

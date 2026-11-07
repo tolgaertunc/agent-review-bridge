@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-chats-"));
 process.env.CLAUDE_CONFIG_DIR = root;
 const rc = await import("../src/readchat.mjs");
-const { claudeSession, claudeSessions, claudeMeta, claudeStream, findClaude, readClaudePage, MAX_RECORD } = await import("../src/chats.mjs");
+const { claudeSession, claudeSessions, claudeMeta, claudeStream, findClaude, readClaudePage, deepTitles, clearTitleMemo, MAX_RECORD } = await import("../src/chats.mjs");
 const { findChatgpt, readChatgptPage, itemUnit, RAW_BUDGET } = await import("../src/codex.mjs");
 
 // ------------------------------------------------------------ Claude fixtures
@@ -23,6 +23,7 @@ const R = {
   use: (id, name, input) => ({ type: "tool_use", id, name, input }),
   result: (id, error = false) => ({ type: "user", timestamp: ts(), message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: error, content: "x" }] } }),
   title: (t) => ({ type: "custom-title", customTitle: t, sessionId: "x" }),
+  aiTitle: (t) => ({ type: "ai-title", aiTitle: t, sessionId: "x" }),
   queued: (prompt) => ({ type: "attachment", timestamp: ts(), attachment: { type: "queued_command", prompt, origin: { kind: "human" } } }),
 };
 const lines = (records) => records.map((r) => (typeof r === "string" ? r : JSON.stringify(r))).join("\n") + "\n";
@@ -237,31 +238,12 @@ async function readAll(pageFn) {
   assert.match((await page(firstHuge.id)).page.text, /then/, "as the very first record too");
   const lastHuge = session([R.user("kept"), R.user(huge)]);
   assert.match((await page(lastHuge.id)).page.text, /kept/, "and as the very last");
-  // title and folder further back than the limit: reported, not a non-match
+  // a folder further back than the limit: reported, not a non-match
   clean();
   session([R.title("Hidden name"), R.user("start", { cwd: "/deep" }), ...Array.from({ length: 6 }, () => ({ type: "x", pad: "p".repeat(1_000_000) }))], { id: "deep" });
-  const byName = await find({ name: "hidden" });
-  assert.equal(byName.found.length, 0);
-  assert.ok(!byName.complete);
-  assert.match(byName.problems.join(), /deep\.jsonl \(title not found within the limit\)/);
   const byFolder = await find({ folder: "/deep" });
   assert.ok(!byFolder.complete);
-  assert.match(byFolder.problems.join(), /deep\.jsonl \(folder not found within the limit\)/);
-  // a stand-in name that matches is still uncertain if the real title may lie
-  // further back; and a first message past the limit isn't "no such name"
-  clean();
-  session([R.title("The real title"), R.user("Needle in a stand-in"), ...Array.from({ length: 6 }, () => ({ type: "x", pad: "p".repeat(1_000_000) }))], { id: "standin" });
-  const standin = await rc.findChats({ name: "needle" }, "claude", claudeFind);
-  assert.equal(standin.total, 1);
-  assert.ok(!standin.complete);
-  assert.match(standin.partial.claude, /standin\.jsonl \(title not found within the limit\)/);
-  assert.equal(rc.pickOne(standin), null, "an uncertain search reads nothing on its own");
-  clean();
-  session([{ type: "x", pad: "p".repeat(1_500_000) }, R.user("The first words")], { id: "late-first" });
-  const lateFirst = await find({ name: "first words" });
-  assert.equal(lateFirst.found.length, 0);
-  assert.ok(!lateFirst.complete, "the first message lay past the limit: not settled");
-  assert.match(lateFirst.problems.join(), /late-first\.jsonl \(title not found within the limit\)/);
+  assert.deepEqual(byFolder.problems, ["folder not found within the limit"]);
   // two records alike for their first 64 KiB are still two records
   clean();
   const alike = (i) => ({ type: "user", message: { role: "user", content: "a".repeat(70_000) }, uuid: `uuid-${i}`, timestamp: `2026-11-01T10:00:0${i}Z`, cwd: "/w" });
@@ -656,7 +638,8 @@ const findG = async (s, crit) => {
   assert.ok(!f.complete && f.problems.length === 1);
   const found = await searchAll({ name: "only" });
   assert.equal(rc.pickOne(found), null, "the unreadable one might have matched too");
-  assert.match(rc.listText(found, null), /not every chat could be searched[\s\S]*Some of Claude Code's chats couldn't be searched \(1 couldn't be read: [^)]*broken\.jsonl \(not a file\)/);
+  assert.match(rc.listText(found, null), /not every chat could be searched[\s\S]*Some of Claude Code's chats couldn't be searched \(1 couldn't be checked: unreadable\)/);
+  assert.ok(!rc.listText(found, null).includes("broken.jsonl"), "no path of a chat nobody asked about");
   fs.rmSync(path.join(root, "projects", "proj", "broken.jsonl"), { recursive: true });
   // a title file that can't be read (a folder in its place) might hold the
   // name: reported, and the readable namesake isn't read on its own
@@ -665,7 +648,8 @@ const findG = async (s, crit) => {
   fs.mkdirSync(path.join(path.dirname(hidden.file), "same-hidden", "custom-title.json"), { recursive: true });
   const same = await searchAll({ name: "Same" });
   assert.deepEqual(same.candidates.map((c) => c.id), ["same-ok"]);
-  assert.match(same.partial.claude, /same-hidden[\\/]custom-title\.json \(EISDIR\)/);
+  assert.match(same.partial.claude, /1 couldn't be checked: unreadable/);
+  assert.ok(!same.partial.claude.includes("same-hidden"));
   assert.equal(rc.pickOne(same), null, "an unreadable title stops the automatic read");
   assert.equal((await claudeMeta(await sessionOf("same-ok"))).name, "Same", "a missing title file is still just missing");
   if (process.platform !== "win32" && process.getuid?.() !== 0) {
@@ -675,9 +659,7 @@ const findG = async (s, crit) => {
     fs.chmodSync(locked, 0);
     fs.chmodSync(shut.file, 0);
     try {
-      const p = (await find({ name: "only" })).problems.join();
-      assert.match(p, /locked \(EACCES\)/, "an unreadable folder is a problem");
-      assert.match(p, /shut\.jsonl \(EACCES\)/, "so is an unreadable session");
+      assert.deepEqual((await find({ name: "only" })).problems, ["unreadable", "unreadable"], "an unreadable folder is a problem, and so is an unreadable session");
     } finally {
       fs.chmodSync(locked, 0o755);
       fs.chmodSync(shut.file, 0o644);
@@ -686,10 +668,186 @@ const findG = async (s, crit) => {
   clean();
   fs.writeFileSync(path.join(root, "projects"), "not a folder");
   const broken = await searchAll({ name: "x" });
-  assert.match(broken.errors.claude, /can't read .*projects \(ENOTDIR\)/);
+  assert.match(broken.errors.claude, /can't read the sessions folder \(ENOTDIR\)/);
+  assert.ok(!broken.errors.claude.includes(root), "no path");
   assert.match(rc.noneText(broken, { name: "x" }), /Claude Code's chats couldn't be read right now/);
   fs.rmSync(path.join(root, "projects"), { force: true });
   console.log("chats 14 unreadable sessions, title files and stores are reported, never taken for no match; a missing store is empty");
+}
+
+// 15 titles: a custom title wins over an automatic one; both are names; two
+// chats of one name are never picked between, whatever each one's title is
+{
+  clean();
+  const ai = session([R.aiTitle("Refactor the parser"), R.user("hello")], { id: "ai-only" });
+  const m = await claudeMeta(await sessionOf(ai.id));
+  assert.equal(m.name, "Refactor the parser", "an automatic title is its name");
+  assert.ok(m.titleKnown);
+  assert.deepEqual((await find({ name: "refactor the" })).found.map((c) => c.id), ["ai-only"]);
+  const both = session([R.title("My own name"), R.user("hi"), R.aiTitle("Automatic name")], { id: "both" });
+  assert.equal((await claudeMeta(await sessionOf(both.id))).name, "My own name", "the user's title wins, even if older");
+  const newest = session([R.aiTitle("First guess"), R.user("hi"), R.aiTitle("Second guess")], { id: "newest" });
+  assert.equal((await claudeMeta(await sessionOf(newest.id))).name, "Second guess");
+  clean();
+  session([R.title("Release checklist"), R.user("a")], { id: "custom-one" });
+  session([R.aiTitle("Release checklist"), R.user("b")], { id: "ai-one" });
+  const twins = await rc.findChats({ name: "release checklist" }, "claude", claudeFind);
+  assert.equal(twins.exact, 2, "both count");
+  assert.equal(rc.pickOne(twins), null, "so the user is asked");
+  assert.match(rc.listText(twins, null), /2 chats match/);
+  clean();
+  console.log("chats 15 titles: automatic ones are names, a custom one wins, two of one name are a list");
+}
+
+// 16 a title further back than the file's end: found by searching the rest,
+// settled only by what was really read
+{
+  clearTitleMemo();
+  const pad = (n, mb = 1) => Array.from({ length: n }, (_, i) => ({ type: "x", i, pad: "p".repeat(mb * 1_000_000) }));
+  const large = session([R.title("Deep title"), R.user("start"), ...pad(6)], { id: "deep-t" });
+  assert.ok(fs.statSync(large.file).size > 4 * 1024 * 1024);
+  const found = await rc.findChats({ name: "deep title" }, "claude", claudeFind);
+  assert.equal(rc.pickOne(found)?.id, "deep-t", "the one match is read at once");
+  session([R.aiTitle("Deep automatic"), R.user("start"), ...pad(6)], { id: "deep-ai" });
+  assert.equal((await claudeMeta(await sessionOf("deep-ai"))).name, "Deep automatic");
+  session([R.title("Deep custom"), R.aiTitle("Automatic after it"), R.user("x"), ...pad(6)], { id: "deep-both" });
+  assert.equal((await claudeMeta(await sessionOf("deep-both"))).name, "Deep custom", "the custom one wins down there too");
+  session([R.title("Older deep"), R.user("x"), ...pad(5), R.aiTitle("Automatic in the tail")], { id: "tail-ai" });
+  assert.equal((await claudeMeta(await sessionOf("tail-ai"))).name, "Older deep", "an automatic title at the end doesn't stop the search for a custom one");
+  // how it's written doesn't matter
+  session(['{"type": "custom-title", "customTitle": "Spaced out", "sessionId": "x"}', R.user("x"), ...pad(6)], { id: "spaced" });
+  assert.equal((await claudeMeta(await sessionOf("spaced"))).name, "Spaced out");
+  // what isn't a title isn't one, and costs nothing
+  clean();
+  const noTitle = session([R.user('{"type":"custom-title","customTitle":"Quoted in a message"}'), { type: "x", nested: { type: "custom-title", customTitle: "Nested" } }, ...pad(6)], { id: "not-titles" });
+  let meta = await claudeMeta(await sessionOf(noTitle.id));
+  assert.match(meta.name, /^\(untitled\)/, "text in a message and nested objects aren't titles");
+  assert.ok(meta.titleKnown, "and the whole file having been read settles that it has none");
+  let search = await find({ name: "no such name" });
+  assert.ok(search.complete, "so a large untitled session leaves a search complete");
+  // the first message past what's read for it is only a missing label
+  clean();
+  const late = session([...pad(1, 2), R.user("The first words"), ...pad(5)], { id: "late-first" });
+  meta = await claudeMeta(await sessionOf(late.id));
+  assert.equal(meta.name, "(untitled)");
+  assert.ok(meta.titleKnown);
+  // what can't be checked stays unsettled
+  clean();
+  const broken = session([R.user("x"), '{"type":"custom-title","customTitle":"Cut of', ...pad(6)], { id: "broken-title" });
+  assert.ok(!(await claudeMeta(await sessionOf(broken.id))).titleKnown, "a candidate that doesn't parse");
+  clean();
+  const longLine = session([R.user("x"), { type: "x", pad: "q".repeat(100_000), nested: { type: "custom-title" } }, ...pad(6)], { id: "long-candidate" });
+  assert.ok(!(await claudeMeta(await sessionOf(longLine.id))).titleKnown, "a candidate in a line too long to look at");
+  search = await find({ name: "nothing" });
+  assert.ok(!search.complete);
+  assert.deepEqual(search.problems, ["title not settled"]);
+  assert.ok(!(await rc.findChats({ name: "nothing" }, "claude", claudeFind)).partial.claude.includes("long-candidate"), "reported by count, with no path");
+  // a custom title at the end settles it, whatever lies further back
+  clean();
+  session(['{"type":"custom-title","customTitle":"Cut of', ...pad(6), R.title("At the end")], { id: "settled-end" });
+  meta = await claudeMeta(await sessionOf("settled-end"));
+  assert.equal(meta.name, "At the end");
+  assert.ok(meta.titleKnown);
+  // the deadline: said, not taken for no title; a later search goes on
+  clean();
+  clearTitleMemo();
+  const timed = session([R.user("x"), ...pad(6), R.user("y")], { id: "timed" });
+  search = await find({ name: "nope", deadline: Date.now() + 60_000 });
+  assert.ok(search.complete);
+  clearTitleMemo();
+  meta = await claudeMeta(await sessionOf(timed.id), { deadline: Date.now() - 1 });
+  assert.ok(!meta.titleKnown, "stopped by the time limit: not settled");
+  // a folder outside the search: not searched and not a problem
+  clean();
+  clearTitleMemo();
+  session([R.user("in", { cwd: "/elsewhere" }), ...pad(4), R.user("end", { cwd: "/elsewhere" }), ...pad(1)], { id: "other-folder" });
+  search = await find({ name: "nope", folder: "/wanted" });
+  assert.ok(search.complete, "narrowing by folder really narrows");
+  console.log("chats 16 deep titles: found anywhere, however written; only a full read with nothing unresolved settles none");
+}
+
+// 17 the scan goes on where it stopped, also inside a line, and only reads what
+// grew; the memo is for the same file only
+{
+  clean();
+  clearTitleMemo();
+  const CH = 256 * 1024;
+  const pad = (bytes) => ({ type: "x", pad: "p".repeat(bytes) });
+  const tail = Array.from({ length: 5 }, () => pad(1_000_000));
+  // a title line across a chunk boundary
+  const split = session([pad(CH - 60), R.title("Across chunks"), R.user("x"), ...tail], { id: "split-chunk" });
+  assert.ok(fs.readFileSync(split.file).indexOf("Across chunks") < CH + 100);
+  assert.equal((await deepTitles(await sessionOf(split.id))).custom, "Across chunks");
+  // a marker across a chunk boundary inside a long line
+  const longAt = (shift) => {
+    const prefix = '{"type":"x","a":"';
+    const fill = "q".repeat(CH - prefix.length - shift);
+    return prefix + fill + '","n":{"type":"custom-title"},"b":"' + "r".repeat(100_000) + '"}';
+  };
+  for (const shift of [1, 8, 15, 30]) {
+    clearTitleMemo();
+    const s = session([longAt(shift), R.user("x"), ...tail], { id: `long-${shift}` });
+    assert.ok(!(await deepTitles(await sessionOf(s.id))).settled, `a marker split at ${shift} is found`);
+    // and exactly at a pause between two calls
+    clearTitleMemo();
+    const first = await deepTitles(await sessionOf(s.id), { maxChunks: 1 });
+    assert.ok(!first.complete);
+    const on = await deepTitles(await sessionOf(s.id));
+    assert.ok(on.complete && !on.settled, `and across a pause at ${shift}`);
+  }
+  // an interrupted scan is never taken for a finished one, and goes on
+  clearTitleMemo();
+  const twoParts = session([...tail, R.title("Late in the scan"), ...tail], { id: "two-parts" });
+  let d = await deepTitles(await sessionOf(twoParts.id), { maxChunks: 2 });
+  assert.ok(!d.complete && !d.settled && !d.custom);
+  const at = d.scanned;
+  d = await deepTitles(await sessionOf(twoParts.id), { maxChunks: 2 });
+  assert.ok(d.scanned > at, "the next call goes on from there");
+  d = await deepTitles(await sessionOf(twoParts.id));
+  assert.equal(d.custom, "Late in the scan");
+  assert.ok(d.complete && d.settled);
+  // one line too long for a single call still moves on
+  clearTitleMemo();
+  const oneLine = session([{ type: "x", pad: "p".repeat(CH * 6) }, R.title("After it")], { id: "one-line" });
+  d = await deepTitles(await sessionOf(oneLine.id), { maxChunks: 2 });
+  const before = d.scanned;
+  assert.ok(before > CH, "it advanced inside the line");
+  d = await deepTitles(await sessionOf(oneLine.id), { maxChunks: 2 });
+  assert.ok(d.scanned > before);
+  d = await deepTitles(await sessionOf(oneLine.id));
+  assert.equal(d.custom, "After it");
+  // a title line written in two steps, with over 4 MB after it
+  clean();
+  clearTitleMemo();
+  const grown = session([R.user("x"), ...tail], { id: "grown" });
+  fs.appendFileSync(grown.file, '{"type":"custom-title","custom');
+  d = await deepTitles(await sessionOf(grown.id));
+  assert.ok(d.complete && !d.settled, "a last line being written, with a marker, is pending");
+  fs.appendFileSync(grown.file, 'Title":"Written in two steps"}\n' + lines(tail));
+  assert.equal((await claudeMeta(await sessionOf(grown.id))).name, "Written in two steps");
+  // only what grew is read
+  const scanned = (await deepTitles(await sessionOf(grown.id))).scanned;
+  fs.appendFileSync(grown.file, lines([R.user("more")]));
+  d = await deepTitles(await sessionOf(grown.id), { maxChunks: 1 });
+  assert.ok(d.complete && d.scanned > scanned, "one chunk was enough for the growth");
+  // another file under the same name
+  clean();
+  clearTitleMemo();
+  const swapped = session([R.title("AAAA"), R.user("x"), ...tail], { id: "swapped" });
+  assert.equal((await deepTitles(await sessionOf(swapped.id))).custom, "AAAA");
+  const bytes = fs.readFileSync(swapped.file);
+  const mid = bytes.indexOf("AAAA");
+  bytes.write("BBBB", mid);
+  fs.writeFileSync(swapped.file, bytes); // same size, same sampled ends
+  fs.utimesSync(swapped.file, new Date(), new Date(Date.now() + 5_000));
+  assert.equal((await deepTitles(await sessionOf(swapped.id))).custom, "BBBB", "a middle-only edit of the same size is seen, by its time");
+  fs.writeFileSync(swapped.file, lines([R.user("short")]));
+  assert.equal((await deepTitles(await sessionOf(swapped.id))).custom, null, "cut short");
+  fs.writeFileSync(swapped.file, lines([R.title("Grown again"), R.user("x"), ...tail]));
+  assert.equal((await deepTitles(await sessionOf(swapped.id))).custom, "Grown again", "cut and grown again: a new read");
+  clean();
+  clearTitleMemo();
+  console.log("chats 17 the title scan stops anywhere and goes on, reads only what grew, and a memo is for the same file only");
 }
 
 fs.rmSync(root, { recursive: true, force: true });

@@ -2,11 +2,12 @@
 // title or folder, and read as units (see src/readchat.mjs).
 //
 // <claude config dir>/projects/<folder key>/<session id>.jsonl, one record
-// per line, append-only. The sidebar title is in <folder key>/<session
-// id>/custom-title.json and in "custom-title" records (the last one wins). A
-// session moved to another folder (a worktree) can sit under several folder
-// keys; the newest file is the session. The format is Claude Code's own and
-// undocumented: only known shapes are read, other records are metadata.
+// per line, append-only. The title the user set is in <folder key>/<session
+// id>/custom-title.json and in "custom-title" records (the last one wins);
+// without one, an automatic title is in "ai-title" records. A session moved to
+// another folder (a worktree) can sit under several folder keys; the newest
+// file is the session. The format is Claude Code's own and undocumented: only
+// known shapes are read, other records are metadata.
 //
 // Transcripts can be huge and this runs in the MCP server, which may also own
 // the broker: files are read in chunks from the end, asynchronously, never
@@ -22,11 +23,16 @@ const CHUNK = 256 * 1024;
 export const MAX_RECORD = 8 * 1024 * 1024;
 const META_BYTES = 4 * 1024 * 1024; // from the end, for a session's title and folder
 const HEAD_BYTES = 1024 * 1024; // from the start, for an untitled session's first message
+const TITLE_LINE = 64 * 1024; // a line this long or shorter is looked at whole for a title
+const MARK_OVERLAP = 1024; // kept between chunks when looking through a longer one
+const MAX_TITLE_MEMO = 5_000;
+const ID_BYTES = 4096; // sampled at each end of what a memo has read
 const TITLE_FILE_BYTES = 64 * 1024;
 export const PAGE_BYTES = 64 * 1024 * 1024; // read for one page before it ends early
 const RESULTS_BYTES = 2 * 1024 * 1024; // past a cursor, for the results of the tool steps before it
 const MAX_TOOL_LINES = 200;
 const EDGE_BYTES = 64 * 1024; // what identifies a record too large to keep
+const HEADER_MS = 5_000; // for a page's title, if it isn't settled yet
 
 // Claude Code's own blocks in user turns: reminders and notices it adds,
 // sometimes before the user's own words in the same message. They are taken
@@ -37,8 +43,13 @@ export const humanText = (t) => String(t ?? "").replace(INJECTED, "").replace(CA
 
 const projectsDir = () => path.join(claudeConfigDir(), "projects");
 const gone = (e) => e.code === "ENOENT" || e.code === "ENOTDIR";
-const problem = (p, e) => `${p} (${e.code ?? e.message})`;
 const pause = () => new Promise((r) => setImmediate(r));
+
+// What goes wrong with a chat the user didn't ask about is reported by count
+// and reason: its path is no business of the agent reading another chat.
+const UNREADABLE = "unreadable";
+const TITLE_UNSETTLED = "title not settled";
+const FOLDER_UNSETTLED = "folder not found within the limit";
 
 // Every session, newest first, one file per session id, and what couldn't
 // be read. No projects folder at all is no sessions; a folder that can't be
@@ -51,7 +62,7 @@ export async function scanSessions() {
     dirs = (await fs.promises.readdir(projectsDir(), { withFileTypes: true })).filter((d) => d.isDirectory());
   } catch (e) {
     if (e.code === "ENOENT") return { sessions: [], problems };
-    throw new Error(`can't read ${problem(projectsDir(), e)}`);
+    throw new Error(`can't read the sessions folder (${e.code ?? e.message})`);
   }
   for (const d of dirs) {
     const dir = path.join(projectsDir(), d.name);
@@ -59,7 +70,7 @@ export async function scanSessions() {
     try {
       names = (await fs.promises.readdir(dir)).filter((f) => f.endsWith(".jsonl"));
     } catch (e) {
-      if (!gone(e)) problems.push(problem(dir, e));
+      if (!gone(e)) problems.push(UNREADABLE);
       continue;
     }
     for (const f of names) {
@@ -68,11 +79,11 @@ export async function scanSessions() {
       try {
         st = await fs.promises.stat(file);
       } catch (e) {
-        if (!gone(e)) problems.push(problem(file, e));
+        if (!gone(e)) problems.push(UNREADABLE);
         continue;
       }
       if (!st.isFile()) {
-        problems.push(`${file} (not a file)`);
+        problems.push(UNREADABLE);
         continue;
       }
       const id = f.slice(0, -".jsonl".length);
@@ -187,19 +198,19 @@ async function readTitleFile(s) {
     fh = await fs.promises.open(file, "r");
     const buf = Buffer.alloc(TITLE_FILE_BYTES + 1);
     const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
-    if (bytesRead > TITLE_FILE_BYTES) throw Object.assign(new Error("too large"), { code: "too large" });
+    if (bytesRead > TITLE_FILE_BYTES) throw new Error("too large");
     return JSON.parse(buf.toString("utf8", 0, bytesRead)).customTitle ?? null;
   } catch (e) {
     // no title file is common; one that can't be read might hold the name asked for
     if (gone(e)) return null;
-    throw new Error(problem(file, e));
+    throw new Error(UNREADABLE);
   } finally {
     await fh?.close();
   }
 }
 
-// The first thing the user wrote, within the first part of the file, and
-// whether that was enough to tell: { text, settled }
+// The first thing the user wrote, within the first part of the file. Only a
+// label for a session with no title, so not finding it hides no name.
 async function firstMessage(s) {
   const fh = await fs.promises.open(s.file, "r");
   try {
@@ -208,12 +219,12 @@ async function firstMessage(s) {
     let start = 0;
     for (;;) {
       const nl = buf.indexOf(10, start);
-      if (nl === -1) return { text: null, settled: s.size <= HEAD_BYTES };
+      if (nl === -1) return null;
       const r = parse(buf.subarray(start, nl));
       start = nl + 1;
       if (r?.type === "user" && !r.isSidechain && !r.isMeta && !r.isCompactSummary) {
         const t = humanText(textOf(r.message?.content));
-        if (t) return { text: t, settled: true };
+        if (t) return t;
       }
     }
   } finally {
@@ -221,42 +232,194 @@ async function firstMessage(s) {
   }
 }
 
-// Title and folder, from the end of the file (titles are written again and
-// again, and most records carry the folder). `titleKnown`/`folderKnown` say
-// whether they were settled within the limits: a large session may hold them
-// further back, and a stand-in name from the first message may not be its name.
-export async function claudeMeta(s) {
-  let name = await readTitleFile(s);
+// ---------------------------------------------------------------- memos
+
+// A memo of what was read from a file may be used again only for the same
+// file, grown at most. Transcripts are append-only: that is an assumption, and
+// a rewrite that both grows the file and keeps both sampled regions isn't
+// detected. The samples are no check of the whole file.
+async function sample(fh, offset, length) {
+  const buf = Buffer.alloc(length);
+  const { bytesRead } = await fh.read(buf, 0, length, offset);
+  return sha(buf.subarray(0, bytesRead));
+}
+
+async function fileIdentity(fh, st, frontier) {
+  const headLen = Math.min(ID_BYTES, frontier);
+  const lastLen = Math.min(ID_BYTES, frontier);
+  return {
+    dev: st.dev,
+    ino: st.ino,
+    size: st.size,
+    mtime: st.mtimeMs,
+    frontier,
+    headLen,
+    head: await sample(fh, 0, headLen),
+    lastLen,
+    last: await sample(fh, frontier - lastLen, lastLen),
+  };
+}
+
+async function sameFile(fh, st, id) {
+  if (st.dev !== id.dev || st.ino !== id.ino || st.size < id.size) return false;
+  if (st.size === id.size) return st.mtimeMs === id.mtime;
+  return (await sample(fh, 0, id.headLen)) === id.head && (await sample(fh, id.frontier - id.lastLen, id.lastLen)) === id.last;
+}
+
+// ---------------------------------------------------------------- titles
+
+// In the raw bytes: quotes inside a JSON string are escaped, so this can't match
+// the text of a message. What it finds is only a candidate, checked by parsing.
+const TITLE_MARK = /"type"\s*:\s*"(?:custom-title|ai-title)"/;
+const TITLE_HINT = Buffer.from('-title"');
+const hasMark = (buf) => TITLE_MARK.test(buf.latin1Slice(0, buf.length));
+
+const titleScans = new Map();
+export const clearTitleMemo = () => titleScans.clear();
+
+// The titles anywhere in a large session, when its end settled no custom one: a
+// forward scan that can stop at any chunk and go on from there next time, and
+// that only reads what grew. It settles "no title" only by reaching the end with
+// no candidate left unresolved: a candidate that doesn't parse, or one in a line
+// over TITLE_LINE, isn't held or parsed there and stays unresolved. Whitespace
+// over MARK_OVERLAP long inside a marker, in such a line, isn't looked for: "no
+// title" holds for the format the app writes (records of a few hundred bytes),
+// not for any JSON. A last line with no newline yet is pending.
+// maxChunks is for tests: stop as a deadline would, at an exact place.
+export async function deepTitles(s, { deadline = Infinity, maxChunks = Infinity } = {}) {
+  const fh = await fs.promises.open(s.file, "r");
+  try {
+    const st = await fh.stat();
+    let e = titleScans.get(s.file);
+    if (e && !(await sameFile(fh, st, e.id))) e = null;
+    if (e?.complete && e.id.size === st.size) return result(e);
+    if (!e) e = { frontier: 0, longLine: false, custom: null, ai: null, unresolved: false, pending: false, complete: false, id: null };
+    e.complete = false;
+    e.pending = false;
+    const check = (line) => {
+      if (!hasMark(line)) return;
+      const r = parse(line);
+      if (!r) e.unresolved = true;
+      else if (r.type === "custom-title" && r.customTitle) e.custom = r.customTitle;
+      else if (r.type === "ai-title" && r.aiTitle) e.ai = r.aiTitle;
+    };
+    let pos = e.frontier;
+    let inLong = e.longLine;
+    let carry = Buffer.alloc(0);
+    let chunks = 0;
+    const chunk = Buffer.allocUnsafe(CHUNK);
+    let stopped = false;
+    while (pos < st.size) {
+      if (Date.now() > deadline || chunks >= maxChunks) {
+        stopped = true;
+        break;
+      }
+      chunks++;
+      const { bytesRead } = await fh.read(chunk, 0, Math.min(CHUNK, st.size - pos), pos);
+      if (!bytesRead) break;
+      const fresh = chunk.subarray(0, bytesRead);
+      const buf = carry.length ? Buffer.concat([carry, fresh]) : fresh;
+      const base = pos - carry.length;
+      pos += bytesRead;
+      let start = 0;
+      if (buf.indexOf(TITLE_HINT) === -1) {
+        const nl = buf.lastIndexOf(10);
+        if (nl !== -1) {
+          start = nl + 1;
+          inLong = false;
+        }
+      } else {
+        for (;;) {
+          const nl = buf.indexOf(10, start);
+          if (nl === -1) break;
+          const line = buf.subarray(start, nl);
+          if (inLong || line.length > TITLE_LINE) {
+            if (hasMark(line)) e.unresolved = true;
+          } else check(line);
+          inLong = false;
+          start = nl + 1;
+        }
+      }
+      const rest = buf.subarray(start);
+      if (inLong || rest.length > TITLE_LINE) {
+        if (hasMark(rest)) e.unresolved = true;
+        inLong = true;
+        carry = Buffer.from(rest.subarray(Math.max(0, rest.length - MARK_OVERLAP)));
+        e.frontier = pos - carry.length;
+      } else {
+        carry = Buffer.from(rest);
+        e.frontier = base + start;
+      }
+      e.longLine = inLong;
+      await pause();
+    }
+    if (!stopped) {
+      e.complete = true;
+      if (!inLong && carry.length && hasMark(carry)) e.pending = true;
+    }
+    e.id = await fileIdentity(fh, st, e.frontier);
+    titleScans.delete(s.file);
+    titleScans.set(s.file, e);
+    if (titleScans.size > MAX_TITLE_MEMO) titleScans.delete(titleScans.keys().next().value);
+    return result(e);
+  } finally {
+    await fh.close();
+  }
+}
+const result = (e) => ({ custom: e.custom, ai: e.ai, settled: e.complete && !e.unresolved && !e.pending, complete: e.complete, scanned: e.frontier });
+
+// Title and folder. The end of the file settles most (titles are written again
+// and again, and most records carry the folder); a custom title in it settles
+// the name, whatever lies further back. A large session with none there is
+// searched whole, if its folder is in scope. `titleKnown`/`folderKnown` say
+// whether they were settled: if not, a name found may not be its name.
+export async function claudeMeta(s, { deadline = Infinity, inScope = () => true } = {}) {
+  let custom = await readTitleFile(s);
+  let ai = null;
   let folder = null;
   let scannedAll = true;
+  let unresolved = false;
   if (s.size > 0)
     for await (const rec of reverseRecords(s.file, { budget: META_BYTES })) {
       if (rec.budget) {
         scannedAll = false;
         break;
       }
-      if (name && folder) break;
+      if (custom && folder) break;
       if (!rec.raw) continue;
       const r = parse(rec.raw);
-      if (!r) continue;
-      if (!name && r.type === "custom-title" && r.customTitle) name = r.customTitle;
+      if (!r) {
+        if (hasMark(rec.raw)) unresolved = true;
+        continue;
+      }
+      if (!custom && r.type === "custom-title" && r.customTitle) custom = r.customTitle;
+      if (!ai && r.type === "ai-title" && r.aiTitle) ai = r.aiTitle;
       if (!folder && typeof r.cwd === "string") folder = r.cwd;
     }
-  let titleKnown = !!name;
+  let titleKnown = !!custom || (scannedAll && !unresolved);
+  if (!custom && !scannedAll) {
+    if (inScope(folder)) {
+      const d = await deepTitles(s, { deadline });
+      custom = d.custom;
+      ai ??= d.ai;
+      titleKnown = !!custom || d.settled;
+    } else titleKnown = false;
+  }
+  let name = custom ?? ai;
   if (!name) {
     const first = await firstMessage(s);
-    name = first.text ? `(untitled) ${first.text.replace(/\s+/g, " ").slice(0, 60)}` : "(untitled)";
-    titleKnown = scannedAll && first.settled;
+    name = first ? `(untitled) ${first.replace(/\s+/g, " ").slice(0, 60)}` : "(untitled)";
   }
   return { app: "claude", id: s.id, name, folder, updated: s.mtime, titleKnown, folderKnown: !!folder || scannedAll };
 }
 
 // ------------------------------------------------------------------ finding
 
-// By title and/or folder, over every session, newest first. A session whose
-// title or folder couldn't be settled within the limits is reported, whether
-// or not what is known of it matches, and so is one the deadline didn't reach:
-// then the search isn't complete.
+// By title and/or folder, over every session, newest first. A session in scope
+// whose title or folder couldn't be settled is reported, whether or not what is
+// known of it matches, and so is one the deadline didn't reach: then the search
+// isn't complete. A session known to lie outside the folder asked for is out,
+// settled or not.
 export async function findClaude({ name, folder, add, deadline = Infinity }) {
   const { sessions, problems } = await scanSessions();
   const want = name ? normalizeName(name) : null;
@@ -265,15 +428,16 @@ export async function findClaude({ name, folder, add, deadline = Infinity }) {
     if (Date.now() > deadline) break;
     looked++;
     try {
-      const { titleKnown, folderKnown, ...chat } = await claudeMeta(s);
-      if (want && !titleKnown) problems.push(`${s.file} (title not found within the limit)`);
-      if (folder && !folderKnown) problems.push(`${s.file} (folder not found within the limit)`);
+      const { titleKnown, folderKnown, ...chat } = await claudeMeta(s, { deadline, inScope: (f) => !folder || !f || inFolder(f, folder) });
+      if (folder && !folderKnown) problems.push(FOLDER_UNSETTLED);
+      if (folder && folderKnown && !inFolder(chat.folder, folder)) continue;
+      if (want && !titleKnown) problems.push(TITLE_UNSETTLED);
       if (folder && !inFolder(chat.folder, folder)) continue;
       if (want && !normalizeName(chat.name).includes(want)) continue;
       add(chat);
     } catch (e) {
       // deleted meanwhile is gone; anything else might have been a match
-      if (!gone(e)) problems.push(e.code ? problem(s.file, e) : e.message);
+      if (!gone(e)) problems.push(UNREADABLE);
     }
   }
   const reached = looked >= sessions.length;
@@ -498,5 +662,5 @@ export async function* claudeStream(file, resume, { includeTools = true, budget 
 export async function readClaudePage(s, { resume, limit, includeTools, budget }) {
   if (resume && !(await boundaryHolds(s.file, resume))) return { moved: true };
   const page = await assemble(claudeStream(s.file, resume, { includeTools, budget }), { limit, includeTools });
-  return { meta: await claudeMeta(s), page };
+  return { meta: await claudeMeta(s, { deadline: Date.now() + HEADER_MS }), page };
 }
