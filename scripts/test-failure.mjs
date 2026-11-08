@@ -583,6 +583,191 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   console.log("15 a tool approval waiting: told once (review, message), dropped once answered; not for advisor mode, answered, closed or ended work, or an idle chat");
 }
 
+// 16. a ChatGPT reviewer asked to run a command outside its sandbox and has no
+// result yet: whoever waits hears it may be waiting on an approval, once. Read
+// from the thread's rollout, which records the request but never the decision.
+{
+  const { call, nextStep, inlineText } = await import("../src/broker.mjs");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-codexhome-"));
+  process.env.CODEX_HOME = home;
+  const R = { app: "claude", id: "claude-waits-on-gpt" };
+  let seq = 0;
+  // a UUIDv7-shaped thread id made now, as ChatGPT's are
+  const newThread = () => {
+    const hex = Date.now().toString(16).padStart(12, "0");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-7000-8000-${String(++seq).padStart(12, "0")}`;
+  };
+  const fileOf = (id) => {
+    const d = new Date(parseInt(id.replace(/-/g, "").slice(0, 12), 16));
+    const p = (n) => String(n).padStart(2, "0");
+    const folder = path.join(home, "sessions", String(d.getFullYear()), p(d.getMonth() + 1), p(d.getDate()));
+    fs.mkdirSync(folder, { recursive: true });
+    return path.join(folder, `rollout-2026-01-01T00-00-00-${id}.jsonl`);
+  };
+  const write = (id, records, tail = "") => fs.writeFileSync(fileOf(id), records.map((r) => JSON.stringify(r)).join("\n") + "\n" + tail);
+  const stamp = (at) => new Date(at).toISOString();
+  const custom = (callId, at) => ({ timestamp: stamp(at), type: "response_item", payload: { type: "custom_tool_call", call_id: callId, name: "exec", input: 'text(await tools.exec_command({cmd:"git diff",sandbox_permissions:"require_escalated",justification:"May I run git diff outside the sandbox?"}))' } });
+  const fn = (callId, at) => ({ timestamp: stamp(at), type: "response_item", payload: { type: "function_call", call_id: callId, name: "shell", arguments: JSON.stringify({ command: ["git", "diff"], sandbox_permissions: "require_escalated", justification: "Run the diff, please." }) } });
+  const output = (callId, at) => ({ timestamp: stamp(at), type: "response_item", payload: { type: "custom_tool_call_output", call_id: callId, output: [{ type: "input_text", text: "Script completed\nWall time 1.0 seconds\nOutput:" }, { type: "input_text", text: "ok" }] } });
+  const plain = (at) => ({ timestamp: stamp(at), type: "response_item", payload: { type: "custom_tool_call", call_id: `plain-${at}`, name: "exec", input: "text(await tools.exec_command({cmd:\"ls\"}))" } });
+  const turns = {};
+  const waiting = (about) => state().messages.filter((x) => x.kind === "waiting" && x.about === about);
+  const review = async (request, running = true) => {
+    const thread = newThread();
+    const link = await call("link_create", { primary: R, advisor: { app: "openai", id: thread }, mode: "review", request });
+    const m = await until(() => {
+      const x = state().messages.find((y) => y.linkId === link.id && y.kind === "review-request");
+      return x?.watch?.clientId && x;
+    });
+    if (running) turns[m.watch.clientId] = { state: "inProgress" };
+    fake({ turns });
+    return { thread, link, m };
+  };
+  const quiet = async (id, why) => {
+    await sleep(400);
+    assert.equal(waiting(id).length, 0, why);
+  };
+  // unanswered for longer than the threshold: told once, as a possibility
+  const a = await review("Check A.");
+  write(a.thread, [plain(Date.now()), custom("call-a", Date.now())]);
+  const n = await until(() => waiting(a.m.id)[0]);
+  assert.deepEqual(n.toEndpoint, R);
+  assert.equal(n.maybe, true);
+  assert.match(n.text, new RegExp(`The ChatGPT chat ${a.thread} asked to run a command outside its sandbox more than a minute ago and has no result yet \\(May I run git diff outside the sandbox\\?\\): it may be waiting for the user's approval in ChatGPT Desktop, or the command may still be running\\.`));
+  assert.match(inlineText(n), new RegExp(`The answer to ${a.m.id} may wait for the user's approval`));
+  assert.match(nextStep(n), /may be waiting for their approval in ChatGPT Desktop, and to check it/);
+  assert.doesNotMatch(nextStep(n), /the answer arrives once it's approved/, "nothing firmer than 'may'");
+  await sleep(400);
+  assert.equal(waiting(a.m.id).length, 1, "told once");
+  // answered: nothing
+  const b = await review("Check B.");
+  write(b.thread, [custom("call-b", Date.now()), output("call-b", Date.now())]);
+  await quiet(b.m.id, "an answered request");
+  // asked just now (younger than the threshold; with the watch scaled down for
+  // tests, a stamp in the future stands for "just now"): nothing yet
+  const c = await review("Check C.");
+  write(c.thread, [custom("call-c", Date.now() + 60_000)]);
+  await quiet(c.m.id, "not a minute old");
+  // asked before this request was sent: not this turn's
+  const d = await review("Check D.");
+  write(d.thread, [custom("call-d", d.m.watch.since - 5_000)]);
+  await quiet(d.m.id, "from before the request");
+  // the last line not fully written yet: nothing decided on it
+  const e = await review("Check E.");
+  write(e.thread, [custom("call-e", Date.now())], '{"timestamp":"2026-01-01T00:00:00.000Z","type":"response_item","payload":{"type":"custom_tool_c');
+  await quiet(e.m.id, "a line still being written");
+  // the other call shape, while the turn can't be read (unknown)
+  const f = await review("Check F.", false);
+  write(f.thread, [fn("call-f", Date.now())]);
+  assert.match((await until(() => waiting(f.m.id)[0])).text, /\(Run the diff, please\.\)/);
+  // a rollout over 512 KB: only its end is read
+  const g = await review("Check G.");
+  const padded = (k) => ({ ...plain(Date.now() - 1000), pad: "p".repeat(1_000), k });
+  write(g.thread, [...Array.from({ length: 700 }, (_, k) => padded(k)), custom("call-g", Date.now())]);
+  assert.ok(fs.statSync(fileOf(g.thread)).size > 512 * 1024);
+  await until(() => waiting(g.m.id)[0]);
+  // one asked before more than 512 KB of later records: past the end that's read
+  const g2 = await review("Check G2.");
+  write(g2.thread, [custom("call-g2", Date.now()), ...Array.from({ length: 700 }, (_, k) => padded(k))]);
+  await quiet(g2.m.id, "only the end of the rollout is read");
+  // the word in a command or in text isn't the parameter
+  const k = await review("Check K.");
+  write(k.thread, [{ timestamp: stamp(Date.now()), type: "response_item", payload: { type: "custom_tool_call", call_id: "call-k", name: "exec", input: 'text(await tools.exec_command({cmd:"grep -rn require_escalated src"}))' } }]);
+  await quiet(k.m.id, "a grep for the word");
+  // no rollout at all: nothing, and no error
+  const h = await review("Check H.");
+  await quiet(h.m.id, "no rollout");
+  // a rollout that shows up only after the first checks: still found
+  const h2 = await review("Check H2.");
+  await sleep(400);
+  write(h2.thread, [custom("call-h2", Date.now())]);
+  await until(() => waiting(h2.m.id)[0]);
+  // a long command hands back an interim output and goes on in the background;
+  // a later wait / write_stdin reports on it. Not its result until one of those
+  // reports isn't another interim output.
+  const rec = (type, extra) => ({ timestamp: stamp(Date.now()), type: "response_item", payload: { type, ...extra } });
+  const yielded = (callId, cell) => rec("custom_tool_call_output", { call_id: callId, output: [{ type: "input_text", text: `Script running with cell ID ${cell}\nWall time 31.0 seconds\nOutput:` }] });
+  const waitOn = (callId, cell) => rec("function_call", { call_id: callId, name: "wait", arguments: JSON.stringify({ cell_id: cell, yield_time_ms: 30000 }) });
+  const shell = (callId) => rec("function_call", { call_id: callId, name: "exec_command", arguments: JSON.stringify({ cmd: "npm test", sandbox_permissions: "require_escalated", justification: "Run the tests?" }) });
+  const proc = (callId, how) => rec("function_call_output", { call_id: callId, output: `Chunk ID: 1a2b\nWall time: 30.0 seconds\n${how}\nOriginal token count: 3\nOutput:\n` });
+  const stdin = (callId, session) => rec("function_call", { call_id: callId, name: "write_stdin", arguments: JSON.stringify({ session_id: session, chars: "" }) });
+  // exec: yielded, and the wait on its cell has no result yet: told
+  const y1 = await review("Check Y1.");
+  write(y1.thread, [custom("call-y1", Date.now()), yielded("call-y1", "g6:11"), waitOn("wait-y1", "g6:11")]);
+  await until(() => waiting(y1.m.id)[0]);
+  // exec: yielded, then the wait on it completed: nothing
+  const y2 = await review("Check Y2.");
+  write(y2.thread, [custom("call-y2", Date.now()), yielded("call-y2", "g7:2"), waitOn("wait-y2", "g7:2"), rec("function_call_output", { call_id: "wait-y2", output: [{ type: "input_text", text: "Script completed\nWall time 2.0 seconds\nOutput:" }] })]);
+  await quiet(y2.m.id, "a yielded cell whose wait completed");
+  // exec_command: still running after a write_stdin: told
+  const y3 = await review("Check Y3.");
+  write(y3.thread, [shell("call-y3"), proc("call-y3", "Process running with session ID 7"), stdin("stdin-y3", 7), proc("stdin-y3", "Process running with session ID 7")]);
+  assert.match((await until(() => waiting(y3.m.id)[0])).text, /\(Run the tests\?\)/);
+  // exec_command: exited after a write_stdin: nothing
+  const y4 = await review("Check Y4.");
+  write(y4.thread, [shell("call-y4"), proc("call-y4", "Process running with session ID 8"), stdin("stdin-y4", 8), proc("stdin-y4", "Process exited with code 0")]);
+  await quiet(y4.m.id, "a session that exited");
+  // notify() adds outputs to an exec call while it runs: they don't end it,
+  // before or after a yield
+  const note = (callId, text) => rec("custom_tool_call_output", { call_id: callId, output: text });
+  const y5 = await review("Check Y5.");
+  write(y5.thread, [custom("call-y5", Date.now()), note("call-y5", "Checking"), yielded("call-y5", "g8:1"), waitOn("wait-y5", "g8:1")]);
+  await until(() => waiting(y5.m.id)[0]);
+  const y6 = await review("Check Y6.");
+  write(y6.thread, [custom("call-y6", Date.now()), yielded("call-y6", "g9:1"), note("call-y6", "Halfway"), waitOn("wait-y6", "g9:1")]);
+  await until(() => waiting(y6.m.id)[0]);
+  // notify(), then the result: nothing
+  const y7 = await review("Check Y7.");
+  write(y7.thread, [custom("call-y7", Date.now()), note("call-y7", "Checking"), output("call-y7", Date.now())]);
+  await quiet(y7.m.id, "notify, then completed");
+  // an exec that reports on a running session calls notify() first, then
+  // finishes: the request ends with it
+  const reportExec = (callId, session) => rec("custom_tool_call", { call_id: callId, name: "exec", input: `notify("Checking tests"); text(await tools.write_stdin({session_id:${session},chars:""}))` });
+  const y10 = await review("Check Y10.");
+  write(y10.thread, [shell("call-y10"), proc("call-y10", "Process running with session ID 9"), reportExec("rep-y10", 9), note("rep-y10", "Checking tests"), output("rep-y10", Date.now())]);
+  await quiet(y10.m.id, "a report that notified, then finished");
+  // a finished command whose own output prints a running line: finished
+  const y8 = await review("Check Y8.");
+  write(y8.thread, [custom("call-y8", Date.now()), rec("custom_tool_call_output", { call_id: "call-y8", output: "Script completed\nWall time 1.0 seconds\nOutput:\nScript running with cell ID example" })]);
+  await quiet(y8.m.id, "the running line is in the command's output");
+  const y9 = await review("Check Y9.");
+  write(y9.thread, [shell("call-y9"), rec("function_call_output", { call_id: "call-y9", output: "Chunk ID: 1a2b\nWall time: 1.0 seconds\nProcess exited with code 0\nOriginal token count: 3\nOutput:\nProcess running with session ID 7\n" })]);
+  await quiet(y9.m.id, "the running line is in the process's output");
+  // a message to a ChatGPT chat: its sender is told
+  const i = await review("Check I.", false);
+  write(i.thread, []);
+  const sent = await call("send", { endpoint: R, text: "Also check the README.", linkId: i.link.id });
+  const sm = await until(() => {
+    const x = state().messages.find((y) => y.id === sent.id);
+    return x?.watch?.clientId && x;
+  });
+  turns[sm.watch.clientId] = { state: "inProgress" };
+  fake({ turns });
+  write(i.thread, [custom("call-i", Date.now())]);
+  assert.deepEqual((await until(() => waiting(sent.id)[0])).toEndpoint, R);
+  // the turn can't be read at all (the read fails): still checked
+  const j = await review("Check J.", false);
+  write(j.thread, [custom("call-j", Date.now())]);
+  fake({ turns, hang: true });
+  await until(() => waiting(j.m.id)[0], 8000);
+  fake({ turns });
+  // advisor mode: the review of a primary's turn is never watched, never told
+  const advThread = newThread();
+  const adv = await call("link_create", { primary: R, advisor: { app: "openai", id: advThread } });
+  await runHook("claude", "stop", { session_id: R.id, last_assistant_message: "Step one done." });
+  const areq = await until(() => state().messages.find((x) => x.linkId === adv.id && x.kind === "review-request"));
+  write(advThread, [custom("call-adv", Date.now())]);
+  await sleep(400);
+  assert.equal(state().messages.find((x) => x.id === areq.id).watch, undefined, "not watched");
+  assert.equal(waiting(areq.id).length, 0, "advisor mode");
+  for (const l of [a, b, c, d, e, f, g, g2, h, h2, i, j, k, y1, y2, y3, y4, y5, y6, y7, y8, y9, y10]) await call("link_close", { linkId: l.link.id }).catch(() => {});
+  await call("link_close", { linkId: adv.id });
+  fake({});
+  delete process.env.CODEX_HOME;
+  fs.rmSync(home, { recursive: true, force: true });
+  console.log("16 a ChatGPT reviewer with an unanswered sandbox escalation: told once as a possibility (both call shapes, turn unknown or unreadable, only the end of a large rollout, a rollout that shows up late, a yielded command still running, notify() outputs before or after a yield); nothing when answered (also through a later wait or write_stdin, one that notified first, or with a running line in the command's own output), too new, from before, half written, without a rollout, or for the word in a command; advisor mode out");
+}
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log("\nfailure tests passed");
 process.exit(0);

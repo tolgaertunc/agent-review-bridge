@@ -59,7 +59,7 @@ const PEER_BURST = { count: 60, windowMs: 10 * 60_000 };
 // deadline. Each read has its own time limit. (Tests scale it down.)
 const WATCH_SCALE = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_WATCH_SCALE) || 1;
 const WATCH = Object.fromEntries(
-  Object.entries({ first: 15_000, second: 60_000, every: 60_000, deadline: 6 * 3600_000, read: 15_000, stuck: 60_000 }).map(([k, v]) => [k, Math.max(20, v * WATCH_SCALE)]),
+  Object.entries({ first: 15_000, second: 60_000, every: 60_000, deadline: 6 * 3600_000, read: 15_000, stuck: 60_000, approval: 60_000 }).map(([k, v]) => [k, Math.max(20, v * WATCH_SCALE)]),
 );
 
 for (const d of [DATA_DIR, OUTBOX_DIR, LISTENERS_DIR, TURNS_DIR]) fs.mkdirSync(d, { recursive: true });
@@ -143,6 +143,7 @@ export function nextStep(m) {
       );
     return `${told} Ask again only if the user wants to (after the reset time, if one is given)${again}`;
   }
+  if (m.kind === "waiting" && m.maybe) return "Tell the user, in their language, that the other chat may be waiting for their approval in ChatGPT Desktop, and to check it. Don't ask again.";
   if (m.kind === "waiting") return "Tell the user, in their language, that the other chat is waiting for their approval there. Don't ask again: the answer arrives once it's approved.";
   if (m.kind === "review-request") return `Review ${m.plan ? "the plan" : "it"}, then answer once with bridge_advise (request_id ${m.id}).`;
   if (m.kind === "advisory")
@@ -211,7 +212,7 @@ export function inlineText(m) {
     "review-result": `The ${m.plan ? "plan review" : "review"} you asked for: ${m.id}`,
     stop: `Stop the fix loop: ${m.id}`,
     failed: `No answer is coming to ${m.about}: ${m.id}`,
-    waiting: `The answer to ${m.about} waits for the user's approval: ${m.id}`,
+    waiting: m.maybe ? `The answer to ${m.about} may wait for the user's approval: ${m.id}` : `The answer to ${m.about} waits for the user's approval: ${m.id}`,
   }[m.kind] ?? `Message ${m.id}`;
   return [`${LABEL[m.from] ?? m.from.toUpperCase()}: ${title} (link ${m.linkId})`, m.text, `${AGENT_LINE} ${nextStep(m)}`].join("\n\n");
 }
@@ -484,6 +485,14 @@ class BrokerState {
       }
       m.dispatch = { ...m.dispatch, state: "sent", at: Date.now() };
     }
+    // not known to be over (running, queued, unreadable): the reviewer may be
+    // waiting on an approval nobody sees
+    if (!r?.completedAt)
+      try {
+        await this.checkApproval(m);
+      } catch (e) {
+        logEvent({ op: "approval-check", id: m.id, error: String(e.message || e) });
+      }
     if (error) logEvent({ op: "watch", id: m.id, error });
     else if (!r.completedAt) {
       // not over yet
@@ -1053,13 +1062,35 @@ class BrokerState {
     for (const w of this.s.messages) if (w.kind === "waiting" && w.about === id && !w.readAt) w.readAt = Date.now();
   }
 
-  post({ from, toEndpoint, kind, linkId, text, decision, lastRound, generation, about, retry, auto, retried }) {
+  // A ChatGPT reviewer asked to run a command outside its sandbox and has no
+  // result after a minute: it may be waiting on an approval nobody sees. Told
+  // once, as a possibility: its rollout records the request, never the decision.
+  async checkApproval(m) {
+    if (m.to !== "openai" || m.approvalToldAt || this.settled(m)) return;
+    const link = this.s.links[m.linkId];
+    const to = m.kind === "review-request" ? link?.primary : m.fromEndpoint;
+    if (!to || !link?.active) return;
+    const w = m.watch;
+    const { rolloutOf, pendingEscalation } = await import("./codex.mjs");
+    // looked for on every check until found (it may not exist yet)
+    if (!w.rollout) w.rollout = rolloutOf(m.toEndpoint.id);
+    if (!w.rollout) return;
+    const p = pendingEscalation(w.rollout, w.since);
+    if (!p || p.partial || Date.now() - p.at < WATCH.approval || m.approvalToldAt) return;
+    m.approvalToldAt = Date.now();
+    const why = p.justification ? ` (${p.justification})` : "";
+    const text = `The ChatGPT chat ${m.toEndpoint.id} asked to run a command outside its sandbox more than a minute ago and has no result yet${why}: it may be waiting for the user's approval in ChatGPT Desktop, or the command may still be running. Its answer to ${m.id} comes after that.`;
+    this.post({ from: "bridge", toEndpoint: to, kind: "waiting", linkId: m.linkId, text, about: m.id, maybe: true });
+    logEvent({ op: "waiting", id: m.id, maybe: true });
+  }
+
+  post({ from, toEndpoint, kind, linkId, text, decision, lastRound, generation, about, retry, auto, retried, maybe }) {
     const msg = { id: "m" + ++this.s.seq, from, to: toEndpoint.app, toEndpoint, kind, linkId, text: text.slice(0, MAX_TEXT), ts: Date.now(), readAt: null };
     // a review's request and result say whether it is a plan, and whether
     // its plan waits for the user, as its link decided (each message is
     // rendered on its own later, by the hooks too)
     const link = ["review-request", "review-result"].includes(kind) ? this.s.links[linkId] : null;
-    Object.assign(msg, link?.plan && { plan: true }, link?.plan && link.noGate && { noGate: true }, decision && { decision }, lastRound && { lastRound: true }, generation !== undefined && { generation }, about && { about }, retry && { retry }, auto && { auto: true }, retried && { retried: true });
+    Object.assign(msg, link?.plan && { plan: true }, link?.plan && link.noGate && { noGate: true }, decision && { decision }, lastRound && { lastRound: true }, generation !== undefined && { generation }, about && { about }, retry && { retry }, auto && { auto: true }, retried && { retried: true }, maybe && { maybe: true });
     this.s.messages.push(msg);
     logEvent({ op: "send", id: msg.id, from, to: toEndpoint, kind, linkId, len: msg.text.length });
     return { id: msg.id };
@@ -1155,7 +1186,7 @@ class BrokerState {
     logEvent({ op: "receive", side, endpoint, ids: out.map((m) => m.id) });
     // everything nextStep reads goes along, so the instruction is the same as in a wake
     return {
-      messages: out.map(({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about, retry, auto, retried }) => ({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about, retry, auto, retried })),
+      messages: out.map(({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about, retry, auto, retried, maybe }) => ({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about, retry, auto, retried, maybe })),
     };
   }
 }
