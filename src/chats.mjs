@@ -439,6 +439,10 @@ async function hydrate(unit, view, fh, budget) {
       continue;
     }
     out.at = stampOf(r) ?? out.at;
+    if (unit.kind === "summary") {
+      out.text = textOf(r.message?.content).trim();
+      continue;
+    }
     if (unit.kind === "user") {
       if (rec.f & F.QUEUED) out.text = humanQueued(r.attachment) ? humanText(r.attachment.prompt) : "";
       else {
@@ -482,7 +486,7 @@ export async function* claudeStream(view, fh, { from = 0, top = Infinity, includ
     const low = Math.min(cut, u.min);
     yield* left(low, cut, i - 1, u.uncertain);
     cut = low;
-    const shown = u.kind === "user" || u.kind === "final" || u.kind === "unfinished" || includeTools;
+    const shown = u.kind === "user" || u.kind === "summary" || u.kind === "final" || u.kind === "unfinished" || includeTools;
     if (shown) {
       const { unit, read } = await hydrate(u, view, fh, unitBudget);
       used += read;
@@ -494,8 +498,9 @@ export async function* claudeStream(view, fh, { from = 0, top = Infinity, includ
 }
 
 // Is that position still the same record, whole? A shifted or rewritten file fails
-// this; records added at the end don't touch it.
-async function boundaryHolds(fh, { o, n, h }) {
+// this; records added at the end don't touch it. o and n are the index's own,
+// never a cursor's.
+async function boundaryHolds(fh, { o, n }, h) {
   const { size } = await fh.stat();
   if (o + n > size) return false;
   const at = async (offset, length) => {
@@ -524,11 +529,23 @@ export async function readClaudePage(s, { resume, limit, includeTools, budget, u
     if (resume) {
       const at = view.byKey.get(resume.u);
       if (at === undefined) return { moved: true };
-      if (!(await boundaryHolds(fh, resume)) || (await historyDigest(view, view.units[at].bi, resume.c)) !== resume.d) return { moved: true };
+      // the cursor's place must be the record the index has for that unit
+      // before anything is read: a changed cursor can't choose what is read
+      const anchor = view.units[at].members[0];
+      if (resume.o !== anchor.o || resume.n !== anchor.n) return { moved: true };
+      if (!(await boundaryHolds(fh, anchor, resume.h)) || (await historyDigest(view, view.units[at].bi, resume.c)) !== resume.d) return { moved: true };
       from = at + 1;
       top = resume.c;
     }
     const page = await assemble(claudeStream(view, fh, { from, top, includeTools, ...(budget !== undefined && { budget }), ...(unitBudget !== undefined && { unitBudget }) }), { limit, includeTools });
+    // where that compaction's summary is, seen from this page: every unit from
+    // `from` to the last one consumed was on it, and a summary is never dropped
+    if (view.compaction) {
+      const last = page.more ? (page.pos?.i ?? from - 1) : view.units.length - 1;
+      const at = view.compaction.summary === null ? undefined : view.byKey.get(view.compaction.summary);
+      const summary = at === undefined ? "unavailable" : at < from ? "earlier" : at > last ? "older" : page.unreadSummaries ? "unreadable" : "shown";
+      page.compaction = { state: view.compaction.state, summary };
+    }
     if (page.pos && page.pos.i >= 0) {
       const u = view.units[page.pos.i];
       const anchor = u.members[0];

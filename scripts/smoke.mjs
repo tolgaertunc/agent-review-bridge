@@ -515,6 +515,14 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   t = textOf(await call(openai, "bridge_read_chat", { name: "release", folder: "sub" }, { ...asGpt("gpt-reader"), "x-codex-turn-metadata": { cwd: repo } }));
   assert.match(t, /Tests, tag, then release notes/, "a relative folder is the calling chat's");
   assert.match(textOf(await reader({ cursor: "not-ours" })), /isn't one this tool returned/);
+  // an id with a name, folder or archived beside it is refused, on both sides, before anything is read
+  for (const args of [{ id: "c-notes-1", name: "Release checklist" }, { id: "c-notes-1", folder: "sub" }])
+    assert.match(textOf(await reader(args)), /Give a name or an id, not both/, JSON.stringify(args));
+  for (const args of [{ id: "c-notes-1", name: "Release checklist" }, { id: "c-notes-1", archived: false }]) {
+    t = textOf(await call(claude, "bridge_read_chat", args));
+    assert.match(t, /Give a name or an id, not both/, JSON.stringify(args));
+    assert.doesNotMatch(t, /couldn't be read right now/, "nothing was searched");
+  }
   // an id nobody has; and one that may exist behind something unreadable
   assert.match(textOf(await reader({ id: "no-such-session" })), /No Claude Code session with id no-such-session on this computer\./);
   fs.mkdirSync(path.join(projects, "broken.jsonl"));

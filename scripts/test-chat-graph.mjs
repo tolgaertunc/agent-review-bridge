@@ -33,7 +33,7 @@ const write = (lines) => {
 // ------------------------------------------------------------------ the oracle
 
 const OTHER = "messages on a branch that was rewound or left";
-const LABEL = { user: "### User", final: "### Assistant", unfinished: "### Assistant (the turn didn't finish)", interim: "### Assistant (between steps)", tool: "### Tool steps" };
+const LABEL = { user: "### User", summary: "### Summary written at a compaction, in place of earlier history", final: "### Assistant", unfinished: "### Assistant (the turn didn't finish)", interim: "### Assistant (between steps)", tool: "### Tool steps" };
 
 // lines: what's in the file, parsed where it can be. Returns the messages, oldest
 // first, with their rendered form, and the totals of what is left out.
@@ -50,11 +50,25 @@ function oracle(lines) {
   count("subagent records", subagent.length);
   const main = all.filter((r) => !r.isSidechain);
   const get = (u) => main.find((r) => r.uuid === u);
-  const back = (r) => {
-    if (r.parentUuid === null && r.type === "system" && r.subtype === "compact_boundary") return (typeof r.logicalParentUuid === "string" && get(r.logicalParentUuid)) || "break";
+  const boundary = (r) => r.parentUuid === null && r.type === "system" && r.subtype === "compact_boundary";
+  const logicalOf = (r) => (typeof r.logicalParentUuid === "string" && get(r.logicalParentUuid)) || null;
+  const rawBack = (r) => {
+    if (boundary(r)) return logicalOf(r) ?? "none";
     if (r.parentUuid === null) return null;
     return get(r.parentUuid) ?? "break";
   };
+  // a boundary is cut if it has no logical parent, or if following that comes
+  // back to it: tried from each boundary, by brute force
+  const goesRound = (b) => {
+    const seen = new Set();
+    for (let c = logicalOf(b); c && typeof c === "object" && !seen.has(c); c = rawBack(c)) {
+      if (c === b) return true;
+      seen.add(c);
+    }
+    return false;
+  };
+  const cutSet = new Set(main.filter((r) => boundary(r) && (!logicalOf(r) || goesRound(r))));
+  const back = (r) => (cutSet.has(r) ? null : rawBack(r));
   const isConv = (r) => r.type === "user" || r.type === "assistant";
   const leafOf = (r) => {
     const seen = new Set();
@@ -64,13 +78,14 @@ function oracle(lines) {
     }
     return null;
   };
-  const isParent = (r) => main.some((x) => x.parentUuid === r.uuid || (x.parentUuid === null && x.subtype === "compact_boundary" && x.logicalParentUuid === r.uuid));
+  const isParent = (r) => main.some((x) => back(x) === r);
   const leaves = main.filter((r) => !isParent(r)).map(leafOf).filter(Boolean);
   const leaf = leaves.sort((a, b) => b.at - a.at)[0] ?? null;
 
   // the straight line
   const line = [];
   let broke = !leaf;
+  let crossed = null;
   for (let c = leaf; c; ) {
     line.push(c);
     const b = back(c);
@@ -78,8 +93,13 @@ function oracle(lines) {
       broke = true;
       break;
     }
+    if (b && boundary(c)) crossed = c;
     c = b;
   }
+  // the compaction whose history can't be reconstructed: the line ends at it,
+  // or breaks behind the last one it went back through
+  const atCut = line.length > 0 && cutSet.has(line.at(-1));
+  const gap = atCut ? line.at(-1) : broke ? crossed : null;
   const lineSet = new Set(line);
   const msgs = new Set(line.filter((r) => r.message?.id && r.type === "assistant").map((r) => r.message.id));
   const queued = (r) => r.type === "attachment" && r.attachment?.type === "queued_command" && r.attachment.origin?.kind === "human" && r.attachment.prompt;
@@ -98,7 +118,8 @@ function oracle(lines) {
   }
   const low = line.length ? Math.min(...line.map((r) => r.at)) : Infinity;
   const region = new Set();
-  if (broke) for (const r of main) if (r.at < low && !on.has(r) && (isConv(r) || queued(r))) region.add(r);
+  if (broke || atCut) for (const r of main) if (r.at < low && !on.has(r) && (isConv(r) || queued(r))) region.add(r);
+  const summaries = new Set(gap ? main.filter((r) => (on.has(r) || region.has(r)) && r.type === "user" && r.isCompactSummary && r.parentUuid === gap.uuid) : []);
 
   // what each shows
   const isHuman = (r) => {
@@ -136,6 +157,9 @@ function oracle(lines) {
     if (o.msg) {
       const recs = main.filter((x) => x.type === "assistant" && x.message.id === o.msg && (on.has(x) || region.has(x))).sort((a, b) => a.at - b.at);
       if (recs.some(hasText) || recs.some(hasUse)) unitsNewestFirst.push({ recs, region: !!o.region, text: recs.flatMap((x) => x.message.content.filter((b) => b.type === "text" && b.text.trim()).map((b) => b.text)).join("\n"), uses: recs.flatMap((x) => x.message.content.filter((b) => b.type === "tool_use")) });
+    } else if (summaries.has(r)) {
+      const c = r.message.content;
+      unitsNewestFirst.push({ summary: true, text: (typeof c === "string" ? c : c.filter((b) => b.type === "text").map((b) => b.text).join("\n")).trim(), region: !!o.region });
     } else if (queued(r)) unitsNewestFirst.push({ user: true, mid: true, text: r.attachment.prompt, region: !!o.region });
     else if (isHuman(r)) unitsNewestFirst.push({ user: true, text: typeof r.message.content === "string" ? r.message.content : r.message.content.filter((b) => b.type === "text").map((b) => b.text).join("\n"), region: !!o.region });
   }
@@ -146,7 +170,7 @@ function oracle(lines) {
   let ranOn = false;
   let any = false;
   for (const u of unitsNewestFirst) {
-    if (u.user) {
+    if (u.user || u.summary) {
       ranOn = u.mid ? ranOn || any : false;
       any = textSeen = later = false;
       continue;
@@ -180,7 +204,7 @@ function oracle(lines) {
     if (isOn) {
       if (thinks(r)) count("thinking");
       else if (isNotice(r)) count("the app's own notices");
-      else if (r.type === "user" && r.isCompactSummary) count("compaction summaries");
+      else if (r.type === "user" && r.isCompactSummary && !summaries.has(r)) count("compaction summaries");
     } else if (r.type === "assistant" && r.isApiErrorMessage) count("the app's own notices");
     else if (isHuman(r) || queued(r)) count(OTHER);
     else if ((hasText(r) || hasUse(r)) && !counted.has(r.message.id)) {
@@ -188,15 +212,17 @@ function oracle(lines) {
       count(OTHER);
     }
   }
-  const visible = (u, tools) => u.user || u.kind === "final" || u.kind === "unfinished" || tools;
+  const visible = (u, tools) => u.user || u.summary || u.kind === "final" || u.kind === "unfinished" || tools;
   const render = (u, tools) => {
-    const label = u.user ? LABEL.user + (u.mid ? " (typed while the turn ran)" : "") : LABEL[u.kind];
+    const label = u.user ? LABEL.user + (u.mid ? " (typed while the turn ran)" : "") : u.summary ? LABEL.summary : LABEL[u.kind];
     const parts = [label];
     if (u.text) parts.push(u.text);
+    else if (u.summary) parts.push("(This summary couldn't be read.)");
     if (tools && u.tools?.length) parts.push(...u.tools);
     return parts.join("\n");
   };
-  return { units: unitsNewestFirst.reverse(), left, visible, render, broke };
+  const compaction = gap ? { state: atCut ? "cut" : "incomplete", summary: summaries.size > 0 } : null;
+  return { units: unitsNewestFirst.reverse(), left, visible, render, broke, compaction };
 }
 
 // ---------------------------------------------------------------- the generator
@@ -232,6 +258,7 @@ function generate(seed) {
   const use = (id) => ({ type: "tool_use", id, name: "Bash", input: { command: `c-${id}` } });
   const resultRec = (id, parent, err) => ({ uuid: uid(), parentUuid: parent, type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, is_error: err, content: "x" }] } });
   let tool = 0;
+  const boundaries = [];
   const turns = 2 + r(9);
   user(`q${seed}-0`);
   for (let t = 0; t < turns; t++) {
@@ -286,13 +313,15 @@ function generate(seed) {
         break;
       }
       case 9: {
-        // compaction
+        // compaction, sometimes with no summary, or one in text blocks
         const before = tip;
         const b = { uuid: uid(), parentUuid: null, logicalParentUuid: before, type: "system", subtype: "compact_boundary" };
         if (r(8) === 0) b.logicalParentUuid = [undefined, null, 5, `gone-${seed}`][r(4)];
         lines.push(b);
+        boundaries.push(b);
         tip = b.uuid;
-        push({ type: "user", isCompactSummary: true, message: { role: "user", content: "summary" } });
+        const said = `summary${seed}-${t}`;
+        if (r(5)) push({ type: "user", isCompactSummary: true, message: { role: "user", content: r(2) ? said : [{ type: "text", text: said }] } });
         break;
       }
       case 10: // the app's own, a subagent, a hook's note, a line that can't be read
@@ -333,6 +362,14 @@ function generate(seed) {
       }
     }
   }
+  // some boundaries point forward: to a later record, which may lead back round
+  // to them (as a session resumed after a compaction can be written), or to
+  // themselves
+  for (const b of boundaries)
+    if (r(4) === 0) {
+      const later = lines.slice(lines.indexOf(b)).filter((l) => typeof l === "object" && l.uuid);
+      b.logicalParentUuid = later[r(later.length)].uuid;
+    }
   return lines;
 }
 
@@ -345,6 +382,8 @@ async function readAll(w, opts) {
   const left = {};
   let resume;
   let uncertain = false;
+  const comps = [];
+  const withSummary = []; // by the page's own messages, not what it says about them
   let pages = 0;
   for (;;) {
     assert.ok(++pages < 2000, "it ends");
@@ -354,14 +393,28 @@ async function readAll(w, opts) {
     blocks.unshift(...onPage);
     for (const [k, v] of Object.entries(r.page.dropped)) if (!/include_tools/.test(k)) left[k] = (left[k] ?? 0) + v;
     uncertain ||= r.page.uncertain;
-    if (!r.page.more) return { blocks, left, uncertain };
+    comps.push(r.page.compaction ?? null);
+    withSummary.push(onPage.some((b) => b.split("\n")[0] === LABEL.summary));
+    if (!r.page.more) return { blocks, left, uncertain, comps, withSummary };
     assert.ok(r.page.pos, "a page with more has somewhere to go on from");
     resume = r.page.pos;
   }
 }
 
+// What every page of a read should say about a compaction whose earlier history
+// can't be reconstructed: nothing if there's none; otherwise its summary is on an
+// older page until the page whose messages hold it, then on a page already read,
+// or it's unavailable throughout
+function compactionSaid(c, { comps, withSummary }) {
+  if (!c) return comps.map(() => null);
+  if (!c.summary) return comps.map(() => ({ state: c.state, summary: "unavailable" }));
+  const at = withSummary.indexOf(true);
+  assert.ok(at >= 0 && withSummary.lastIndexOf(true) === at, "the summary is on exactly one page");
+  return comps.map((_, i) => ({ state: c.state, summary: i < at ? "older" : i > at ? "earlier" : "shown" }));
+}
+
 const seeds = Number(process.argv[2] ?? 300);
-let totals = { units: 0, rewound: 0, broken: 0, parallel: 0 };
+let totals = { units: 0, rewound: 0, broken: 0, parallel: 0, compactions: 0 };
 for (let seed = 1; seed <= seeds; seed++) {
   const lines = generate(seed);
   const w = write(lines);
@@ -376,11 +429,13 @@ for (let seed = 1; seed <= seeds; seed++) {
       assert.deepEqual(got.blocks, expected, `seed ${seed}, tools ${includeTools}, ${JSON.stringify(opts)}`);
       assert.deepEqual(got.left, o.left, `seed ${seed} counts, tools ${includeTools}, ${JSON.stringify(opts)}`);
       assert.equal(!!got.uncertain, o.units.some((u) => u.region), `seed ${seed}: warned exactly when a page holds uncertain history`);
+      assert.deepEqual(got.comps, compactionSaid(o.compaction, got), `seed ${seed}, ${JSON.stringify(opts)}: each page says where the summary is`);
     }
   }
+  if (o.compaction) totals.compactions++;
   if (seed % 50 === 0) clearIndexMemo();
 }
-console.log(`graph ${seeds} random transcripts, ${totals.units} messages, ${totals.rewound} with rewound branches, ${totals.broken} with broken links: each page size and budget tried gives exactly the oracle's messages, outcomes and counts`);
+console.log(`graph ${seeds} random transcripts, ${totals.units} messages, ${totals.rewound} with rewound branches, ${totals.broken} with broken links, ${totals.compactions} with history before a compaction that can't be reconstructed: each page size and budget tried gives exactly the oracle's messages, outcomes and counts`);
 
 // ------------------------------------------------------------ the named cases
 
@@ -462,6 +517,7 @@ const texts = (blocks) => blocks.map((b) => b.split("\n")[1]);
     assert.deepEqual(texts(r.blocks), ["older", "reply", "newer"], `logical parent ${what}: all shown`);
     assert.ok(r.uncertain, `logical parent ${what}: with the warning`);
     assert.ok(!r.left[OTHER], `logical parent ${what}: none called left`);
+    assert.deepEqual(r.comps, [{ state: "cut", summary: "unavailable" }], `logical parent ${what}: the page says there's no summary`);
   }
   // logicalParentUuid only at a boundary with no parent
   r = await read([U("u", null, "root"), A("x", "u", "mx", "off"), U("v", null, "second root", { logicalParentUuid: "x" }), A("w", "v", "mw", "end")]);
@@ -481,6 +537,7 @@ const texts = (blocks) => blocks.map((b) => b.split("\n")[1]);
   assert.deepEqual(texts(r.blocks).sort(), ["one", "two"]);
   assert.ok(r.uncertain);
   assert.ok(!r.left[OTHER]);
+  assert.deepEqual(r.comps, [null], "a cycle of parentUuids alone is a break, not a compaction");
   // a missing parent with two older rooted stretches behind it
   r = await read([U("u1", null, "older one"), A("a1", "u1", "m1", "reply one"), U("u2", null, "older two"), A("a2", "u2", "m2", "reply two"), U("t", "gone", "newest")]);
   assert.deepEqual(texts(r.blocks), ["older one", "reply one", "older two", "reply two", "newest"], "all of it, in file order");
@@ -533,6 +590,131 @@ const texts = (blocks) => blocks.map((b) => b.split("\n")[1]);
     }
   }
   console.log("graph named: late copies, rewinds, repeats, parallel calls and their results, compactions, trailing messages, broken links and cycles");
+}
+
+// history before a compaction that can't be reconstructed: the summary stands in,
+// and each page says where it is
+{
+  const Sum = (uuid, parentUuid, t) => U(uuid, parentUuid, t, { isCompactSummary: true });
+  const heads = (blocks) => blocks.map((b) => b.split("\n")[0]);
+  const SUMMARY = "### Summary written at a compaction, in place of earlier history";
+  const opts = [{ limit: 60 }, { limit: 1 }, { limit: 2 }, { limit: 1, budget: 1 }, { limit: 3, budget: 300 }];
+  // the same messages, counts and warning over every page size and budget
+  const steady = async (lines, what) => {
+    const w = write(lines);
+    const all = await readAll(w, { limit: 60, includeTools: false });
+    for (const o of opts.slice(1)) {
+      const got = await readAll(w, { ...o, includeTools: false });
+      assert.deepEqual(got.blocks, all.blocks, `${what}, ${JSON.stringify(o)}`);
+      assert.deepEqual(got.left, all.left, `${what} counts, ${JSON.stringify(o)}`);
+      assert.equal(got.uncertain, all.uncertain, `${what} warning, ${JSON.stringify(o)}`);
+      assert.deepEqual(got.comps, compactionSaid(all.comps[0] && { state: all.comps[0].state, summary: all.comps[0].summary !== "unavailable" }, got), `${what} notices, ${JSON.stringify(o)}`);
+    }
+    return { w, ...all };
+  };
+
+  // a resumed session: the logical parent is the current answer, written after
+  // the boundary, so boundary, summary and answer go round. The answer is still
+  // the newest message, and the summary stands in for what came before
+  let r = await steady([U("o", null, "old"), Boundary("b", "a"), Sum("s", "b", "what happened before"), A("a", "s", "ma", "current")], "resumed");
+  assert.deepEqual(texts(r.blocks), ["old", "what happened before", "current"]);
+  assert.deepEqual(heads(r.blocks), ["### User", SUMMARY, "### Assistant"]);
+  assert.ok(r.uncertain, "the older message can't be placed: it's shown with the warning");
+  assert.ok(!r.left[OTHER] && !r.left["compaction summaries"], "nothing called left, the summary shown, not counted");
+  assert.deepEqual(r.comps, [{ state: "cut", summary: "shown" }]);
+  {
+    const p = await readClaudePage(sessionOf(r.w), { limit: 60, includeTools: false });
+    const t = rc.pageText(p.meta, p.page, { first: true });
+    assert.match(t, /history before a compaction in this chat can't be reconstructed here; the summary written at that compaction is shown above in its place\. Tell the user/);
+    assert.match(t, /broken link, or a compaction it can't be followed back through/);
+  }
+  // a page at a time: on an older page, shown, then already read
+  {
+    const pages = [];
+    let resume;
+    for (;;) {
+      const p = await readClaudePage(sessionOf(r.w), { limit: 1, includeTools: false, resume });
+      pages.push({ head: p.page.text.split("\n")[0], summary: p.page.compaction.summary, uncertain: p.page.uncertain, text: rc.pageText(p.meta, p.page, { cursor: "c", first: !resume }) });
+      if (!p.page.more) break;
+      resume = p.page.pos;
+    }
+    assert.deepEqual(pages.map((p) => [p.head, p.summary, p.uncertain]), [["### Assistant", "older", false], [SUMMARY, "shown", false], ["### User", "earlier", true]]);
+    assert.match(pages[0].text, /the summary written at that compaction is on an older page: pass the cursor to reach it/);
+    assert.match(pages[2].text, /was on a page already read/);
+  }
+  // pointing at itself
+  r = await steady([U("u", null, "old"), A("a", "u", "ma", "reply"), Boundary("b", "b"), Sum("s", "b", "sum"), U("v", "s", "new")], "self");
+  assert.deepEqual(texts(r.blocks), ["old", "reply", "sum", "new"]);
+  assert.deepEqual(r.comps, [{ state: "cut", summary: "shown" }]);
+  assert.ok(r.uncertain);
+  // round through records in between
+  r = await steady([Boundary("b", "x"), Sum("s", "b", "sum"), U("v", "s", "question"), A("x", "v", "mx", "answer"), U("w", "x", "newest")], "round");
+  assert.deepEqual(texts(r.blocks), ["sum", "question", "answer", "newest"]);
+  assert.deepEqual(r.comps, [{ state: "cut", summary: "shown" }]);
+  assert.ok(!r.uncertain, "nothing older to place");
+  // two boundaries on one cycle: both cut, so the newest answer wins
+  const two = [Boundary("b1", "a2"), Sum("s1", "b1", "sum one"), A("a1", "s1", "m1", "one"), Boundary("b2", "a1"), Sum("s2", "b2", "sum two"), A("a2", "s2", "m2", "two")];
+  r = await steady(two, "two boundaries");
+  assert.deepEqual(texts(r.blocks), ["one", "sum two", "two"], "the older answer only as uncertain history, never as the newest");
+  assert.deepEqual(r.comps, [{ state: "cut", summary: "shown" }]);
+  assert.equal(r.left["compaction summaries"], 1, "the other boundary's summary is behind the cut, not standing in here");
+  assert.ok(r.uncertain);
+  // a logical parent that only leads into such a cycle is followed
+  r = await steady([...two, Boundary("b3", "s1"), Sum("s3", "b3", "sum three"), U("z", "s3", "after three")], "into a cycle");
+  assert.deepEqual(texts(r.blocks), ["sum one", "after three"], "b3 followed back to s1; b1 is cut, so its summary stands in");
+  assert.deepEqual(r.comps, [{ state: "cut", summary: "shown" }]);
+  assert.equal(r.left["compaction summaries"], 1, "b3's own summary isn't needed: its history was followed");
+  // a late copy of the logical parent that doesn't go round is followed, as before
+  r = await steady([U("u", null, "q"), A("a", "u", "ma", "ans"), Boundary("b", "a"), Sum("s", "b", "sum"), U("v", "s", "new q"), A("w", "v", "mw", "new ans"), A("a", "u", "ma", "ans")], "late copy");
+  assert.deepEqual(texts(r.blocks), ["q", "ans", "new q", "new ans"]);
+  assert.deepEqual(r.comps, [null]);
+  assert.equal(r.left["compaction summaries"], 1);
+  assert.ok(!r.uncertain);
+  // a missing logical parent with nothing older in the file
+  r = await steady([Boundary("b", "gone"), Sum("s", "b", "sum"), U("v", "s", "after")], "missing, alone");
+  assert.deepEqual(texts(r.blocks), ["sum", "after"]);
+  assert.deepEqual(r.comps, [{ state: "cut", summary: "shown" }]);
+  assert.ok(!r.uncertain, "no warning about a broken link: there's nothing to place, and the page says what's missing");
+  // the first step back works, the history breaks further back: the summary stands in too
+  r = await steady([U("p", "gone", "p text"), Boundary("b", "p"), Sum("s", "b", "sum"), U("n", "s", "new")], "break further back");
+  assert.deepEqual(texts(r.blocks), ["p text", "sum", "new"]);
+  assert.deepEqual(r.comps, [{ state: "incomplete", summary: "shown" }]);
+  {
+    const p = await readClaudePage(sessionOf(r.w), { limit: 60, includeTools: false });
+    assert.match(rc.pageText(p.meta, p.page, { first: true }), /can't be reconstructed here; the summary written at that compaction is shown above/, "said even with nothing uncertain shown");
+  }
+  // nested compactions with a break in the older one's history: only that one is incomplete
+  r = await steady([U("p", "gone", "old p"), Boundary("b1", "p"), Sum("s1", "b1", "sum one"), U("m", "s1", "middle"), Boundary("b2", "m"), Sum("s2", "b2", "sum two"), U("n", "s2", "newest")], "nested");
+  assert.deepEqual(texts(r.blocks), ["old p", "sum one", "middle", "newest"]);
+  assert.deepEqual(r.comps, [{ state: "incomplete", summary: "shown" }]);
+  assert.equal(r.left["compaction summaries"], 1, "the newer one's history was followed");
+  // no summary
+  r = await steady([Boundary("b", "gone"), U("v", "b", "after")], "no summary");
+  assert.deepEqual(texts(r.blocks), ["after"]);
+  assert.deepEqual(r.comps, [{ state: "cut", summary: "unavailable" }]);
+  {
+    const p = await readClaudePage(sessionOf(r.w), { limit: 60, includeTools: false });
+    assert.match(rc.pageText(p.meta, p.page, { first: true }), /its summary is unavailable here \(there is none, or it's too large to read\)\. Tell the user/);
+  }
+  // a summary too large to read
+  r = await read([Boundary("b", "gone"), Sum("s", "b", "z".repeat(MAX_RECORD + 10)), U("v", "s", "after")]);
+  assert.deepEqual(texts(r.blocks), ["after"]);
+  assert.deepEqual(r.comps, [{ state: "cut", summary: "unavailable" }]);
+  assert.equal(r.left["records too large to read"], 1);
+  // a summary in text blocks, and one cut like any message
+  r = await read([Boundary("b", "gone"), U("s", "b", [{ type: "text", text: "in blocks" }], { isCompactSummary: true }), U("v", "s", "after")]);
+  assert.deepEqual(texts(r.blocks), ["in blocks", "after"]);
+  {
+    const w = write([Boundary("b", "gone"), Sum("s", "b", "y".repeat(30_000)), U("v", "s", "after")]);
+    const p = await readClaudePage(sessionOf(w), { limit: 60, includeTools: false });
+    assert.equal(p.page.cut, 1);
+    assert.match(p.page.text, /\(cut at 25000 characters\)/);
+  }
+  // a summary ends the turn before it: the older answer is still an answer
+  r = await read([U("u", null, "old q"), A("a", "u", "ma", "old answer"), Boundary("b", "gone"), Sum("s", "b", "sum"), A("n", "s", "mn", "new answer")]);
+  assert.deepEqual(texts(r.blocks), ["old q", "old answer", "sum", "new answer"]);
+  assert.deepEqual(heads(r.blocks), ["### User", "### Assistant", SUMMARY, "### Assistant"]);
+  console.log("graph compactions: a cycle through boundaries is cut at each, so the newest message stays the newest; a summary stands in wherever the history before it can't be reconstructed, and each page says where it is");
 }
 
 // the kinds of a turn

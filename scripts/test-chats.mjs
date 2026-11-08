@@ -232,6 +232,33 @@ async function readAll(pageFn) {
   fs.appendFileSync(s.file, lines([same("E", "D")]));
   const p2 = await page(s.id, { resume: p1.page.pos, limit: 2 });
   assert.match(p2.page.text, /A[\s\S]*B/, "an addition at the end changes nothing");
+  // a changed cursor: the right unit, another place or length. Refused before
+  // the file is read at that place, so it can't make the server read (or
+  // allocate) what it names
+  {
+    const big = session(row(...Array.from({ length: 300 }, (_, i) => `m${i} ${"x".repeat(1000)}`)));
+    const b1 = await page(big.id, { limit: 2 });
+    const size = fs.statSync(big.file).size;
+    assert.ok(size > 256 * 1024);
+    const reads = [];
+    const open = fs.promises.open;
+    fs.promises.open = async (...args) => {
+      const fh = await open(...args);
+      const read = fh.read.bind(fh);
+      fh.read = (buf, off, length, position) => (reads.push(length), read(buf, off, length, position));
+      return fh;
+    };
+    try {
+      for (const r of [{ n: size - b1.page.pos.o }, { o: 0, n: size }, { n: b1.page.pos.n + 1 }, { o: b1.page.pos.o + 1 }]) {
+        reads.length = 0;
+        assert.ok((await page(big.id, { resume: { ...b1.page.pos, ...r }, limit: 2 })).moved, JSON.stringify(r));
+        assert.ok(reads.every((n) => n <= 64 * 1024), `nothing read at the cursor's length: ${JSON.stringify(r)} read ${Math.max(0, ...reads)}`);
+      }
+      assert.ok(!(await page(big.id, { resume: b1.page.pos, limit: 2 })).moved, "the cursor as it was still goes on");
+    } finally {
+      fs.promises.open = open;
+    }
+  }
   // a tool step on the next page keeps the result that lies past the cursor
   const t = session([R.user("go"), R.asst("x", [R.use("u1", "Bash", { command: "npm test" })]), R.user("typed"), R.result("u1"), R.asst("y", [R.text("ok")])]);
   const a = await page(t.id, { limit: 2, includeTools: true });
@@ -503,6 +530,11 @@ const findG = async (s, crit) => {
     { ...good, r: { ...good.r, d: "" } },
     { ...good, r: { ...good.r, c: -1 } },
     { ...good, r: { ...good.r, c: null } },
+    { ...good, r: { ...good.r, n: MAX_RECORD + 1 } },
+    { ...good, r: { ...good.r, n: 1e9 } },
+    { ...good, r: { ...good.r, n: 2 ** 53 } },
+    { ...good, r: { ...good.r, o: 2 ** 53 } },
+    { ...good, r: { ...good.r, n: 1.5 } },
   ])
     assert.equal(rc.decodeCursor(rc.encodeCursor(bad), "claude"), null, JSON.stringify(bad));
   assert.equal(rc.decodeCursor(rc.encodeCursor({ ...good, to: "chatgpt", r: { pc: 1, b: "x" } }), "chatgpt"), null);
@@ -604,6 +636,11 @@ const findG = async (s, crit) => {
   assert.ok(!same.partial.claude.includes("same-hidden"));
   assert.equal(rc.pickOne(same), null, "an unreadable title stops the automatic read");
   assert.equal((await claudeMeta(await sessionOf("same-ok"))).name, "Same", "a missing title file is still just missing");
+  // gone again, so the folder in its place isn't a third problem below
+  fs.rmSync(path.join(path.dirname(hidden.file), "same-hidden"), { recursive: true });
+  fs.rmSync(hidden.file);
+  fs.rmSync(path.join(path.dirname(hidden.file), "same-ok.jsonl"));
+  assert.deepEqual((await find({ name: "only" })).problems, [], "nothing left over from the cases above (checked on every platform)");
   if (process.platform !== "win32" && process.getuid?.() !== 0) {
     const locked = path.join(root, "projects", "locked");
     fs.mkdirSync(locked);

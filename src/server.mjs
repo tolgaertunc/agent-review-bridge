@@ -760,6 +760,10 @@ server.registerTool(
       crit = c.crit;
       after = c.after;
     }
+    // an id reads that chat whatever else is said: a stale id beside a new name
+    // would read the wrong one without a word
+    if (!crit && a.id && (a.name !== undefined || a.folder !== undefined || a.archived !== undefined))
+      return text("[AGENT-REVIEW-BRIDGE] Give a name or an id, not both: an id reads that chat directly, and name, folder and archived only find one. Leave out whichever is stale.");
     if (!crit && a.id) return readOne({ id: a.id, includeTools: !!a.include_tools, limit });
     if (!crit) {
       if (!a.name) return text("[AGENT-REVIEW-BRIDGE] Say which chat: its name or its id.");

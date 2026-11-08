@@ -12,7 +12,10 @@
 //
 // The rules follow the Agent SDK's reader, except that compaction is followed
 // back through logicalParentUuid: this tool reads the original history and leaves
-// summaries out, where the SDK shows the summary instead.
+// that compaction's summary out, where the SDK shows the summary instead. Where the
+// history before a compaction can't be followed (no logical parent, one that comes
+// back round to the boundary, or a break further back in what it leads to), the
+// summary is shown in its place, as the SDK does, and the page says so.
 
 import fs from "node:fs";
 import crypto from "node:crypto";
@@ -475,7 +478,10 @@ const outcomes = (core, others) => (id) => {
   return seen.size > 1 ? "unclear" : seen.has(true) ? "failed" : "done";
 };
 
-// The conversation as it stands: { units, branch, omitted, outcome, broke }.
+// The conversation as it stands: { units, branch, omitted, outcome, broke,
+// compaction }. compaction is null, or { state: "cut" | "incomplete", summary }
+// for the compaction whose earlier history can't be reconstructed, with the key
+// of its summary's unit, or null when there's none to show.
 // units is newest first, one per message. branch is every record that belongs to
 // it, newest first, and a unit's `bi` is its place there. Everything is linear in
 // the number of records, and yields as it goes.
@@ -488,26 +494,61 @@ export async function resolve(idx) {
     const r = idx.records.get(u);
     return r && !(r.f & F.SIDE) ? r : null;
   };
-  // the step back from a record: another record, null at a true root, BREAK if
-  // the history can't be followed from here
+  // A compaction's boundary has no parent; its step back is its logical parent,
+  // the history before the compaction. A boundary is cut when that can't be
+  // followed: no logical parent is named or found, or following it comes back
+  // round to the boundary (a session resumed after a compaction can be written
+  // so). The walk stops at a cut boundary as at a root, and its summary stands in
+  // for what came before.
+  const cut = new Set();
+  const compacted = (rec) => rec.p === null && rec.f & F.BOUNDARY;
+  // the step back from a record: another record, null at a true root or a cut
+  // boundary, BREAK if the history can't be followed from here
   const stepBack = (rec) => {
     if (typeof rec.p === "string") return by(rec.p) ?? BREAK;
     if (rec.p === undefined) return BREAK;
-    // a boundary continues the history before it: with no way back, that history
-    // isn't known to be gone, so this is a break, not a root
-    if (rec.f & F.BOUNDARY) return typeof rec.l === "string" ? (by(rec.l) ?? BREAK) : BREAK;
+    if (rec.f & F.BOUNDARY) return cut.has(rec) ? null : by(rec.l);
     return null;
   };
 
-  // who has children
-  const parents = new Set();
   const main = [];
   for (const rec of idx.records.values()) {
     await breathe();
     if (rec.f & F.SIDE) continue;
     main.push(rec);
-    if (typeof rec.p === "string") parents.add(rec.p);
-    if (rec.p === null && rec.f & F.BOUNDARY && typeof rec.l === "string") parents.add(rec.l);
+    if (compacted(rec) && !(typeof rec.l === "string" && by(rec.l))) cut.add(rec);
+  }
+
+  // Each record has one step back, so each part of the graph has at most one
+  // cycle. One through a boundary's logical parent is cut at every boundary on
+  // it: cutting one can leave another pointing back past the newest message, and
+  // none of their history goes anywhere but round. Logical parents that only
+  // lead into a cycle are kept. A cycle of parentUuids alone stays a break.
+  // (The marks go before `near` grows, so the peak stays what viewBytes counts.)
+  {
+    const mark = new Map(); // place on the path being walked, or -1 once done
+    for (const start of main) {
+      if (mark.has(start)) continue;
+      const path = [];
+      let cur = start;
+      while (isRec(cur) && !mark.has(cur)) {
+        await breathe();
+        mark.set(cur, path.length);
+        path.push(cur);
+        cur = stepBack(cur);
+      }
+      const at = isRec(cur) ? mark.get(cur) : -1;
+      if (at >= 0) for (let i = at; i < path.length; i++) if (compacted(path[i])) cut.add(path[i]);
+      for (const r of path) mark.set(r, -1);
+    }
+  }
+
+  // who has children, by those same steps
+  const parents = new Set();
+  for (const rec of main) {
+    await breathe();
+    const back = stepBack(rec);
+    if (isRec(back)) parents.add(back);
   }
 
   // the nearest conversation record at or behind a record: each is walked once
@@ -541,7 +582,7 @@ export async function resolve(idx) {
   let leaf = null;
   for (const rec of main) {
     await breathe();
-    if (parents.has(rec.u)) continue;
+    if (parents.has(rec)) continue;
     const l = nearest(rec);
     if (l && (!leaf || l.o > leaf.o)) leaf = l;
   }
@@ -550,6 +591,10 @@ export async function resolve(idx) {
   const core = [];
   const coreSet = new Set();
   let broke = !leaf;
+  // the boundary whose logical parent the walk followed last: a break further
+  // back is in the history before that compaction, which then isn't whole. One
+  // crossed earlier did reach the next boundary back, so its own history is.
+  let crossed = null;
   let cur = leaf;
   while (cur) {
     await breathe();
@@ -560,8 +605,13 @@ export async function resolve(idx) {
       broke = true;
       break;
     }
+    if (isRec(back) && compacted(cur)) crossed = cur;
     cur = back;
   }
+  // the compaction whose history before it can't be reconstructed, if any: the
+  // walk ends either at a cut boundary or at a break, so there is one at most
+  const ended = core.at(-1);
+  const gap = ended && cut.has(ended) ? { boundary: ended, state: "cut" } : broke && crossed ? { boundary: crossed, state: "incomplete" } : null;
 
   // what else belongs to the messages on it, wherever it lies in the file: the
   // other records of a parallel call, and their results
@@ -633,10 +683,10 @@ export async function resolve(idx) {
     put(r);
   }
 
-  // past a break nothing is known about how older records relate: all of them
-  // are shown, in file order, and none is called abandoned
+  // past a break, or a cut boundary, nothing is known about how older records
+  // relate: all of them are shown, in file order, and none is called abandoned
   const certainEnd = branch.length;
-  if (broke) {
+  if (broke || gap?.state === "cut") {
     let low = Infinity;
     for (const r of core) if (r.o < low) low = r.o;
     for (let i = main.length - 1; i >= 0; i--) {
@@ -646,6 +696,21 @@ export async function resolve(idx) {
     }
   }
 
+  // that compaction's summary, which is then shown: the newest is the one named.
+  // One too large to read was never parsed, so isn't known to be one: it's
+  // counted as too large, and the page says the summary is unavailable.
+  const shownSummary = new Set();
+  let compaction = null;
+  if (gap) {
+    let summary = null;
+    for (const r of branch) {
+      if (!(r.f & F.SUMMARY) || r.f & F.HUGE || r.p !== gap.boundary.u) continue;
+      shownSummary.add(r);
+      summary ??= r.u;
+    }
+    compaction = { state: gap.state, summary };
+  }
+
   // one unit per message
   const units = [];
   const unitOfMsg = new Map();
@@ -653,7 +718,9 @@ export async function resolve(idx) {
     await breathe();
     const r = branch[bi];
     if (r.f & (F.TEAM | F.HUGE)) continue;
-    if (r.f & (F.HUMAN | F.QUEUED)) {
+    if (shownSummary.has(r)) {
+      units.push({ key: r.u, kind: "summary", members: [r], bi, min: r.o, uncertain: bi >= certainEnd });
+    } else if (r.f & (F.HUMAN | F.QUEUED)) {
       units.push({ key: r.u, kind: "user", members: [r], bi, min: r.o, midTurn: !!(r.f & F.QUEUED), uncertain: bi >= certainEnd });
     } else if (r.m && r.f & (F.TEXT | F.USE)) {
       let u = unitOfMsg.get(r.m);
@@ -680,7 +747,8 @@ export async function resolve(idx) {
   let ranOn = false;
   let any = false;
   for (const u of units) {
-    if (u.kind === "user") {
+    // a summary ends the stretch before it, as a message the user sent does
+    if (u.kind === "user" || u.kind === "summary") {
       if (u.midTurn) ranOn = ranOn || any;
       else ranOn = false;
       any = false;
@@ -709,7 +777,7 @@ export async function resolve(idx) {
       if (r.f & F.TEAM) omitted[R.SUBAGENT].push(r.o);
       else if (r.f & F.THINK) omitted[R.THINKING].push(r.o);
       else if (r.f & F.NOTICE) omitted[R.NOTICE].push(r.o);
-      else if (r.f & F.SUMMARY) omitted[R.SUMMARY].push(r.o);
+      else if (r.f & F.SUMMARY && !shownSummary.has(r)) omitted[R.SUMMARY].push(r.o);
     } else if (r.f & F.API_ERROR) omitted[R.NOTICE].push(r.o);
     else if (r.f & F.TEAM && r.f & (F.HUMAN | F.TEXT | F.USE)) omitted[R.SUBAGENT].push(r.o);
     else if (r.f & (F.HUMAN | F.QUEUED)) omitted[R.OTHER_BRANCH].push(r.o);
@@ -724,7 +792,7 @@ export async function resolve(idx) {
   const byKey = new Map(units.map((u, i) => [u.key, i]));
   let viewBytes = 200 + branch.length * 48 + units.length * 220 + near.size * 48 + (coreResults.size + otherResults.size) * 100 + byMsg.size * 120 + owners.size * 100;
   for (const list of Object.values(omitted)) viewBytes += list.length * 8;
-  return { units, branch, omitted, outcome, broke, byKey, viewBytes, certainEnd };
+  return { units, branch, omitted, outcome, broke, compaction, byKey, viewBytes, certainEnd };
 }
 
 // What a cursor checks, so it can't go on in a history that changed under it: every
