@@ -14,6 +14,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { findCodexCli, openUrl, dataDir } from "./platform.mjs";
+import { assemble, normalizeName, inFolder } from "./readchat.mjs";
 
 // No call waits for ever: an app-server that doesn't answer is given up on
 const RPC_MS = 60_000;
@@ -267,6 +268,188 @@ export async function turnOf(threadId, clientId, { timeoutMs = 15_000, ...opts }
     },
     { deadlineMs: timeoutMs, ...opts },
   );
+}
+
+// ------------------------------------------------- chats, for bridge_read_chat
+// Read-only calls (measured on 0.166, also with the app closed): thread/list
+// (names, paged, archived too), thread/items/list (sortDirection "desc" pages
+// newest first; a cursor gives the same page again) and thread/read.
+
+// One app-server session for a whole bridge_read_chat call
+export const withChatgpt = (fn, opts) => withServer(fn, { deadlineMs: 60_000, ...opts });
+
+export class ChatMovedError extends Error {}
+
+// A search of ChatGPT's chats, in the time it has left: startup and the work get
+// that time each, so about twice that at worst. With none left, nothing starts.
+export async function searchChatgpt(args, { open = withChatgpt } = {}) {
+  const left = args.deadline - Date.now();
+  if (!(left > 0)) return { complete: false, scope: "none searched (time limit reached)" };
+  return open((s) => findChatgpt(s, args), { deadlineMs: left });
+}
+
+// What thread/read answers, as measured, for a well-formed id it doesn't have and
+// for a malformed one (it does read existing and archived threads that weren't
+// loaded). Anything else is the app not answering, never "no such chat".
+const NO_SUCH_THREAD = /^(?:thread not loaded: |invalid thread id: )/;
+class NoSuchThread extends Error {}
+
+const RAW_PAGE = 50;
+export const RAW_BUDGET = 20; // raw pages per read call
+
+// a missing method, in any version
+const cantList = (e) =>
+  e.code === -32601 || /unknown variant `thread\//.test(e.message) ? new Error("this ChatGPT version can't list its chats") : e;
+
+const threadName = (t) => t.name || (t.preview ? `(untitled) ${t.preview.replace(/\s+/g, " ").slice(0, 60)}` : "(untitled)");
+const asChat = (t, archived) => ({
+  app: "chatgpt",
+  id: t.id,
+  name: threadName(t),
+  folder: t.cwd ?? null,
+  updated: t.updatedAt ? t.updatedAt * 1000 : null,
+  ...(archived && { archived: true }),
+});
+
+export async function chatgptMeta(s, id) {
+  try {
+    return asChat((await s.rpc("thread/read", { threadId: id })).thread);
+  } catch (e) {
+    if (e.code === -32600 && NO_SUCH_THREAD.test(e.message ?? "")) throw new NoSuchThread();
+    throw cantList(e);
+  }
+}
+
+// By name and/or folder, over every thread (archived ones in a second pass),
+// newest first. Only the deadline stops it, and then it says so.
+export async function findChatgpt(s, { name, folder, archived, add, deadline = Infinity }) {
+  const want = name ? normalizeName(name) : null;
+  let seen = 0;
+  try {
+    for (const arch of archived ? [false, true] : [false]) {
+      let cursor = null;
+      do {
+        if (Date.now() > deadline) return { complete: false, scope: `${seen} chats, the newest (time limit reached)` };
+        const r = await s.rpc("thread/list", { limit: 100, ...(arch && { archived: true }), ...(cursor && { cursor }) });
+        for (const t of r.data ?? []) {
+          seen++;
+          const c = asChat(t, arch);
+          if ((!folder || inFolder(c.folder, folder)) && (!want || normalizeName(c.name).includes(want))) add(c);
+        }
+        cursor = r.nextCursor ?? null;
+      } while (cursor);
+    }
+    return { complete: true, scope: `${seen} chats${archived ? " (archived too)" : ""}` };
+  } catch (e) {
+    throw cantList(e);
+  }
+}
+
+const cmdShort = (s) => {
+  const t = String(s ?? "").replace(/\s+/g, " ").trim();
+  return t.length > 160 ? `${t.slice(0, 160)}…` : t;
+};
+
+// The app's own context around what the user typed (measured: an
+// <in-app-browser-context source="ambient-ui-state"> block, then "## My
+// request:"), left out like the app's notices on the Claude side
+const AMBIENT = /<([a-z][\w-]*-context)\b[^>]*source="ambient[^"]*"[^>]*>[\s\S]*?<\/\1>/g;
+const userText = (t) => {
+  const s = t.replace(AMBIENT, "").trim();
+  return s === t.trim() ? t : s.replace(/^##\s*My request:\s*/i, "");
+};
+
+// One thread item as a unit (see src/readchat.mjs)
+export function itemUnit({ item }) {
+  const key = item.id;
+  const at = item.startedAtMs ?? null;
+  switch (item.type) {
+    case "userMessage": {
+      const text = (item.content ?? []).map((c) => (c.type === "text" ? userText(c.text) : `[${c.type}]`)).join("\n");
+      return { key, kind: "user", at, text };
+    }
+    case "agentMessage":
+      if (!item.text?.trim()) return { key, kind: "drop:" };
+      return { key, kind: item.phase === "commentary" ? "interim" : "final", at, text: item.text };
+    case "reasoning":
+      return { key, kind: "drop:thinking" };
+    case "commandExecution": {
+      const cmd = item.commandActions?.map((a) => a.command).join("; ") || item.command;
+      const outcome = item.exitCode != null ? `exit ${item.exitCode}` : item.status === "completed" ? "done" : `${item.status ?? "no result recorded"} (an attempt)`;
+      return { key, kind: "tool", at, tools: [`ran: ${cmdShort(cmd)} (${outcome})`] };
+    }
+    case "fileChange": {
+      const files = (item.changes ?? []).map((c) => `${c.kind?.type ?? "change"} ${c.path}`).join(", ");
+      const outcome = item.status === "completed" ? "applied" : `${item.status ?? "no result recorded"} (an attempt)`;
+      return { key, kind: "tool", at, tools: [`edited: ${cmdShort(files)} (${outcome})`] };
+    }
+    case "webSearch":
+      return { key, kind: "tool", at, tools: [`searched the web: ${cmdShort(item.action?.queries?.join(" | ") || item.query)}`] };
+    case "mcpToolCall":
+      return { key, kind: "tool", at, tools: [`called ${item.server}.${item.tool} (${item.error ? "failed" : (item.status ?? "no result recorded")})`] };
+    default:
+      return { key, kind: "tool", at, tools: [`${item.type}`] };
+  }
+}
+
+// Units newest first, as { unit, pos } where pos = { pc, b }: the provider
+// cursor that fetched the raw page holding the unit, and the unit's id. A
+// resume fetches that page again and goes on after b. New items arrive at the
+// newest end, so a cursor-fetched page stays put; the very first page (pc
+// null) can shift, and then b is looked for from the newest on. Not found
+// within the budget: ChatMovedError, never a skip.
+export async function* chatgptStream(s, threadId, resume, { budget = RAW_BUDGET } = {}) {
+  let pc = resume ? resume.pc : null;
+  let seeking = resume ? resume.b : null;
+  let fromNewest = !resume || resume.pc === null;
+  let pages = 0;
+  for (;;) {
+    if (pages >= budget) {
+      if (seeking) throw new ChatMovedError();
+      yield { budget: true };
+      return;
+    }
+    let r;
+    try {
+      r = await s.rpc("thread/items/list", { threadId, limit: RAW_PAGE, sortDirection: "desc", ...(pc && { cursor: pc }) });
+    } catch (e) {
+      throw cantList(e);
+    }
+    pages++;
+    let data = r.data ?? [];
+    if (seeking) {
+      const i = data.findIndex((d) => d.item?.id === seeking);
+      if (i === -1) {
+        if (!fromNewest) {
+          // the page it was on is gone: look from the newest on
+          fromNewest = true;
+          pc = null;
+          continue;
+        }
+        if (!r.nextCursor) throw new ChatMovedError();
+        pc = r.nextCursor;
+        continue;
+      }
+      data = data.slice(i + 1);
+      seeking = null;
+    }
+    for (const d of data) yield { unit: itemUnit(d), pos: { pc, b: d.item.id } };
+    if (!r.nextCursor) return;
+    pc = r.nextCursor;
+  }
+}
+
+// One page of a thread on a given session: { meta, page }, { moved: true }, or
+// { missing: true } if there's no such thread
+export async function readChatgptPage(s, id, { resume, limit, includeTools, budget }) {
+  try {
+    const meta = await chatgptMeta(s, id);
+    return { meta, page: await assemble(chatgptStream(s, id, resume, { budget }), { limit, includeTools }) };
+  } catch (e) {
+    if (e instanceof ChatMovedError) return { moved: true };
+    if (e instanceof NoSuchThread) return { missing: true };
+    throw e;
+  }
 }
 
 export function listQueue(threadId, opts) {

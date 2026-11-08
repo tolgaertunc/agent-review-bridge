@@ -27,7 +27,7 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.AGENT_REVIEW_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 16);
+export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 17);
 
 export const SIDES = ["claude", "openai"];
 // Claude Desktop's session ids, as claude://code/continue?session= accepts them
@@ -1055,6 +1055,21 @@ class BrokerState {
   op_send_target({ endpoint, replyTo }) {
     const { link, to } = this.sendTarget(endpoint, undefined, replyTo);
     return { to, linkId: link.id };
+  }
+
+  // A chat the bridge itself created to review or advise: it stays one after
+  // its link closes, so bridge_read_chat can refuse it for good
+  op_reviewer_chat({ endpoint }) {
+    if (!endpoint?.app || !endpoint?.id) throw new Error("this chat is unknown");
+    this.s.reviewerChats = { ...(this.s.reviewerChats ?? {}), [`${endpoint.app}:${endpoint.id}`]: Date.now() };
+    return { ok: true };
+  }
+
+  // May this chat read the user's other chats? Not one the bridge created to
+  // review or advise, nor one reviewing or advising through an open link
+  op_read_chat_allowed({ endpoint }) {
+    if (this.s.reviewerChats?.[`${endpoint.app}:${endpoint.id}`]) return { allowed: false };
+    return { allowed: !Object.values(this.s.links).some((l) => l.active && sameEndpoint(l.advisor, endpoint)) };
   }
 
   // Claude Desktop's own id for a Claude Code session (claude://code/continue
