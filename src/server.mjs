@@ -736,7 +736,7 @@ server.registerTool(
       ...(READ_TARGET === "chatgpt" && { archived: z.boolean().optional().describe("Also look in ChatGPT's archived chats") }),
       cursor: z.string().optional().describe("The cursor a previous call returned: to read further back in the same chat, or to list more of the same matches"),
       limit: z.number().int().min(1).max(rc.MAX_LIMIT).optional().describe(`Messages per page of a chat (default ${rc.PAGE_LIMIT})`),
-      include_tools: z.boolean().optional().describe("Also show the chat's tool steps and the text between them"),
+      include_tools: z.boolean().optional().describe("Also show the chat's tool steps (one line each, never their output) and the text between them"),
     },
     annotations: READ_ONLY,
   },

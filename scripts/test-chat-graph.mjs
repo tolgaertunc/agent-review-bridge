@@ -119,7 +119,19 @@ function oracle(lines) {
   const low = line.length ? Math.min(...line.map((r) => r.at)) : Infinity;
   const region = new Set();
   if (broke || atCut) for (const r of main) if (r.at < low && !on.has(r) && (isConv(r) || queued(r))) region.add(r);
-  const summaries = new Set(gap ? main.filter((r) => (on.has(r) || region.has(r)) && r.type === "user" && r.isCompactSummary && r.parentUuid === gap.uuid) : []);
+  // a summary belongs to that compaction if it hangs off its boundary by
+  // parentUuid, directly or through records that aren't messages: tried from
+  // each summary on its own, never by a logical parent
+  const hangsOff = (s, b) => {
+    const seen = new Set();
+    for (let c = get(s.parentUuid); c; c = get(c.parentUuid)) {
+      if (c === b) return true;
+      if (seen.has(c) || isConv(c) || queued(c) || (c.type === "system" && c.subtype === "compact_boundary")) return false;
+      seen.add(c);
+    }
+    return false;
+  };
+  const summaries = new Set(gap ? main.filter((r) => (on.has(r) || region.has(r)) && r.type === "user" && r.isCompactSummary && hangsOff(r, gap)) : []);
 
   // what each shows
   const isHuman = (r) => {
@@ -222,7 +234,8 @@ function oracle(lines) {
     return parts.join("\n");
   };
   const compaction = gap ? { state: atCut ? "cut" : "incomplete", summary: summaries.size > 0 } : null;
-  return { units: unitsNewestFirst.reverse(), left, visible, render, broke, compaction };
+  const chained = [...summaries].some((s) => s.parentUuid !== gap.uuid);
+  return { units: unitsNewestFirst.reverse(), left, visible, render, broke, compaction, chained };
 }
 
 // ---------------------------------------------------------------- the generator
@@ -320,6 +333,27 @@ function generate(seed) {
         lines.push(b);
         boundaries.push(b);
         tip = b.uuid;
+        // often records that aren't messages between the boundary and its
+        // summary, as newer versions write them; rarely a message or a queued
+        // prompt, or one whose link leads nowhere or to itself
+        switch (r(6)) {
+          case 0:
+          case 1:
+          case 2: {
+            const k = 1 + r(3);
+            for (let i = 0; i < k; i++) push([{ type: "attachment", attachment: { type: "skill_listing" } }, { type: "system", subtype: "turn_duration" }, { type: "progress" }][r(3)]);
+            break;
+          }
+          case 3:
+            if (r(3) === 0) push([{ type: "user", message: { role: "user", content: `between${seed}-${t}` } }, { type: "attachment", attachment: { type: "queued_command", prompt: `typed-between${seed}-${t}`, origin: { kind: "human" } } }][r(2)]);
+            break;
+          case 4:
+            if (r(3) === 0) {
+              const x = push({ type: "attachment", attachment: { type: "skill_listing" } });
+              x.parentUuid = r(2) ? `gone-between-${seed}-${t}` : x.uuid;
+            }
+            break;
+        }
         const said = `summary${seed}-${t}`;
         if (r(5)) push({ type: "user", isCompactSummary: true, message: { role: "user", content: r(2) ? said : [{ type: "text", text: said }] } });
         break;
@@ -414,7 +448,7 @@ function compactionSaid(c, { comps, withSummary }) {
 }
 
 const seeds = Number(process.argv[2] ?? 300);
-let totals = { units: 0, rewound: 0, broken: 0, parallel: 0, compactions: 0 };
+let totals = { units: 0, rewound: 0, broken: 0, parallel: 0, compactions: 0, chained: 0 };
 for (let seed = 1; seed <= seeds; seed++) {
   const lines = generate(seed);
   const w = write(lines);
@@ -433,9 +467,10 @@ for (let seed = 1; seed <= seeds; seed++) {
     }
   }
   if (o.compaction) totals.compactions++;
+  if (o.chained) totals.chained++;
   if (seed % 50 === 0) clearIndexMemo();
 }
-console.log(`graph ${seeds} random transcripts, ${totals.units} messages, ${totals.rewound} with rewound branches, ${totals.broken} with broken links, ${totals.compactions} with history before a compaction that can't be reconstructed: each page size and budget tried gives exactly the oracle's messages, outcomes and counts`);
+console.log(`graph ${seeds} random transcripts, ${totals.units} messages, ${totals.rewound} with rewound branches, ${totals.broken} with broken links, ${totals.compactions} with history before a compaction that can't be reconstructed (${totals.chained} with its summary under records that aren't messages): each page size and budget tried gives exactly the oracle's messages, outcomes and counts`);
 
 // ------------------------------------------------------------ the named cases
 
@@ -714,7 +749,58 @@ const texts = (blocks) => blocks.map((b) => b.split("\n")[1]);
   r = await read([U("u", null, "old q"), A("a", "u", "ma", "old answer"), Boundary("b", "gone"), Sum("s", "b", "sum"), A("n", "s", "mn", "new answer")]);
   assert.deepEqual(texts(r.blocks), ["old q", "old answer", "sum", "new answer"]);
   assert.deepEqual(heads(r.blocks), ["### User", "### Assistant", SUMMARY, "### Assistant"]);
-  console.log("graph compactions: a cycle through boundaries is cut at each, so the newest message stays the newest; a summary stands in wherever the history before it can't be reconstructed, and each page says where it is");
+
+  // a summary under records that aren't messages, as newer versions write it
+  const Att = (uuid, parentUuid, extra = {}) => ({ uuid, parentUuid, type: "attachment", attachment: { type: "skill_listing", ...extra } });
+  const Prog = (uuid, parentUuid) => ({ uuid, parentUuid, type: "progress" });
+  // the shape found on a Mac: three attachments, the logical parent written after
+  r = await steady([U("o", null, "old"), Boundary("b", "l"), Att("t1", "b"), Att("t2", "t1"), Att("t3", "t2"), Sum("s", "t3", "sum"), A("a", "s", "ma", "current"), Att("l", "a")], "attachments, cut");
+  assert.deepEqual(texts(r.blocks), ["old", "sum", "current"]);
+  assert.deepEqual(r.comps, [{ state: "cut", summary: "shown" }]);
+  assert.ok(!r.left["compaction summaries"], "shown, not counted");
+  // system and progress records between, and a break further back
+  r = await steady([U("p", "gone", "p text"), Boundary("b", "p"), Att("t1", "b"), Sys("y", "t1", "turn_duration"), Prog("g", "y"), Sum("s", "g", "sum"), U("n", "s", "new")], "attachments, incomplete");
+  assert.deepEqual(texts(r.blocks), ["p text", "sum", "new"]);
+  assert.deepEqual(r.comps, [{ state: "incomplete", summary: "shown" }]);
+  // what stops the chain: each time the compaction has a gap and the summary is
+  // on the branch (it's counted as left out), so the match was tried and refused
+  const refused = async (lines, what, shown) => {
+    const got = await steady(lines, what);
+    assert.deepEqual(texts(got.blocks), shown, `${what}: messages`);
+    assert.equal(got.comps[0]?.state, "cut", `${what}: the compaction has a gap`);
+    assert.deepEqual(got.comps, [{ state: "cut", summary: "unavailable" }], `${what}: no summary for it`);
+    assert.equal(got.left["compaction summaries"], 1, `${what}: the summary was on the branch, and isn't this compaction's`);
+    return got;
+  };
+  await refused([Boundary("b", "gone"), U("m", "b", "between"), Sum("s", "m", "sum"), U("v", "s", "after")], "a message between", ["between", "after"]);
+  await refused([Boundary("b", "gone"), Q("q", "b", "typed"), Sum("s", "q", "sum"), U("v", "s", "after")], "a queued prompt between", ["typed", "after"]);
+  await refused([Boundary("b1", "gone"), U("m", "b1", "middle"), Boundary("b2", "m"), Att("t", "b2"), Sum("s", "t", "sum two"), U("v", "s", "after")], "another boundary's summary", ["middle", "after"]);
+  // behind the cut, in what's shown as uncertain: chains that go round or nowhere
+  r = await refused([Att("t1", "t2"), Att("t2", "t1"), Sum("s0", "t1", "looped"), Boundary("b", "gone"), U("v", "b", "after")], "a loop", ["after"]);
+  r = await refused([Att("t1", "nowhere"), Sum("s0", "t1", "dangling"), Boundary("b", "gone"), U("v", "b", "after")], "a missing parent", ["after"]);
+  // a record too large to read may be a queued prompt: the chain stops there
+  r = await refused([Boundary("b", "gone"), Att("h", "b", { content: "z".repeat(MAX_RECORD + 10) }), Sum("s", "h", "sum"), U("v", "s", "after")], "a huge attachment", ["after"]);
+  assert.equal(r.left["records too large to read"], 1);
+  // a chain already found not to lead to the boundary stays so for the next summary
+  r = await steady([Sum("y", "t1", "y sum"), Boundary("b", "gone"), U("m", "b", "between"), Att("t1", "m"), Sum("x", "t1", "x sum"), U("v", "x", "after")], "a refused chain shared");
+  assert.deepEqual(texts(r.blocks), ["between", "after"]);
+  assert.deepEqual(r.comps, [{ state: "cut", summary: "unavailable" }]);
+  assert.equal(r.left["compaction summaries"], 2, "neither summary is this compaction's");
+  // two summaries sharing a long chain, one behind the cut: both shown
+  {
+    const chain = [];
+    for (let i = 0; i < 3000; i++) chain.push(Att(`c${i}`, i ? `c${i - 1}` : "b"));
+    // (two summaries are shown, so not through steady: the one named is the newer)
+    const w = write([Sum("s1", "c2999", "first sum"), Boundary("b", "gone"), ...chain, Sum("s2", "c2999", "second sum"), U("v", "s2", "after")]);
+    r = await readAll(w, { limit: 60, includeTools: false });
+    assert.deepEqual(texts(r.blocks), ["first sum", "second sum", "after"]);
+    assert.deepEqual(r.comps, [{ state: "cut", summary: "shown" }]);
+    assert.ok(!r.left["compaction summaries"]);
+    const paged = await readAll(w, { limit: 1, includeTools: false });
+    assert.deepEqual(paged.blocks, r.blocks, "a shared chain, a page at a time");
+    assert.deepEqual(paged.comps, [{ state: "cut", summary: "older" }, { state: "cut", summary: "shown" }, { state: "cut", summary: "earlier" }], "the newer summary is the one named");
+  }
+  console.log("graph compactions: a cycle through boundaries is cut at each, so the newest message stays the newest; a summary stands in wherever the history before it can't be reconstructed, found under records that aren't messages too, and each page says where it is");
 }
 
 // the kinds of a turn

@@ -697,14 +697,48 @@ export async function resolve(idx) {
   }
 
   // that compaction's summary, which is then shown: the newest is the one named.
-  // One too large to read was never parsed, so isn't known to be one: it's
-  // counted as too large, and the page says the summary is unavailable.
+  // A summary hangs off its boundary by parentUuid, directly or through records
+  // that aren't messages (attachments, system and progress records); logical
+  // parents play no part. The chain up from it stops at a message, a queued
+  // prompt, another boundary, a record too large to read (it may be a queued
+  // prompt), a missing parent or a loop. A summary too large to read was never
+  // parsed, so isn't known to be one: it's counted as too large, and the page
+  // says the summary is unavailable.
   const shownSummary = new Set();
   let compaction = null;
+  const reaches = new Map(); // a record passed on the way up → whether it leads to the boundary
   if (gap) {
+    const target = gap.boundary;
+    const up = (r) => (typeof r.p === "string" ? by(r.p) : null);
+    const ofTarget = async (sum) => {
+      const path = [];
+      const onPath = new Set();
+      let ok = false;
+      let cur = up(sum);
+      while (cur) {
+        await breathe();
+        if (cur === target) {
+          ok = true;
+          break;
+        }
+        if (reaches.has(cur)) {
+          ok = reaches.get(cur);
+          break;
+        }
+        if (onPath.has(cur) || cur.f & (F.CONV | F.QUEUED | F.BOUNDARY | F.HUGE)) break;
+        path.push(cur);
+        onPath.add(cur);
+        cur = up(cur);
+      }
+      for (const r of path) {
+        await breathe();
+        reaches.set(r, ok);
+      }
+      return ok;
+    };
     let summary = null;
     for (const r of branch) {
-      if (!(r.f & F.SUMMARY) || r.f & F.HUGE || r.p !== gap.boundary.u) continue;
+      if (!(r.f & F.SUMMARY) || r.f & F.HUGE || !(await ofTarget(r))) continue;
       shownSummary.add(r);
       summary ??= r.u;
     }
@@ -790,7 +824,7 @@ export async function resolve(idx) {
   omitted[R.HUGE] = [...omitted[R.HUGE], ...idx.unparsedHuge].sort((a, b) => a - b);
 
   const byKey = new Map(units.map((u, i) => [u.key, i]));
-  let viewBytes = 200 + branch.length * 48 + units.length * 220 + near.size * 48 + (coreResults.size + otherResults.size) * 100 + byMsg.size * 120 + owners.size * 100;
+  let viewBytes = 200 + branch.length * 48 + units.length * 220 + (near.size + reaches.size) * 48 + (coreResults.size + otherResults.size) * 100 + byMsg.size * 120 + owners.size * 100;
   for (const list of Object.values(omitted)) viewBytes += list.length * 8;
   return { units, branch, omitted, outcome, broke, compaction, byKey, viewBytes, certainEnd };
 }
