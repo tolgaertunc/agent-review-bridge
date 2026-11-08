@@ -872,9 +872,26 @@ const findG = async (s, crit) => {
   const doubt = await claudeMeta(await sessionOf("doubt"));
   assert.equal(doubt.name, "Readable");
   assert.ok(!doubt.titleKnown, "there may be a newer title in the line it couldn't read");
+  // the same in a short file, read in one go from the end: the older title
+  // found after the unreadable newer one stays provisional and picks nothing
   clean();
   clearTitleMemo();
-  console.log("chats 17b a title from an unfinished scan is provisional: it can't pick a chat");
+  session([R.title("Old title"), R.user("x"), '{"type":"custom-title","customTitle":"New ti'], { id: "doubt-short" });
+  const short = await claudeMeta(await sessionOf("doubt-short"));
+  assert.equal(short.name, "Old title");
+  assert.ok(!short.titleKnown, "a newer title record couldn't be read");
+  const shortFind = await rc.findChats({ name: "old title" }, "claude", claudeFind);
+  assert.equal(shortFind.total, 1);
+  assert.equal(rc.pickOne(shortFind), null, "a renamed chat isn't read under its old name");
+  // a title file still settles it: it's newer than any record
+  fs.mkdirSync(path.join(root, "projects", "proj", "doubt-short"), { recursive: true });
+  fs.writeFileSync(path.join(root, "projects", "proj", "doubt-short", "custom-title.json"), JSON.stringify({ customTitle: "From the file" }));
+  clearTitleMemo();
+  const filed = await claudeMeta(await sessionOf("doubt-short"));
+  assert.deepEqual([filed.name, filed.titleKnown], ["From the file", true]);
+  clean();
+  clearTitleMemo();
+  console.log("chats 17b a title from an unfinished scan is provisional: it can't pick a chat; nor one found past an unreadable newer title");
 }
 
 // 17c the search's time limit against a real process: one that never answers is

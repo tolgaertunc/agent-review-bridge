@@ -306,6 +306,8 @@ const result = (e) => ({ custom: e.custom, ai: e.ai, settled: e.complete && !e.u
 // whether they were settled: if not, a name found may not be its name.
 export async function claudeMeta(s, { deadline = Infinity, inScope = () => true } = {}) {
   let custom = await readTitleFile(s);
+  const fromFile = !!custom; // the title file is the newest word
+  let newerDoubt = false; // a title record newer than the one found couldn't be read
   let ai = null;
   let folder = null;
   let scannedAll = true;
@@ -320,14 +322,18 @@ export async function claudeMeta(s, { deadline = Infinity, inScope = () => true 
       if (!rec.raw) continue;
       const r = parse(rec.raw);
       if (!r) {
-        if (hasMark(rec.raw)) unresolved = true;
+        if (hasMark(rec.raw)) {
+          unresolved = true;
+          if (!custom) newerDoubt = true;
+        }
         continue;
       }
       if (!custom && r.type === "custom-title" && r.customTitle) custom = r.customTitle;
       if (!ai && r.type === "ai-title" && r.aiTitle) ai = r.aiTitle;
       if (!folder && typeof r.cwd === "string") folder = r.cwd;
     }
-  let titleKnown = !!custom || (scannedAll && !unresolved);
+  // a title found past a newer record that couldn't be read may be an old name
+  let titleKnown = custom ? fromFile || !newerDoubt : scannedAll && !unresolved;
   if (!custom && !scannedAll) {
     // The end of a file and the title file are the newest word. A forward scan's
     // title isn't until it has read to the end: a newer rename may lie further on.
