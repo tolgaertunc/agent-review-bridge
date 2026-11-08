@@ -487,6 +487,102 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   console.log("14 auto mode: a failed review may be retried once by the agent; the retry's failure is told to the user");
 }
 
+// 15. a Claude chat working for another waits on the user to approve a tool
+// (Notification, permission_prompt): whoever waits on it is told, once per
+// message; nothing for advisor mode, answered, closed or ended work, or a chat
+// working for nobody; a notice not yet read is dropped once the answer is in
+{
+  const { call, nextStep, inlineText } = await import("../src/broker.mjs");
+  const C = { app: "claude", id: "claude-approver" };
+  const P = { app: "openai", id: "gpt-asks-claude" };
+  const A = { app: "openai", id: "gpt-advised" };
+  const waiting = (about) => state().messages.filter((x) => x.kind === "waiting" && x.about === about);
+  const prompt = (message = "Claude needs your permission to use Bash") =>
+    runHook("claude", "permission", { session_id: C.id, hook_event_name: "Notification", notification_type: "permission_prompt", message });
+  const handOver = async (id) => call("receive", { side: "claude", endpoint: C, id });
+  const reviewOn = async (request) => {
+    const l = await call("link_create", { primary: P, advisor: C, mode: "review", request });
+    return { link: l, req: await until(() => state().messages.find((x) => x.linkId === l.id && x.kind === "review-request")) };
+  };
+  const quiet = async (id, why) => {
+    await prompt();
+    await sleep(300);
+    assert.equal(waiting(id).length, 0, why);
+  };
+  // a one-off review: the requester is told, with the tool
+  const { link: review, req } = await reviewOn("Check the parser.");
+  await handOver(req.id);
+  const out = await prompt();
+  assert.deepEqual([out.code, out.out], [0, ""], "the hook prints nothing");
+  const n = await until(() => waiting(req.id)[0]);
+  assert.deepEqual(n.toEndpoint, P);
+  assert.equal(n.from, "bridge");
+  assert.match(n.text, new RegExp(`The Claude Code session ${C.id} is waiting for the user to approve a tool in Claude Desktop \\(Bash\\)\\. Its answer to ${req.id} comes after that\\.`));
+  assert.match(inlineText(n), new RegExp(`The answer to ${req.id} waits for the user's approval`));
+  assert.match(nextStep(n), /Tell the user, in their language, that the other chat is waiting for their approval there/);
+  assert.equal(n.watch, undefined, "a notice is never watched");
+  // a second prompt in the same work adds nothing
+  await prompt("Claude needs your permission to use Read");
+  await sleep(300);
+  assert.equal(waiting(req.id).length, 1, "told once");
+  // a message on the same link: its sender is told too
+  const sent = await call("send", { endpoint: P, text: "Also look at the tests." });
+  await handOver(sent.id);
+  await prompt("Claude needs your permission to use Read");
+  assert.match((await until(() => waiting(sent.id)[0])).text, /\(Read\)/);
+  // the answer arrives before a Claude requester read the notice: it's dropped
+  const Q = { app: "claude", id: "claude-asker" };
+  const stale = await call("link_create", { primary: Q, advisor: C, mode: "review", request: "Stale check." });
+  const sreq = await until(() => state().messages.find((x) => x.linkId === stale.id && x.kind === "review-request"));
+  await handOver(sreq.id);
+  await prompt();
+  const sn = await until(() => waiting(sreq.id)[0]);
+  assert.deepEqual([sn.toEndpoint, sn.readAt], [Q, null], "waiting for the requester to read it");
+  await call("advise", { endpoint: C, requestId: sreq.id, decision: "approved" });
+  assert.ok(state().messages.find((x) => x.id === sn.id).readAt, "dropped once the answer is in");
+  assert.ok(!(await call("receive", { side: "claude", endpoint: Q })).messages.some((x) => x.kind === "waiting"), "not handed to the requester");
+  // the same for a message answered with a reply
+  const open2 = await call("link_create", { primary: Q, advisor: C, mode: "review", request: "Reply check." });
+  const asked = await call("send", { endpoint: Q, text: "Which test covers it?" });
+  await handOver(asked.id);
+  await prompt();
+  const an = await until(() => waiting(asked.id)[0]);
+  assert.equal(an.readAt, null);
+  await call("send", { endpoint: C, text: "test-link 30.", replyTo: asked.id });
+  assert.ok(state().messages.find((x) => x.id === an.id).readAt, "dropped once the reply is in");
+  await call("link_close", { linkId: open2.id });
+  await call("link_close", { linkId: review.id });
+  // advisor mode: nothing (it would start the primary's turn, and a new review)
+  const adv = await call("link_create", { primary: A, advisor: C });
+  await runHook("openai", "stop", { session_id: A.id, last_assistant_message: "Done with step one." });
+  const areq = await until(() => state().messages.find((x) => x.linkId === adv.id && x.kind === "review-request"));
+  await handOver(areq.id);
+  await quiet(areq.id, "advisor mode");
+  await call("link_close", { linkId: adv.id });
+  // nothing for work that is already over, each told nothing before its first prompt
+  const { link: r2, req: req2 } = await reviewOn("Second look.");
+  await handOver(req2.id);
+  await call("advise", { endpoint: C, requestId: req2.id, decision: "approved" });
+  await quiet(req2.id, "an answered review");
+  const { link: r3 } = await reviewOn("Third look.");
+  const msg3 = await call("send", { endpoint: P, text: "One more thing." });
+  await handOver(msg3.id);
+  await call("link_close", { linkId: r3.id });
+  await quiet(msg3.id, "a message on a closed link");
+  const { link: r4, req: req4 } = await reviewOn("Fourth look.");
+  await handOver(req4.id);
+  await runHook("claude", "stop", { session_id: C.id, last_assistant_message: "Done." }); // its turn ended: settled
+  await until(() => state().messages.find((x) => x.id === req4.id).settledAt);
+  await quiet(req4.id, "a request from a turn that ended");
+  for (const l of [r2, r4]) await call("link_close", { linkId: l.id }).catch(() => {});
+  // a chat working for nobody: nothing at all
+  const total = state().messages.filter((x) => x.kind === "waiting").length;
+  await runHook("claude", "permission", { session_id: "claude-alone", hook_event_name: "Notification", notification_type: "permission_prompt", message: "Claude needs your permission to use Bash" });
+  await sleep(300);
+  assert.equal(state().messages.filter((x) => x.kind === "waiting").length, total);
+  console.log("15 a tool approval waiting: told once (review, message), dropped once answered; not for advisor mode, answered, closed or ended work, or an idle chat");
+}
+
 fs.rmSync(dir, { recursive: true, force: true });
 console.log("\nfailure tests passed");
 process.exit(0);

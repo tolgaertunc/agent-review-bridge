@@ -170,6 +170,16 @@ if (event === "start") {
   process.exit(0);
 }
 
+// A tool approval waits on the user (Notification, permission_prompt): written
+// down for the broker; no output
+if (event === "permission") {
+  if (app === "claude" && involved(readState())) {
+    writeOutbox("permission_wait", { endpoint, at: t0, what: input.message ?? null });
+    hookLog({ permission: input.hook_event_name ?? null });
+  }
+  process.exit(0);
+}
+
 if (event === "stopfail") {
   if (app === "claude" && involved(readState())) {
     writeOutbox("turn_failed", { endpoint, at: t0, error: input.error ?? null, details: input.error_details ?? null });

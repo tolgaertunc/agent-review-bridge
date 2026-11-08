@@ -27,7 +27,7 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.AGENT_REVIEW_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 16);
+export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 17);
 
 export const SIDES = ["claude", "openai"];
 // Claude Desktop's session ids, as claude://code/continue?session= accepts them
@@ -94,7 +94,7 @@ export function pendingFor(state, endpoint) {
 export const listenerFile = (endpoint) => path.join(LISTENERS_DIR, `${safeName(endpoint)}.json`);
 export const turnFile = (endpoint) => path.join(TURNS_DIR, `${safeName(endpoint)}.json`);
 
-const OUTBOX_OPS = new Set(["turn_start", "turn_end", "notes_ack", "wake_ack", "auto_prompt", "turn_ok", "turn_failed"]);
+const OUTBOX_OPS = new Set(["turn_start", "turn_end", "notes_ack", "wake_ack", "auto_prompt", "turn_ok", "turn_failed", "permission_wait"]);
 
 function token() {
   try {
@@ -143,6 +143,7 @@ export function nextStep(m) {
       );
     return `${told} Ask again only if the user wants to (after the reset time, if one is given)${again}`;
   }
+  if (m.kind === "waiting") return "Tell the user, in their language, that the other chat is waiting for their approval there. Don't ask again: the answer arrives once it's approved.";
   if (m.kind === "review-request") return `Review ${m.plan ? "the plan" : "it"}, then answer once with bridge_advise (request_id ${m.id}).`;
   if (m.kind === "advisory")
     return "Fix what holds up; if a finding is wrong, say why instead of complying. Your next turn is reviewed again. If you're going in circles or the rest needs a decision, stop and ask the user.";
@@ -210,6 +211,7 @@ export function inlineText(m) {
     "review-result": `The ${m.plan ? "plan review" : "review"} you asked for: ${m.id}`,
     stop: `Stop the fix loop: ${m.id}`,
     failed: `No answer is coming to ${m.about}: ${m.id}`,
+    waiting: `The answer to ${m.about} waits for the user's approval: ${m.id}`,
   }[m.kind] ?? `Message ${m.id}`;
   return [`${LABEL[m.from] ?? m.from.toUpperCase()}: ${title} (link ${m.linkId})`, m.text, `${AGENT_LINE} ${nextStep(m)}`].join("\n\n");
 }
@@ -930,6 +932,7 @@ class BrokerState {
     const link = this.s.links[req.linkId];
     if (!link?.active) throw new Error(`review request ${requestId} belongs to a closed link`);
     req.answeredAt = Date.now();
+    this.answered(req.id);
     const text = renderAnswer({ decision, note: withoutCitations(note), blocking, nits });
     link.advisories.push({ at: Date.now(), decision, text });
     if (link.mode === "review") {
@@ -1021,6 +1024,35 @@ class BrokerState {
     return { ok: true };
   }
 
+  // A Claude chat working for another waits on the user to approve a tool:
+  // whoever waits on what woke it is told, once per message. As with failures,
+  // only a one-off review or a message: in advisor mode the notice would start
+  // the primary's turn and with it a new review, again and again.
+  op_permission_wait({ endpoint, at, what }) {
+    if (!endpoint?.id || !at) return { skipped: true };
+    const asked = what && String(what).replace(/^Claude needs your permission to use /, "").slice(0, 200);
+    const tool = asked ? ` (${asked})` : "";
+    for (const m of this.s.messages) {
+      const link = this.s.links[m.linkId];
+      if (!watched(m, link) || !sameEndpoint(m.toEndpoint, endpoint)) continue;
+      if (!m.wokenAt || m.wokenAt > at || m.settledAt || m.approvalToldAt || this.settled(m)) continue;
+      if (!link?.active) continue; // closed: no answer can come back on it
+      const to = m.kind === "review-request" ? this.s.links[m.linkId]?.primary : m.fromEndpoint;
+      if (!to) continue;
+      m.approvalToldAt = at;
+      const text = `The Claude Code session ${endpoint.id} is waiting for the user to approve a tool in Claude Desktop${tool}. Its answer to ${m.id} comes after that.`;
+      this.post({ from: "bridge", toEndpoint: to, kind: "waiting", linkId: m.linkId, text, about: m.id });
+      logEvent({ op: "waiting", id: m.id });
+    }
+    return { ok: true };
+  }
+
+  // The answer to `id` is here: a notice that it waits for an approval, not
+  // delivered yet, would only contradict it
+  answered(id) {
+    for (const w of this.s.messages) if (w.kind === "waiting" && w.about === id && !w.readAt) w.readAt = Date.now();
+  }
+
   post({ from, toEndpoint, kind, linkId, text, decision, lastRound, generation, about, retry, auto, retried }) {
     const msg = { id: "m" + ++this.s.seq, from, to: toEndpoint.app, toEndpoint, kind, linkId, text: text.slice(0, MAX_TEXT), ts: Date.now(), readAt: null };
     // a review's request and result say whether it is a plan, and whether
@@ -1086,6 +1118,7 @@ class BrokerState {
     if (recent >= PEER_BURST.count) throw new Error(`more than ${PEER_BURST.count} messages in 10 minutes; looks like a loop, wait a bit`);
     const r = this.post({ from: endpoint.app, toEndpoint: to, kind: "message", linkId: link.id, text });
     Object.assign(this.s.messages.at(-1), { fromEndpoint: endpoint }, replyTo && { replyTo });
+    if (replyTo) this.answered(replyTo);
     // the chat it goes to was last seen failing: say so
     const failure = this.s.endpoints?.[autoKey(to)]?.lastFailure;
     return { ...r, to, linkId: link.id, ...(failure && { lastFailure: failure }) };

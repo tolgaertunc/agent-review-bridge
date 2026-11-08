@@ -18,7 +18,7 @@ const sameTo = (a, b) => !!a && a.app === b.app && a.id === b.id;
 // It runs the version before this one, as after a real update.
 const brokerUrl = new URL("../src/broker.mjs", import.meta.url).href;
 const stale = spawn(process.execPath, ["--input-type=module", "-e", `const b=await import(${JSON.stringify(brokerUrl)});await b.call("status");console.log("owner");setInterval(()=>{},1000);`], {
-  env: { ...process.env, AGENT_REVIEW_BRIDGE_TEST_PROTOCOL: "15" },
+  env: { ...process.env, AGENT_REVIEW_BRIDGE_TEST_PROTOCOL: "16" },
 });
 await new Promise((r) => stale.stdout.once("data", r));
 const { call, inlineText, nextStep } = await import("../src/broker.mjs");

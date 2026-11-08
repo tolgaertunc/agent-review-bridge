@@ -18,7 +18,8 @@ assert.ok(!claudeDir.startsWith(path.join(realHome, ".claude")) && !codexDir.sta
 const otherClaudeHook = { type: "command", command: "echo other" };
 const otherCodexHook = { type: "command", command: "echo keep" };
 const legacyCodexHook = { type: "command", command: "node C:\\x\\codex-stop-hook.mjs", timeout: 330 };
-fs.writeFileSync(path.join(claudeDir, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(ls:*)"] }, hooks: { Stop: [{ hooks: [otherClaudeHook] }] } }));
+const otherNotification = { matcher: "idle_prompt", hooks: [{ type: "command", command: "echo idle" }] };
+fs.writeFileSync(path.join(claudeDir, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(ls:*)"] }, hooks: { Stop: [{ hooks: [otherClaudeHook] }], Notification: [otherNotification] } }));
 fs.writeFileSync(path.join(codexDir, "hooks.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [legacyCodexHook] }], PreToolUse: [{ matcher: "Bash", hooks: [otherCodexHook] }] } }));
 fs.writeFileSync(path.join(codexDir, "config.toml"), 'model = "x"\n');
 
@@ -40,6 +41,12 @@ assert.equal(claude.SessionStart.filter(ours).length, 2, "the listener and the a
 assert.ok(claude.SessionStart.some((h) => h.command.includes("--event start") && !h.asyncRewake));
 assert.ok(claude.StopFailure.filter(ours).length === 1 && claude.StopFailure[0].command.includes("--event stopfail"));
 assert.equal(claude.UserPromptSubmit.filter(ours).length, 1);
+// the approval notice: Notification, only for permission prompts
+const groups = read(path.join(claudeDir, "settings.json")).hooks;
+const ourGroup = (event) => groups[event].filter((g) => g.hooks.some(ours));
+assert.deepEqual(ourGroup("Notification").map((g) => g.matcher), ["permission_prompt"]);
+assert.ok(ourGroup("Notification")[0].hooks[0].command.includes("--event permission"));
+assert.deepEqual(groups.Notification.find((g) => g.matcher === "idle_prompt"), otherNotification, "a foreign Notification hook stays");
 assert.equal(codex.Stop.length, 1, "legacy blocking hook replaced");
 assert.ok(codex.Stop[0].command.includes("--event stop"));
 assert.ok(!codex.Stop[0].asyncRewake && codex.Stop[0].timeout === 10);
@@ -58,7 +65,7 @@ console.log("install ×2: one copy of each hook, other hooks kept, legacy Codex 
 install("--uninstall");
 claude = read(path.join(claudeDir, "settings.json"));
 codex = read(path.join(codexDir, "hooks.json"));
-assert.deepEqual(claude, { permissions: { allow: ["Bash(ls:*)"] }, hooks: { Stop: [{ hooks: [otherClaudeHook] }] } });
+assert.deepEqual(claude, { permissions: { allow: ["Bash(ls:*)"] }, hooks: { Stop: [{ hooks: [otherClaudeHook] }], Notification: [otherNotification] } });
 assert.deepEqual(codex, { hooks: { PreToolUse: [{ matcher: "Bash", hooks: [otherCodexHook] }] } });
 assert.equal(fs.readFileSync(path.join(codexDir, "config.toml"), "utf8").trim(), 'model = "x"');
 console.log("uninstall: only our entries removed");

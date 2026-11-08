@@ -164,12 +164,19 @@ function runs(cmd, shell) {
     ["SessionStart", "listen", true],
     ["SessionStart", "start", false],
     ["UserPromptSubmit", "prompt", false],
+    ["Notification", "permission", false, "permission_prompt"],
   ];
-  for (const [event, kind, rewake] of want) {
+  for (const [event, kind, rewake, matcher] of want) {
     const label = `${event} hook (${kind})`;
-    const h = (settings.hooks?.[event] ?? []).flatMap((g) => g.hooks ?? []).find((x) => x.command?.includes("hook.mjs") && x.command.includes(`--event ${kind}`));
+    const ours = (x) => x.command?.includes("hook.mjs") && x.command.includes(`--event ${kind}`);
+    const group = (settings.hooks?.[event] ?? []).find((g) => (g.hooks ?? []).some(ours));
+    const h = group?.hooks.find(ours);
     if (!h) {
       fail(A, label, "missing", REINSTALL);
+      continue;
+    }
+    if (matcher && group.matcher !== matcher) {
+      fail(A, label, `matcher is ${JSON.stringify(group.matcher ?? "")}, not "${matcher}"`, REINSTALL);
       continue;
     }
     if (rewake && !h.asyncRewake) {
