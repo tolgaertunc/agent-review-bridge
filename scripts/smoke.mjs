@@ -76,11 +76,11 @@ const claude = await connect("claude", { CLAUDE_CODE_SESSION_ID: SESSION, CLAUDE
 const openai = await connect("openai");
 
 // 1. tools and their approval hints
-const expected = ["bridge_advise", "bridge_link", "bridge_link_join", "bridge_read_chat", "bridge_receive", "bridge_review", "bridge_send", "bridge_status", "bridge_unlink"];
+const expected = ["bridge_advise", "bridge_auto", "bridge_link", "bridge_link_join", "bridge_read_chat", "bridge_receive", "bridge_review", "bridge_send", "bridge_status", "bridge_unlink"];
 for (const c of [claude, openai]) {
   const { tools } = await c.listTools();
-  // auto mode runs from Claude, with a ChatGPT reviewer
-  assert.deepEqual(tools.map((t) => t.name).sort(), (c === claude ? [...expected, "bridge_auto"] : expected).sort());
+  // either app can be the working chat, auto mode included
+  assert.deepEqual(tools.map((t) => t.name).sort(), expected);
   for (const t of tools) assert.equal(t.annotations?.destructiveHint, false, `${t.name} must be marked non-destructive`);
 }
 console.log(`1 both servers expose the same ${expected.length} tools, all marked non-destructive`);
@@ -330,7 +330,7 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
 {
   const made = () => JSON.parse(fs.readFileSync(path.join(dir, "fake-threads.json"), "utf8"));
   const ac = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-auto-route", CLAUDE_PROJECT_DIR: repo });
-  const autoThread = async () => JSON.parse(textOf(await call(ac, "bridge_status"))).auto.thread;
+  const autoThread = async () => JSON.parse(textOf(await call(ac, "bridge_status"))).auto.reviewer?.id;
   await call(ac, "bridge_auto", { on: true, model: "gpt-6.1-sol", effort: "ultra" });
   const first = (await call(ac, "bridge_review", { request: "Goal: route. Step: first." })).structuredContent;
   assert.equal(made().at(-1).threadId, first.threadId, "the first review makes auto mode's chat");
@@ -361,12 +361,73 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   await call(ac, "bridge_auto", { on: true });
   const firstOwn = (await call(ac, "bridge_review", { model: "gpt-6-astra", name: "Field fixes", request: "Goal: route. Step: first with a model." })).structuredContent;
   const st = JSON.parse(textOf(await call(ac, "bridge_status"))).auto;
-  assert.deepEqual([st.thread, st.model], [firstOwn.threadId, "gpt-6-astra"], "the first review's chat is auto mode's");
+  assert.deepEqual([st.reviewer, st.model], [{ app: "openai", id: firstOwn.threadId }, "gpt-6-astra"], "the first review's chat is auto mode's");
   assert.equal(made().at(-1).name, "Agent review bridge · Field fixes");
   assert.equal((await call(ac, "bridge_review", { request: "Goal: route. Step: next." })).structuredContent.threadId, firstOwn.threadId);
   await call(ac, "bridge_auto", { on: false });
   await ac.close();
   console.log("5e2 auto mode: another model or a name gets a chat of its own (no effort carried over), auto mode's chat stays; new chats are prefixed");
+}
+
+// 5e3. auto mode from ChatGPT: the bridge can't make a Claude chat, so the
+// first review gives a join code; the Claude chat that joins stays the
+// reviewer, and later reviews go to it without a code
+{
+  const W = "gpt-auto-worker";
+  const meta = { ...asGpt(W), "x-codex-turn-metadata": { cwd: repo } };
+  const events = () => fs.readFileSync(path.join(dir, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const idIn = (t) => t.match(/ id=(m\d+)/)[1];
+  const on = textOf(await call(openai, "bridge_auto", { on: true }, meta));
+  assert.match(on, /^Auto mode is on\. Tracked: [^\n]+\. The first review gives a join code: ask the user to paste it into the Claude Code chat that should review; that chat then stays the reviewer\./);
+  assert.match(on, /Auto mode is on: you work with a second model as your reviewer/);
+  const first = await call(openai, "bridge_review", { request: "Goal: trim fields. Step: parse trims." }, meta);
+  assert.match(textOf(first), /is waiting for auto mode's reviewer\. In the Claude Code chat that should review, ask it to call bridge_link_join with code [0-9a-f]{6}\. Tell the user that chat then stays auto mode's reviewer/);
+  const reviewer = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-auto-reviewer", CLAUDE_CODE_HOST_SESSION_ID: "local_auto-reviewer-1", CLAUDE_PROJECT_DIR: repo });
+  assert.match(textOf(await call(reviewer, "bridge_link_join", { code: first.structuredContent.joinCode })), /This chat is now the reviewer of that chat's auto mode/);
+  const q1 = await receiveUntil(reviewer, undefined, /Goal: trim fields/);
+  assert.match(q1, /Auto mode: judge the work against its goal/);
+  assert.match(q1, /Where the changes are/);
+  await call(reviewer, "bridge_advise", { request_id: idIn(q1), decision: "approved" });
+  await deliveredTo(W, /The review you asked for[\s\S]*\[APPROVED\]/);
+  const st = JSON.parse(textOf(await call(openai, "bridge_status", {}, meta))).auto;
+  assert.deepEqual(st.reviewer, { app: "claude", id: "claude-auto-reviewer" });
+  assert.ok(Object.values(st.paths)[0].approved, "the approval recorded the content");
+  // the next review goes to it; while it isn't listening, nothing is sent
+  // unless the user agrees to open it, which Claude Desktop does by its id
+  const closed = await openai.callTool({ name: "bridge_review", arguments: { request: "Goal: trim fields. Step: next." }, _meta: meta });
+  assert.match(textOf(closed), /^Nothing was sent: the Claude Code session claude-auto-reviewer isn't open/);
+  const next = await call(openai, "bridge_review", { request: "Goal: trim fields. Step: next.", open: true }, meta);
+  assert.ok(events().some((e) => e.op === "report" && e.event === "opened" && e.data.target.id === "claude-auto-reviewer"), "opened through Claude Desktop");
+  assert.match(textOf(next), /sent to auto mode's reviewer, the Claude Code session claude-auto-reviewer\./);
+  const q2 = await receiveUntil(reviewer, undefined, /Step: next/);
+  // changes requested: the next round goes to the same reviewer
+  await call(reviewer, "bridge_advise", { request_id: idIn(q2), decision: "changes_requested", blocking: [{ title: "Trim tabs too." }] });
+  await deliveredTo(W, /\[CHANGES REQUESTED\][\s\S]*Trim tabs too/);
+  fs.writeFileSync(path.join(dir, "listeners", "claude-claude-auto-reviewer.json"), JSON.stringify({ pid: process.pid, startedAt: Date.now(), beat: Date.now() })); // the opened session listens
+  const round2 = await call(openai, "bridge_review", { round_of: next.structuredContent.id, request: "Tabs are trimmed too." }, meta);
+  assert.match(textOf(round2), /^Round 2 \(L\d+\) sent to the reviewer of L\d+ \(claude chat claude-auto-reviewer\)/);
+  const q3 = await receiveUntil(reviewer, undefined, /Tabs are trimmed too/);
+  await call(reviewer, "bridge_advise", { request_id: idIn(q3), decision: "approved" });
+  // a join asked for while there is one is a reviewer of its own
+  const own = await call(openai, "bridge_review", { reviewer: "join", request: "Goal: trim fields. Step: second opinion." }, meta);
+  assert.match(textOf(own), /is waiting for a reviewer\. In the chat that should review \(either app\)/);
+  assert.doesNotMatch(textOf(own), /stays auto mode's reviewer/);
+  const second = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-second-opinion", CLAUDE_PROJECT_DIR: repo });
+  assert.doesNotMatch(textOf(await call(second, "bridge_link_join", { code: own.structuredContent.joinCode })), /reviewer of that chat's auto mode/);
+  assert.deepEqual(JSON.parse(textOf(await call(openai, "bridge_status", {}, meta))).auto.reviewer, { app: "claude", id: "claude-auto-reviewer" }, "auto mode keeps its reviewer");
+  // a reviewer that is gone can be dropped: what was approved stays, the next review asks again
+  const before = JSON.parse(textOf(await call(openai, "bridge_status", {}, meta))).auto;
+  assert.match(textOf(await call(openai, "bridge_auto", { on: true, new_reviewer: true }, meta)), /The first review gives a join code/);
+  const after = JSON.parse(textOf(await call(openai, "bridge_status", {}, meta))).auto;
+  assert.equal(after.reviewer, null);
+  assert.deepEqual(after.paths, before.paths, "what was approved stays");
+  assert.match(textOf(await call(openai, "bridge_review", { request: "Goal: trim fields. Step: with a new reviewer." }, meta)), /is waiting for auto mode's reviewer/);
+  await call(openai, "bridge_unlink", {}, meta);
+  assert.match(textOf(await call(openai, "bridge_auto", { on: false }, meta)), /Auto mode is off/);
+  fs.rmSync(path.join(dir, "listeners", "claude-claude-auto-reviewer.json"), { force: true });
+  await second.close();
+  await reviewer.close();
+  console.log("5e3 auto mode from ChatGPT: the first review's Claude chat stays the reviewer; later reviews and rounds go to it (opened by its Claude Desktop id when closed); an explicit join gets one of its own; new_reviewer drops it and keeps the approvals");
 }
 
 // 5f. one message per request: with many paths the file lists go first,

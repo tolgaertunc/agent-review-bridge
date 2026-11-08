@@ -50,6 +50,8 @@ assert.deepEqual(groups.Notification.find((g) => g.matcher === "idle_prompt"), o
 assert.equal(codex.Stop.length, 1, "legacy blocking hook replaced");
 assert.ok(codex.Stop[0].command.includes("--event stop"));
 assert.ok(!codex.Stop[0].asyncRewake && codex.Stop[0].timeout === 10);
+assert.equal(codex.UserPromptSubmit.length, 1);
+assert.ok(codex.SessionStart.length === 1 && codex.SessionStart[0].command.includes("--app openai --event start"), "ChatGPT gets auto mode's rules again too");
 if (process.platform === "win32") {
   // PowerShell can't start a command line with a quoted path
   const w = codex.Stop[0].commandWindows;

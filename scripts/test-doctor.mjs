@@ -57,6 +57,9 @@ if (findCodexCli()) {
   assert.equal(stop.status, "fail");
   assert.match(stop.detail, /untrusted|modified/);
   assert.match(stop.fix, /trust/);
+  // the SessionStart hook is checked the same way
+  assert.equal(d.get("ChatGPT Desktop", "sessionStart hook").status, "fail");
+  assert.match(d.get("ChatGPT Desktop", "sessionStart hook").detail, /untrusted|modified/);
   console.log(`doctor 2 installed: Claude side clean; Codex hooks flagged as "${stop.detail}"`);
 } else console.log("doctor 2 installed: Claude side clean (no codex here, trust not checked)");
 

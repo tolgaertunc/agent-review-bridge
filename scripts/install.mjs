@@ -12,8 +12,8 @@
 //   linked primary for review without blocking, a UserPromptSubmit hook that
 //   hands over the advisor's nits, and on Claude a background listener that
 //   wakes the session when something arrives for it, and a StopFailure hook
-//   that tells whoever waits when an API error (a usage limit) ends a turn,
-//   and a SessionStart hook that gives auto mode's rules again after a
+//   that tells whoever waits when an API error (a usage limit) ends a turn.
+//   In both, a SessionStart hook gives auto mode's rules again after a
 //   compaction or a resumed session.
 // - Cleans up the blocking Codex Stop hook that older versions registered.
 
@@ -93,6 +93,8 @@ const CLAUDE_HOOKS = {
 const CODEX_HOOKS = {
   Stop: [quick("openai", "stop")],
   UserPromptSubmit: [quick("openai", "prompt")],
+  // the auto mode rules again after a compaction or a resumed chat
+  SessionStart: [quick("openai", "start")],
 };
 
 // Claude Code: user scope via its own CLI (it owns ~/.claude.json)
@@ -174,3 +176,5 @@ const CODEX_HOOKS = {
 }
 
 console.log("Restart both apps for the change to take effect.");
+// ChatGPT skips a new or changed hook until the user trusts it
+if (!uninstall) console.log("ChatGPT Desktop: open it normally, with its window, and trust the agent-review-bridge hooks it asks you to review; `npm run doctor` shows any it still skips.");

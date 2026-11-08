@@ -3,13 +3,15 @@
 //   node src/hook.mjs --app claude|openai --event stop|prompt|listen
 //
 // stop    Stop, sync: if this chat is a link's primary, drop the turn's final
-//         message in the outbox for review. Never blocks, never waits.
+//         message in the outbox for review (never waiting for it). In auto
+//         mode, stop the turn once per set of changes the reviewer hasn't
+//         approved.
 // prompt  UserPromptSubmit: record the user's message for this turn's review
 //         request, and hand the advisor's pending nits to the model as
 //         additional context.
-// start   Claude only, SessionStart: what a compaction or a resumed session
-//         may have lost: auto mode's full rules, and for a chat reviewing for
-//         another, the reviews still waiting for its answer with its role.
+// start   SessionStart: what a compaction or a resumed session may have lost:
+//         auto mode's full rules, and for a chat reviewing for another, the
+//         reviews still waiting for its answer with its role.
 // stopfail Claude only, StopFailure: an API error (a usage limit, an outage)
 //         ended the turn; whoever waits on a message it was woken for is told.
 // listen  Claude only, registered with asyncRewake on Stop and SessionStart:
@@ -23,9 +25,9 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { readState, activeLinks, writeOutbox, pendingFor, claudeWakeText, listenerFile, turnFile, DATA_DIR, MAX_DIFF, REVIEWER_ROLE } from "./broker.mjs";
+import { readState, activeLinks, writeOutbox, pendingFor, claudeWakeText, listenerFile, turnFile, DATA_DIR, MAX_DIFF, REVIEWER_ROLE, bridgePrompt } from "./broker.mjs";
 import { baseline, turnDiff, fingerprint } from "./git.mjs";
-import { autoFor, AUTO_RULES, AUTO_RULES_SHORT, AUTO_REMINDER, REMIND_AFTER, autoGuard } from "./auto.mjs";
+import { autoFor, AUTO_RULES, AUTO_RULES_SHORT, AUTO_REMINDER, REMIND_AFTER, autoGuard, standingReviewer, GUARD_HEAD } from "./auto.mjs";
 import { rulesBlock } from "./rules.mjs";
 
 const args = process.argv.slice(2);
@@ -68,6 +70,11 @@ const t0 = Date.now();
 // what the end-of-turn check last told this chat about, so the same changes
 // stop a turn only once (a new user prompt clears it)
 const guardFile = (endpoint) => turnFile(endpoint).replace(/\.json$/, ".auto-guard.json");
+// ChatGPT goes on with a turn the check stopped, with the check's words as a
+// new prompt. What it was stopped for in the turn it is going on with: the
+// same changes don't stop that turn again, even if that prompt were taken for
+// the user's (a bound that doesn't rest on telling the two apart)
+const chainFile = (endpoint) => turnFile(endpoint).replace(/\.json$/, ".auto-chain.json");
 
 // a path that isn't there (not one that can't be read: that stays a failed check)
 const gone = (p) => {
@@ -80,12 +87,15 @@ const gone = (p) => {
 };
 
 const advisedPrimary = (state) => activeLinks(state).find((l) => l.mode === "advisor" && sameEndpoint(l.primary, endpoint));
-// a review this chat asked for is still waiting for its answer
-const reviewPending = (state) => activeLinks(state).some((l) => l.mode === "review" && sameEndpoint(l.primary, endpoint));
-// this chat works through the bridge: linked, in auto mode, or sent a message
-// lately (a wake always comes from one, read from this same state file)
+// a review this chat asked for is still waiting for its answer (one waiting
+// for a reviewer to join with its code doesn't count: that may never happen)
+const reviewPending = (state) => activeLinks(state).some((l) => l.mode === "review" && l.advisor && sameEndpoint(l.primary, endpoint));
+// this chat works through the bridge: linked, in auto mode or an auto mode's
+// reviewer, or sent a message lately (a wake always comes from one, read from
+// this same state file)
 const involved = (state) =>
   !!autoFor(state, endpoint) ||
+  standingReviewer(state, endpoint) ||
   activeLinks(state).some((l) => sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint)) ||
   (state?.messages ?? []).some((m) => sameEndpoint(m.toEndpoint, endpoint) && t0 - m.ts < 24 * 3600_000);
 
@@ -116,6 +126,8 @@ if (event === "stop") {
   // waiting. Not tied to stop_hook_active: Claude Code sets it for every turn
   // the bridge's own wake started, which would leave those turns unchecked.
   const auto = autoFor(state, endpoint);
+  // a ChatGPT turn the Stop check didn't continue starts a new chain
+  if (app === "openai" && !input.stop_hook_active) fs.rmSync(chainFile(endpoint), { force: true });
   if (auto && !reviewPending(state)) {
     const unreviewed = [];
     const unchecked = [];
@@ -129,15 +141,19 @@ if (event === "stop") {
     const key = JSON.stringify([unreviewed.map((p) => [p, fingerprint(p).hash]), unchecked]);
     // a tracked folder that was deleted is a change too: said so
     const named = unreviewed.map((p) => (fs.existsSync(p) ? p : `${p} (no longer there)`));
-    let told = null;
-    try {
-      told = JSON.parse(fs.readFileSync(guardFile(endpoint), "utf8")).key;
-    } catch {
-      // not told yet
-    }
+    const keyIn = (file) => {
+      try {
+        return JSON.parse(fs.readFileSync(file, "utf8")).key;
+      } catch {
+        return null; // not told yet
+      }
+    };
+    const told = keyIn(guardFile(endpoint));
+    const chained = app === "openai" && input.stop_hook_active ? keyIn(chainFile(endpoint)) : null;
     if (!unreviewed.length && !unchecked.length) fs.rmSync(guardFile(endpoint), { force: true });
-    else if (told !== key) {
+    else if (told !== key && chained !== key) {
       fs.writeFileSync(guardFile(endpoint), JSON.stringify({ key, at: Date.now() }));
+      if (app === "openai") fs.writeFileSync(chainFile(endpoint), JSON.stringify({ key, at: Date.now() }));
       await answer({ decision: "block", reason: autoGuard(named, unchecked) });
       hookLog({ autoGuard: unreviewed, unchecked, ms: Date.now() - t0 });
       process.exit(0); // the turn goes on: it hasn't ended yet
@@ -149,7 +165,6 @@ if (event === "stop") {
 }
 
 if (event === "start") {
-  if (app !== "claude") process.exit(0);
   const state = readState();
   // review requests addressed to this chat on open one-off reviews, unanswered
   const waiting = (state?.messages ?? []).filter(
@@ -192,10 +207,14 @@ if (event === "prompt") {
   const state = readState();
   const auto = autoFor(state, endpoint);
   // auto mode counts the user's turns for its reminder; a new prompt means
-  // unreviewed changes may stop the next turn's end again
-  if (auto && input.prompt) {
+  // unreviewed changes may stop the next turn's end again. Only a prompt the
+  // user wrote: not the app's own notice, one of the bridge's deliveries (a
+  // ChatGPT chat runs them as prompts), or the Stop check's own words, which
+  // ChatGPT goes on with as a new prompt.
+  const fromUser = (p) => !/^\s*<task-notification>/.test(p) && !p.includes(GUARD_HEAD) && !bridgePrompt(state, endpoint, p);
+  if (auto && input.prompt && fromUser(input.prompt)) {
     writeOutbox("auto_prompt", { endpoint, turnId: input.turn_id ?? input.prompt_id ?? null, prompt: input.prompt });
-    if (!/^\s*<task-notification>/.test(input.prompt)) fs.rmSync(guardFile(endpoint), { force: true });
+    fs.rmSync(guardFile(endpoint), { force: true });
   }
   // the user's message goes into this turn's review request, so the advisor
   // sees what was asked and not just the answer
@@ -228,6 +247,7 @@ if (event === "prompt") {
   const reached = (m) => Math.max(m.ts, m.dispatch?.at ?? 0, m.readAt ?? 0);
   const working =
     !!auto ||
+    standingReviewer(state, endpoint) ||
     activeLinks(state).some((l) => sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint)) ||
     (state?.messages ?? []).some((m) => sameEndpoint(m.toEndpoint, endpoint) && Date.now() - reached(m) < 24 * 3600_000);
   const context = [
@@ -251,9 +271,12 @@ if (event === "prompt") {
 
 if (event === "listen") {
   // a closed link can still have a last message on the way (a one-off review
-  // closes as its answer is posted), so pending messages count as linked
+  // closes as its answer is posted), so pending messages count as linked; an
+  // auto mode's reviewer waits for its next review between them
   const linked = (s) =>
-    activeLinks(s).some((l) => sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint)) || pendingFor(s, endpoint).length > 0;
+    activeLinks(s).some((l) => sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint)) ||
+    pendingFor(s, endpoint).length > 0 ||
+    standingReviewer(s, endpoint);
   if (!linked(readState())) process.exit(0);
   const file = listenerFile(endpoint);
   const me = { pid: process.pid, startedAt: Date.now(), beat: Date.now(), source: input.hook_event_name ?? null };

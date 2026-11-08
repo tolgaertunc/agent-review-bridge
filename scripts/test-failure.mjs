@@ -7,7 +7,7 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-failure-"));
 Object.assign(process.env, {
@@ -385,17 +385,17 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
 // earlier session leaves the new one's paths alone
 {
   const A = { app: "claude", id: "claude-fail-auto" };
-  await call("auto_set", { endpoint: A, on: true, thread: "old-thread", paths: [{ path: "/x", fp: "f1", head: "h1" }] });
+  await call("auto_set", { endpoint: A, on: true, reviewer: { app: "openai", id: "old-thread" }, paths: [{ path: "/x", fp: "f1", head: "h1" }] });
   const { id } = await call("link_create", { primary: A, advisor: GPT, mode: "review", request: "Old session.", reqPaths: [{ path: "/x", fp: "f2", head: "h2" }] });
   await call("auto_set", { endpoint: A, on: false });
   await sleep(5);
   const fresh = await call("auto_set", { endpoint: A, on: true });
-  assert.equal(fresh.thread, null, "a new reviewer chat");
+  assert.equal(fresh.reviewer, null, "a new reviewer chat");
   assert.deepEqual(fresh.paths, {}, "paths as they are now");
   await call("advise", { endpoint: GPT, requestId: reqOf(id).id, decision: "approved" });
   assert.deepEqual(state().auto["claude:claude-fail-auto"].paths, {}, "the old session's approval doesn't land here");
-  const kept = await call("auto_set", { endpoint: A, on: true, thread: "t2" });
-  assert.equal((await call("auto_set", { endpoint: A, on: true })).thread, "t2", "turning it on while on keeps the chat");
+  const kept = await call("auto_set", { endpoint: A, on: true, reviewer: { app: "openai", id: "t2" } });
+  assert.deepEqual((await call("auto_set", { endpoint: A, on: true })).reviewer, { app: "openai", id: "t2" }, "turning it on while on keeps the chat");
   assert.equal(kept.since, fresh.since);
   console.log("12 auto mode on again starts fresh; a late approval from before doesn't touch it");
 }
@@ -766,6 +766,84 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   delete process.env.CODEX_HOME;
   fs.rmSync(home, { recursive: true, force: true });
   console.log("16 a ChatGPT reviewer with an unanswered sandbox escalation: told once as a possibility (both call shapes, turn unknown or unreadable, only the end of a large rollout, a rollout that shows up late, a yielded command still running, notify() outputs before or after a yield); nothing when answered (also through a later wait or write_stdin, one that notified first, or with a running line in the command's own output), too new, from before, half written, without a rollout, or for the word in a command; advisor mode out");
+}
+
+// 17. auto mode from ChatGPT: the bridge can't make a Claude chat, so the
+// first review is joined by one, which then stays the reviewer: only for that
+// review, in the same auto session, while there is none. Between reviews it
+// still listens, and doesn't read the user's other chats, in either direction.
+{
+  const { reviewerOf, standingReviewer } = await import("../src/auto.mjs");
+  const W = { app: "openai", id: "gpt-auto-worker" };
+  const R = { app: "claude", id: "claude-auto-reviewer" };
+  const other = { app: "claude", id: "claude-other-reviewer" };
+  // state from before: a ChatGPT thread id reads as that chat
+  assert.deepEqual(reviewerOf({ thread: "t-old" }), { app: "openai", id: "t-old" });
+  assert.ok(standingReviewer({ auto: { "claude:x": { on: true, thread: "t-old" } } }, { app: "openai", id: "t-old" }));
+  assert.ok(!standingReviewer({ auto: { "claude:x": { on: false, thread: "t-old" } } }, { app: "openai", id: "t-old" }), "only while auto mode is on");
+  // an owner that loads such state moves it to `reviewer` (a broker of its own, on its own data)
+  const old = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-oldstate-"));
+  try {
+    const legacy = { seq: 0, messages: [], links: {}, linkSeq: 0, notes: [], endpoints: {}, auto: { "claude:c-old": { on: true, since: 1, paths: {}, turns: 0, thread: "t-old" } } };
+    fs.writeFileSync(path.join(old, "state.json"), JSON.stringify(legacy));
+    const brokerUrl = new URL("../src/broker.mjs", import.meta.url).href;
+    const script = `const b = await import(${JSON.stringify(brokerUrl)}); const st = await b.call("status", { endpoint: { app: "claude", id: "c-old" } }); console.log(JSON.stringify(st.auto)); process.exit(0);`;
+    const out = execFileSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, AGENT_REVIEW_BRIDGE_DIR: old, AGENT_REVIEW_BRIDGE_PORT: "7477" }, encoding: "utf8" });
+    const migrated = JSON.parse(out.trim().split("\n").at(-1));
+    assert.deepEqual(migrated.reviewer, { app: "openai", id: "t-old" }, "the old thread is the reviewer");
+    assert.ok(!("thread" in migrated), "and the old field is gone");
+  } finally {
+    fs.rmSync(old, { recursive: true, force: true });
+  }
+  await call("auto_set", { endpoint: W, on: true });
+  // a join that isn't auto mode's own review doesn't bind anything
+  const plain = await call("link_create", { primary: W, mode: "review", request: "A join of its own." });
+  assert.equal((await call("link_join", { code: plain.joinCode, endpoint: other })).autoReviewer, undefined);
+  assert.equal(state().auto["openai:gpt-auto-worker"].reviewer, null);
+  // auto mode's first review, asked twice before anyone joined: a chat in the
+  // same app can't take it (the code stays valid); the chat that joins
+  // becomes the reviewer, and the earlier try's code goes
+  const earlier = await call("link_create", { primary: W, mode: "review", request: "Auto's first review, first try.", autoReviewer: true });
+  const first = await call("link_create", { primary: W, mode: "review", request: "Auto's first review.", autoReviewer: true });
+  await assert.rejects(call("link_join", { code: first.joinCode, endpoint: { app: "openai", id: "gpt-same-app" } }), /for auto mode's reviewer, a chat in the other app: paste it into a Claude Code chat/);
+  assert.ok(state().links[first.id].joinCode, "the code stays valid");
+  assert.equal((await call("link_join", { code: first.joinCode, endpoint: R })).autoReviewer, true);
+  assert.deepEqual(state().auto["openai:gpt-auto-worker"].reviewer, R);
+  assert.equal(state().links[earlier.id].active, false, "the earlier try's code goes");
+  await assert.rejects(call("link_join", { code: earlier.joinCode, endpoint: other }), /no open link with that join code/);
+  // a second one doesn't replace it
+  const second = await call("link_create", { primary: W, mode: "review", request: "Another first?", autoReviewer: true });
+  assert.equal((await call("link_join", { code: second.joinCode, endpoint: other })).autoReviewer, undefined);
+  assert.deepEqual(state().auto["openai:gpt-auto-worker"].reviewer, R, "auto mode keeps its reviewer");
+  // between reviews: refused other chats, in both directions
+  await call("advise", { endpoint: R, requestId: reqOf(first.id).id, decision: "approved" });
+  assert.equal(state().links[first.id].active, false, "the review's link is closed");
+  assert.equal((await call("read_chat_allowed", { endpoint: R })).allowed, false, "a Claude chat reviewing a ChatGPT chat's auto mode");
+  const C = { app: "claude", id: "claude-auto-worker" };
+  const T = { app: "openai", id: "gpt-named-reviewer" };
+  await call("auto_set", { endpoint: C, on: true, reviewer: T });
+  assert.equal((await call("read_chat_allowed", { endpoint: T })).allowed, false, "a ChatGPT chat named as a Claude chat's reviewer");
+  await call("auto_set", { endpoint: C, on: false });
+  assert.equal((await call("read_chat_allowed", { endpoint: T })).allowed, true, "allowed again once that auto mode is off");
+  // a reviewer that stops its reviews is no longer auto mode's: its next review asks for a new one
+  assert.deepEqual((await call("link_close", { endpoint: R })).released, ["openai:gpt-auto-worker"]);
+  assert.equal(state().auto["openai:gpt-auto-worker"].reviewer, null);
+  assert.equal((await call("read_chat_allowed", { endpoint: R })).allowed, true);
+  await call("auto_set", { endpoint: W, on: true, reviewer: R }); // as it was, for what follows
+  // a review from an earlier auto session doesn't bind the new one
+  const late = await call("link_create", { primary: W, mode: "review", request: "Before off and on.", autoReviewer: true });
+  await call("auto_set", { endpoint: W, on: false });
+  assert.equal((await call("read_chat_allowed", { endpoint: R })).allowed, true, "no longer a reviewer once auto mode is off");
+  await sleep(5);
+  await call("auto_set", { endpoint: W, on: true });
+  assert.equal((await call("link_join", { code: late.joinCode, endpoint: R })).autoReviewer, undefined, "another auto session");
+  assert.equal(state().auto["openai:gpt-auto-worker"].reviewer, null, "a fresh start has no reviewer yet");
+  // without auto mode on: never marked
+  await call("auto_set", { endpoint: W, on: false });
+  const noAuto = await call("link_create", { primary: W, mode: "review", request: "No auto mode.", autoReviewer: true });
+  assert.equal(state().links[noAuto.id].autoReviewer, undefined);
+  for (const id of [second.id, late.id, noAuto.id, plain.id]) await call("link_close", { linkId: id });
+  console.log("17 auto mode from ChatGPT: the Claude chat that joins its first review stays its reviewer (not another join, a second one or an earlier session's); a chat in the same app can't, an earlier try's code goes; a standing reviewer reads no other chats, in either direction, until it unlinks or auto mode is off");
 }
 
 fs.rmSync(dir, { recursive: true, force: true });
