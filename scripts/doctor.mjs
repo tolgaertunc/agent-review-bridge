@@ -245,7 +245,7 @@ function runs(cmd, shell) {
     api
       ? ok(A, "thread queue API", "available (experimental)")
       : fail(A, "thread queue API", "missing in this app version", "This version of ChatGPT Desktop can't be driven; wakes won't work.");
-  for (const [event, kind] of [["stop", "stop"], ["userPromptSubmit", "prompt"]]) {
+  for (const [event, kind] of [["stop", "stop"], ["userPromptSubmit", "prompt"], ["sessionStart", "start"]]) {
     const label = `${event} hook`;
     const h = listed.find((x) => x.eventName === event && x.command?.includes("hook.mjs") && x.command.includes(`--event ${kind}`));
     if (!h) {

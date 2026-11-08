@@ -15,7 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { dataDir } from "./platform.mjs";
-import { autoKey } from "./auto.mjs";
+import { autoKey, reviewerOf, standingReviewer } from "./auto.mjs";
 
 export const DATA_DIR = dataDir();
 export const STATE_FILE = path.join(DATA_DIR, "state.json");
@@ -27,7 +27,7 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.AGENT_REVIEW_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 18);
+export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 19);
 
 export const SIDES = ["claude", "openai"];
 // Claude Desktop's session ids, as claude://code/continue?session= accepts them
@@ -221,6 +221,23 @@ export function inlineText(m) {
 // again if the hook output was cut
 export const claudeWakeText = (m) => `[AGENT-REVIEW-BRIDGE] (If this looks cut off, bridge_receive with id "${m.id}" returns it in full.)\n${inlineText(m)}`;
 
+// Is this prompt one of the bridge's own deliveries to this chat in the last
+// day (a ChatGPT thread runs them as prompts), not something the user typed?
+// Its whole text, or, should an app update change it a little (line endings,
+// spacing, a cut), its first line and the fixed agent-message line. Read
+// from the state alone, so hooks can tell too.
+export function bridgePrompt(state, endpoint, prompt) {
+  const text = String(prompt ?? "").trim();
+  const norm = (s) => s.replace(/\s+/g, " ").trim();
+  return (state?.messages ?? []).some(
+    (m) =>
+      m.dispatch &&
+      sameEndpoint(m.toEndpoint, endpoint) &&
+      Date.now() - m.ts < DAY &&
+      (inlineText(m).trim() === text || (norm(text).startsWith(norm(inlineText(m).split("\n")[0])) && text.includes(AGENT_LINE))),
+  );
+}
+
 async function deliverToCodex(threadId, text, clientId) {
   if (process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX) {
     if (process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX === "fail") throw new Error("ChatGPT Desktop not reachable (test)");
@@ -269,6 +286,13 @@ class BrokerState {
       this.s = freshState();
     }
     delete this.s.widgets; // left over from the MCP Apps panel spike
+    // auto mode's reviewer was a ChatGPT thread id before it could be a chat
+    // in either app
+    for (const e of Object.values(this.s.auto ?? {}))
+      if (e && e.reviewer === undefined) {
+        e.reviewer = reviewerOf(e);
+        delete e.thread;
+      }
   }
 
   // Bounded state: read messages and delivered notes go after a day, anything
@@ -604,12 +628,12 @@ class BrokerState {
   }
 
   // ------------------------------------------------------------ auto mode
-  // Per chat: on/off, the reviewer chat it keeps using, and per path the
-  // content last approved and the commit to compare from. A path enters when
-  // auto mode is turned on (the chat's folder, as it is then) or when a
-  // review names it.
+  // Per chat: on/off, the reviewer it keeps using (a chat in the other app),
+  // and per path the content last approved and the commit to compare from. A
+  // path enters when auto mode is turned on (the chat's folder, as it is then)
+  // or when a review names it.
 
-  op_auto_set({ endpoint, on, thread, model, effort, paths }) {
+  op_auto_set({ endpoint, on, reviewer, model, effort, paths }) {
     if (!endpoint?.app || !endpoint?.id) throw new Error("this chat is unknown");
     const key = autoKey(endpoint);
     if (!on) {
@@ -619,8 +643,8 @@ class BrokerState {
     const prev = this.s.auto?.[key];
     // turned on again after it was off: a fresh start, with a new reviewer
     // chat (unless one is named) and the paths as they are now
-    const entry = prev?.on ? { ...prev } : { paths: {}, turns: 0, on: true, since: Date.now(), thread: null };
-    if (thread !== undefined) entry.thread = thread;
+    const entry = prev?.on ? { ...prev } : { paths: {}, turns: 0, on: true, since: Date.now(), reviewer: null };
+    if (reviewer !== undefined) entry.reviewer = reviewer;
     if (model !== undefined) entry.model = model;
     if (effort !== undefined) entry.effort = effort;
     // paths named when turning it on start from their state at that moment
@@ -629,12 +653,12 @@ class BrokerState {
     return entry;
   }
 
-  // the reviewer chat auto mode keeps using, once it exists, and the model
-  // and effort it was made with if auto mode wasn't given them
-  op_auto_thread({ endpoint, thread, model, effort }) {
+  // the reviewer chat auto mode keeps using, once the bridge has made it, and
+  // the model and effort it was made with if auto mode wasn't given them
+  op_auto_reviewer({ endpoint, reviewer, model, effort }) {
     const entry = this.s.auto?.[autoKey(endpoint)];
     if (!entry?.on) return { ok: true };
-    entry.thread = thread;
+    entry.reviewer = reviewer;
     if (model && entry.model == null) entry.model = model;
     if (effort && entry.effort == null) entry.effort = effort;
     return { ok: true };
@@ -709,7 +733,7 @@ class BrokerState {
   // mode "advisor": every turn of the primary is reviewed; one per primary.
   // mode "review": one request, one answer, then the link closes.
   // The advisor is bound now (a thread the bridge created) or later via code.
-  op_link_create({ primary, advisor, mode = "advisor", name, request, plan, noGate, reqPaths }) {
+  op_link_create({ primary, advisor, mode = "advisor", name, request, plan, noGate, reqPaths, autoReviewer }) {
     if (!primary?.app || !primary?.id) throw new Error("primary endpoint unknown (caller identity missing)");
     if (mode === "advisor")
       for (const l of Object.values(this.s.links))
@@ -724,6 +748,9 @@ class BrokerState {
       if (plan && noGate) link.noGate = true; // an auto-mode consult the agent started
       if (reqPaths?.length) link.reqPaths = reqPaths; // what an approval covers
       link.autoSince = this.autoSession(primary);
+      // auto mode's first review where the bridge can't make the reviewer
+      // chat: the chat that joins becomes auto mode's reviewer
+      if (autoReviewer && !advisor && link.autoSince != null) link.autoReviewer = true;
     } else link.generation = 0; // bumped by each real user prompt
     this.s.links[id] = link;
     // a plan's paths are context: a plan approval approves no content
@@ -737,11 +764,25 @@ class BrokerState {
     const link = Object.values(this.s.links).find((l) => l.active && l.joinCode && l.joinCode === code);
     if (!link) throw new Error("no open link with that join code");
     if (sameEndpoint(link.primary, endpoint)) throw new Error("a chat can't advise itself");
+    // auto mode's reviewer works in the other app; the code stays valid for it
+    if (link.autoReviewer && endpoint.app === link.primary.app)
+      throw new Error(`this code is for auto mode's reviewer, a chat in the other app: paste it into a ${link.primary.app === "openai" ? "Claude Code" : "ChatGPT"} chat`);
     link.advisor = endpoint;
     delete link.joinCode;
-    logEvent({ op: "link_join", id: link.id, advisor: endpoint });
+    // the requester's auto mode keeps this chat as its reviewer: only for the
+    // review auto mode itself sent out for one, in the same auto session, and
+    // only while it has none
+    const auto = this.s.auto?.[autoKey(link.primary)];
+    const adopted = link.mode === "review" && !!link.autoReviewer && link.autoSince === this.autoSession(link.primary) && !reviewerOf(auto);
+    if (adopted) {
+      auto.reviewer = endpoint;
+      // codes from earlier tries at that first review aren't needed any more
+      for (const l of Object.values(this.s.links))
+        if (l !== link && l.active && l.autoReviewer && !l.advisor && sameEndpoint(l.primary, link.primary)) Object.assign(l, { active: false, closedAt: Date.now() });
+    }
+    logEvent({ op: "link_join", id: link.id, advisor: endpoint, ...(adopted && { autoReviewer: true }) });
     this.sendReviewRequest(link);
-    return { id: link.id, mode: link.mode, primary: link.primary, ...(link.plan && { plan: true }) };
+    return { id: link.id, mode: link.mode, primary: link.primary, ...(link.plan && { plan: true }), ...(adopted && { autoReviewer: true }) };
   }
 
   // the one request of a "review" link, once its reviewer is known
@@ -834,8 +875,19 @@ class BrokerState {
         closed.push(l.id);
       }
     }
-    logEvent({ op: "link_close", closed });
-    return { closed };
+    // a chat that stops its reviews is no longer an auto mode's reviewer
+    // either: that auto mode's next review asks for a new one
+    const released = [];
+    if (!linkId && endpoint)
+      for (const [key, e] of Object.entries(this.s.auto ?? {})) {
+        const r = e?.on && reviewerOf(e);
+        if (r && sameEndpoint(r, endpoint)) {
+          e.reviewer = null;
+          released.push(key);
+        }
+      }
+    logEvent({ op: "link_close", closed, ...(released.length && { released }) });
+    return { closed, ...(released.length && { released }) };
   }
 
   // A prompt the bridge itself delivered (a ChatGPT thread runs its queue as
@@ -859,15 +911,7 @@ class BrokerState {
   // The same test without using a delivery up (the advisor's turn_start may
   // already have matched it): any delivery to this chat in the last day
   looksFromBridge(endpoint, prompt) {
-    const text = prompt.trim();
-    const norm = (s) => s.replace(/\s+/g, " ").trim();
-    return this.s.messages.some(
-      (m) =>
-        m.dispatch &&
-        sameEndpoint(m.toEndpoint, endpoint) &&
-        Date.now() - m.ts < DAY &&
-        (inlineText(m).trim() === text || (norm(text).startsWith(norm(inlineText(m).split("\n")[0])) && text.includes(AGENT_LINE))),
-    );
+    return bridgePrompt(this.s, endpoint, prompt);
   }
 
   // From the primary's UserPromptSubmit hook: what the user asked this turn.
@@ -1129,9 +1173,10 @@ class BrokerState {
   }
 
   // May this chat read the user's other chats? Not one the bridge created to
-  // review or advise, nor one reviewing or advising through an open link
+  // review or advise, nor one reviewing or advising through an open link, nor
+  // an auto mode's reviewer between its reviews
   op_read_chat_allowed({ endpoint }) {
-    if (this.s.reviewerChats?.[`${endpoint.app}:${endpoint.id}`]) return { allowed: false };
+    if (this.s.reviewerChats?.[`${endpoint.app}:${endpoint.id}`] || standingReviewer(this.s, endpoint)) return { allowed: false };
     return { allowed: !Object.values(this.s.links).some((l) => l.active && sameEndpoint(l.advisor, endpoint)) };
   }
 

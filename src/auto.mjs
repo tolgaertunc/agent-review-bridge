@@ -8,6 +8,19 @@ export const REMIND_AFTER = 5;
 export const autoKey = (endpoint) => `${endpoint.app}:${endpoint.id}`;
 export const autoFor = (state, endpoint) => (endpoint && state?.auto?.[autoKey(endpoint)]?.on ? state.auto[autoKey(endpoint)] : null);
 
+// The chat in the other app an auto mode keeps as its reviewer, if it has one
+// yet (state from before this was a ChatGPT thread id: `thread`)
+export const reviewerOf = (entry) => entry?.reviewer ?? (entry?.thread ? { app: "openai", id: entry.thread } : null);
+
+// Is this chat the reviewer of an auto mode that is on? It stays one between
+// reviews: it keeps listening for the next one, and doesn't read other chats.
+export const standingReviewer = (state, endpoint) =>
+  !!endpoint &&
+  Object.values(state?.auto ?? {}).some((e) => {
+    const r = e?.on && reviewerOf(e);
+    return !!r && r.app === endpoint.app && r.id === endpoint.id;
+  });
+
 // To the working agent in full when auto mode is turned on and whenever its
 // session starts again (a compaction may have summarised them away)
 export const AUTO_RULES =
@@ -41,11 +54,15 @@ export const AUTO_REVIEWER =
 export const AUTO_REMINDER =
   "[AGENT-REVIEW-BRIDGE] For your information: you haven't consulted the reviewer for a few turns. If a decision or a change since then calls for it, ask now; if not, carry on.";
 
+// How the Stop check's words begin. ChatGPT goes on with a turn a Stop hook
+// stopped by giving it those words as a new prompt: that prompt isn't the user's.
+export const GUARD_HEAD = "[AGENT-REVIEW-BRIDGE] Auto mode";
+
 // From the Stop check, once for the same unreviewed changes in auto mode
 export const autoGuard = (unreviewed, unchecked = []) =>
   [
-    unreviewed.length && `[AGENT-REVIEW-BRIDGE] Auto mode: the reviewer hasn't approved the current changes in ${unreviewed.join(", ")}.`,
-    unchecked.length && `[AGENT-REVIEW-BRIDGE] Auto mode couldn't check ${unchecked.join("; ")}: tell the user, since unreviewed changes there can't be caught.`,
+    unreviewed.length && `${GUARD_HEAD}: the reviewer hasn't approved the current changes in ${unreviewed.join(", ")}.`,
+    unchecked.length && `${GUARD_HEAD} couldn't check ${unchecked.join("; ")}: tell the user, since unreviewed changes there can't be caught.`,
     unreviewed.length &&
       "Ask for a review (bridge_review) before you finish, or tell the user why not; telling them doesn't count as approval, the changes stay unreviewed.",
     "If you are waiting for the user's answer or have to stop for another reason, you can stop now.",

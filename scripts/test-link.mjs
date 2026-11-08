@@ -18,7 +18,7 @@ const sameTo = (a, b) => !!a && a.app === b.app && a.id === b.id;
 // It runs the version before this one, as after a real update.
 const brokerUrl = new URL("../src/broker.mjs", import.meta.url).href;
 const stale = spawn(process.execPath, ["--input-type=module", "-e", `const b=await import(${JSON.stringify(brokerUrl)});await b.call("status");console.log("owner");setInterval(()=>{},1000);`], {
-  env: { ...process.env, AGENT_REVIEW_BRIDGE_TEST_PROTOCOL: "17" },
+  env: { ...process.env, AGENT_REVIEW_BRIDGE_TEST_PROTOCOL: "18" },
 });
 await new Promise((r) => stale.stdout.once("data", r));
 const { call, inlineText, nextStep } = await import("../src/broker.mjs");
@@ -975,6 +975,92 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   assert.doesNotMatch(nextStep({ ...failed, auto: true, retried: true }), /Auto mode/, "a failed retry gives no new one");
   assert.doesNotMatch(nextStep({ kind: "failed", auto: true }), /Auto mode/, "not a review: nothing to retry");
   console.log("35 plan paths aren't tracked, a never-approved path that is gone drops out, citations are taken out, a failed review's retry rule");
+}
+
+// 37. auto mode from ChatGPT, its hooks: the end-of-turn check stops once per
+// set of changes, a turn ChatGPT already continued included; the bridge's own
+// deliveries and the check's own words, which ChatGPT runs as prompts, aren't
+// the user's; the rules again at session start; and the Claude chat that is
+// its reviewer keeps listening between reviews, until auto mode is off
+{
+  const { execFileSync } = await import("node:child_process");
+  const { fingerprint } = await import("../src/git.mjs");
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-gptauto-"));
+  try {
+    const g = (...a) => execFileSync("git", ["-C", work, "-c", "user.name=t", "-c", "user.email=t@t", ...a], { encoding: "utf8" });
+    g("init", "-q");
+    fs.writeFileSync(path.join(work, "a.js"), "1\n");
+    g("add", ".");
+    g("commit", "-qm", "init");
+    const head = g("rev-parse", "HEAD").trim();
+    const W = { app: "openai", id: "gpt-auto-37" };
+    const R = { app: "claude", id: "claude-reviewer-37" };
+    const key = `openai:${W.id}`;
+    await call("auto_set", { endpoint: W, on: true, paths: [{ path: work, fp: fingerprint(work).hash, head }] });
+    const stop = async (extra = {}) => {
+      const r = await runHook("openai", "stop", { session_id: W.id, cwd: work, ...extra });
+      return r.out ? JSON.parse(r.out) : null;
+    };
+    const prompt = (p, turn) => runHook("openai", "prompt", { session_id: W.id, cwd: work, prompt: p, turn_id: turn });
+    fs.writeFileSync(path.join(work, "a.js"), "2\n");
+    const first = await stop({ stop_hook_active: true });
+    assert.equal(first?.decision, "block", "a turn ChatGPT already continued is checked too");
+    assert.equal(await stop({ stop_hook_active: true }), null, "the same changes: once");
+    fs.writeFileSync(path.join(work, "a.js"), "3\n");
+    const again = await stop({ stop_hook_active: true });
+    assert.equal(again?.decision, "block", "new changes: checked again");
+    // ChatGPT goes on with the check's words as a new prompt: not the user's,
+    // nor wrapped in other words
+    await prompt(again.reason, "c1");
+    assert.equal(await stop(), null, "the check's own words don't make it stop the same changes again");
+    await prompt(`Continue. ${again.reason}`, "c1b");
+    assert.equal(await stop(), null, "nor wrapped in other words");
+    // even if such a prompt were taken for the user's (the record cleared), the
+    // same changes don't stop the turn ChatGPT goes on with; new changes do
+    fs.writeFileSync(path.join(work, "a.js"), "4\n");
+    assert.equal((await stop())?.decision, "block");
+    fs.rmSync(path.join(dir, "turns", "openai-gpt-auto-37.auto-guard.json"));
+    assert.equal(await stop({ stop_hook_active: true }), null, "the turn it went on with isn't stopped again for the same changes");
+    fs.writeFileSync(path.join(work, "a.js"), "5\n");
+    assert.equal((await stop({ stop_hook_active: true }))?.decision, "block", "new changes in it are");
+    // a review result the bridge delivered, run as a prompt: not the user's either
+    const r = await call("link_create", { primary: W, mode: "review", advisor: R, request: "check 3", reqPaths: [{ path: work, fp: fingerprint(work).hash, head }] });
+    await call("receive", { side: "claude", endpoint: R }); // the reviewer reads it, as a woken session does
+    await call("advise", { endpoint: R, requestId: state().messages.find((m) => m.linkId === r.id && m.kind === "review-request").id, decision: "changes_requested", blocking: [{ title: "x" }] });
+    const result = await until(() => state().messages.find((m) => m.linkId === r.id && m.kind === "review-result" && m.dispatch?.state === "sent"));
+    await prompt(inlineText(result), "c2");
+    assert.equal(await stop(), null, "a delivery doesn't make it stop the same changes again");
+    await sleep(300);
+    assert.equal(state().auto[key].turns, 0, "neither counts as a user turn");
+    // the user's own prompt: a new start
+    await prompt("go on", "u1");
+    await until(() => state().auto[key].turns === 1);
+    assert.equal((await stop())?.decision, "block", "after the user's prompt the same changes stop the turn again");
+    // a review waiting for someone to join with its code doesn't hold the check back
+    const unjoined = await call("link_create", { primary: W, mode: "review", request: "waiting for a code" });
+    fs.writeFileSync(path.join(work, "a.js"), "6\n");
+    assert.equal((await stop())?.decision, "block", "an unjoined review doesn't count as waiting");
+    await call("link_close", { linkId: unjoined.id });
+    // the rules again when the chat starts again
+    const start = JSON.parse((await runHook("openai", "start", { session_id: W.id, source: "compact" })).out).hookSpecificOutput;
+    assert.equal(start.hookEventName, "SessionStart");
+    assert.match(start.additionalContext, /Get its approval at the moments that matter, not at every small step/);
+    // its Claude reviewer keeps listening between reviews (the review's link is closed)
+    await call("auto_set", { endpoint: W, on: true, reviewer: R });
+    assert.equal(state().links[r.id].active, false);
+    const file = path.join(dir, "listeners", "claude-claude-reviewer-37.json");
+    const listener = runHook("claude", "listen", { session_id: R.id }, { killAfter: 9000 });
+    await until(() => fs.existsSync(file));
+    await sleep(1500);
+    assert.ok(fs.existsSync(file), "still listening between reviews");
+    await call("auto_set", { endpoint: W, on: false });
+    const done = await listener;
+    assert.equal(done.code, 0, "auto mode off: it stops listening on its own");
+    assert.equal((await runHook("openai", "start", { session_id: W.id, source: "resume" })).out, "", "auto mode off: nothing at session start");
+    console.log("37 auto mode from ChatGPT: the turn check once per set of changes (continued turns too, bounded even if its words were taken for the user's), deliveries and the check's own words aren't user prompts, an unjoined review doesn't hold it back, rules at session start, its Claude reviewer listens until auto mode is off");
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
 }
 
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));
