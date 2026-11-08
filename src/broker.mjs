@@ -27,7 +27,7 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.AGENT_REVIEW_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 17);
+export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 18);
 
 export const SIDES = ["claude", "openai"];
 // Claude Desktop's session ids, as claude://code/continue?session= accepts them
@@ -59,7 +59,7 @@ const PEER_BURST = { count: 60, windowMs: 10 * 60_000 };
 // deadline. Each read has its own time limit. (Tests scale it down.)
 const WATCH_SCALE = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_WATCH_SCALE) || 1;
 const WATCH = Object.fromEntries(
-  Object.entries({ first: 15_000, second: 60_000, every: 60_000, deadline: 6 * 3600_000, read: 15_000, stuck: 60_000 }).map(([k, v]) => [k, Math.max(20, v * WATCH_SCALE)]),
+  Object.entries({ first: 15_000, second: 60_000, every: 60_000, deadline: 6 * 3600_000, read: 15_000, stuck: 60_000, approval: 60_000 }).map(([k, v]) => [k, Math.max(20, v * WATCH_SCALE)]),
 );
 
 for (const d of [DATA_DIR, OUTBOX_DIR, LISTENERS_DIR, TURNS_DIR]) fs.mkdirSync(d, { recursive: true });
@@ -94,7 +94,7 @@ export function pendingFor(state, endpoint) {
 export const listenerFile = (endpoint) => path.join(LISTENERS_DIR, `${safeName(endpoint)}.json`);
 export const turnFile = (endpoint) => path.join(TURNS_DIR, `${safeName(endpoint)}.json`);
 
-const OUTBOX_OPS = new Set(["turn_start", "turn_end", "notes_ack", "wake_ack", "auto_prompt", "turn_ok", "turn_failed"]);
+const OUTBOX_OPS = new Set(["turn_start", "turn_end", "notes_ack", "wake_ack", "auto_prompt", "turn_ok", "turn_failed", "permission_wait"]);
 
 function token() {
   try {
@@ -143,6 +143,8 @@ export function nextStep(m) {
       );
     return `${told} Ask again only if the user wants to (after the reset time, if one is given)${again}`;
   }
+  if (m.kind === "waiting" && m.maybe) return "Tell the user, in their language, that the other chat may be waiting for their approval in ChatGPT Desktop, and to check it. Don't ask again.";
+  if (m.kind === "waiting") return "Tell the user, in their language, that the other chat is waiting for their approval there. Don't ask again: the answer arrives once it's approved.";
   if (m.kind === "review-request") return `Review ${m.plan ? "the plan" : "it"}, then answer once with bridge_advise (request_id ${m.id}).`;
   if (m.kind === "advisory")
     return "Fix what holds up; if a finding is wrong, say why instead of complying. Your next turn is reviewed again. If you're going in circles or the rest needs a decision, stop and ask the user.";
@@ -210,6 +212,7 @@ export function inlineText(m) {
     "review-result": `The ${m.plan ? "plan review" : "review"} you asked for: ${m.id}`,
     stop: `Stop the fix loop: ${m.id}`,
     failed: `No answer is coming to ${m.about}: ${m.id}`,
+    waiting: m.maybe ? `The answer to ${m.about} may wait for the user's approval: ${m.id}` : `The answer to ${m.about} waits for the user's approval: ${m.id}`,
   }[m.kind] ?? `Message ${m.id}`;
   return [`${LABEL[m.from] ?? m.from.toUpperCase()}: ${title} (link ${m.linkId})`, m.text, `${AGENT_LINE} ${nextStep(m)}`].join("\n\n");
 }
@@ -482,6 +485,14 @@ class BrokerState {
       }
       m.dispatch = { ...m.dispatch, state: "sent", at: Date.now() };
     }
+    // not known to be over (running, queued, unreadable): the reviewer may be
+    // waiting on an approval nobody sees
+    if (!r?.completedAt)
+      try {
+        await this.checkApproval(m);
+      } catch (e) {
+        logEvent({ op: "approval-check", id: m.id, error: String(e.message || e) });
+      }
     if (error) logEvent({ op: "watch", id: m.id, error });
     else if (!r.completedAt) {
       // not over yet
@@ -930,6 +941,7 @@ class BrokerState {
     const link = this.s.links[req.linkId];
     if (!link?.active) throw new Error(`review request ${requestId} belongs to a closed link`);
     req.answeredAt = Date.now();
+    this.answered(req.id);
     const text = renderAnswer({ decision, note: withoutCitations(note), blocking, nits });
     link.advisories.push({ at: Date.now(), decision, text });
     if (link.mode === "review") {
@@ -1021,13 +1033,64 @@ class BrokerState {
     return { ok: true };
   }
 
-  post({ from, toEndpoint, kind, linkId, text, decision, lastRound, generation, about, retry, auto, retried }) {
+  // A Claude chat working for another waits on the user to approve a tool:
+  // whoever waits on what woke it is told, once per message. As with failures,
+  // only a one-off review or a message: in advisor mode the notice would start
+  // the primary's turn and with it a new review, again and again.
+  op_permission_wait({ endpoint, at, what }) {
+    if (!endpoint?.id || !at) return { skipped: true };
+    const asked = what && String(what).replace(/^Claude needs your permission to use /, "").slice(0, 200);
+    const tool = asked ? ` (${asked})` : "";
+    for (const m of this.s.messages) {
+      const link = this.s.links[m.linkId];
+      if (!watched(m, link) || !sameEndpoint(m.toEndpoint, endpoint)) continue;
+      if (!m.wokenAt || m.wokenAt > at || m.settledAt || m.approvalToldAt || this.settled(m)) continue;
+      if (!link?.active) continue; // closed: no answer can come back on it
+      const to = m.kind === "review-request" ? this.s.links[m.linkId]?.primary : m.fromEndpoint;
+      if (!to) continue;
+      m.approvalToldAt = at;
+      const text = `The Claude Code session ${endpoint.id} is waiting for the user to approve a tool in Claude Desktop${tool}. Its answer to ${m.id} comes after that.`;
+      this.post({ from: "bridge", toEndpoint: to, kind: "waiting", linkId: m.linkId, text, about: m.id });
+      logEvent({ op: "waiting", id: m.id });
+    }
+    return { ok: true };
+  }
+
+  // The answer to `id` is here: a notice that it waits for an approval, not
+  // delivered yet, would only contradict it
+  answered(id) {
+    for (const w of this.s.messages) if (w.kind === "waiting" && w.about === id && !w.readAt) w.readAt = Date.now();
+  }
+
+  // A ChatGPT reviewer asked to run a command outside its sandbox and has no
+  // result after a minute: it may be waiting on an approval nobody sees. Told
+  // once, as a possibility: its rollout records the request, never the decision.
+  async checkApproval(m) {
+    if (m.to !== "openai" || m.approvalToldAt || this.settled(m)) return;
+    const link = this.s.links[m.linkId];
+    const to = m.kind === "review-request" ? link?.primary : m.fromEndpoint;
+    if (!to || !link?.active) return;
+    const w = m.watch;
+    const { rolloutOf, pendingEscalation } = await import("./codex.mjs");
+    // looked for on every check until found (it may not exist yet)
+    if (!w.rollout) w.rollout = rolloutOf(m.toEndpoint.id);
+    if (!w.rollout) return;
+    const p = pendingEscalation(w.rollout, w.since);
+    if (!p || p.partial || Date.now() - p.at < WATCH.approval || m.approvalToldAt) return;
+    m.approvalToldAt = Date.now();
+    const why = p.justification ? ` (${p.justification})` : "";
+    const text = `The ChatGPT chat ${m.toEndpoint.id} asked to run a command outside its sandbox more than a minute ago and has no result yet${why}: it may be waiting for the user's approval in ChatGPT Desktop, or the command may still be running. Its answer to ${m.id} comes after that.`;
+    this.post({ from: "bridge", toEndpoint: to, kind: "waiting", linkId: m.linkId, text, about: m.id, maybe: true });
+    logEvent({ op: "waiting", id: m.id, maybe: true });
+  }
+
+  post({ from, toEndpoint, kind, linkId, text, decision, lastRound, generation, about, retry, auto, retried, maybe }) {
     const msg = { id: "m" + ++this.s.seq, from, to: toEndpoint.app, toEndpoint, kind, linkId, text: text.slice(0, MAX_TEXT), ts: Date.now(), readAt: null };
     // a review's request and result say whether it is a plan, and whether
     // its plan waits for the user, as its link decided (each message is
     // rendered on its own later, by the hooks too)
     const link = ["review-request", "review-result"].includes(kind) ? this.s.links[linkId] : null;
-    Object.assign(msg, link?.plan && { plan: true }, link?.plan && link.noGate && { noGate: true }, decision && { decision }, lastRound && { lastRound: true }, generation !== undefined && { generation }, about && { about }, retry && { retry }, auto && { auto: true }, retried && { retried: true });
+    Object.assign(msg, link?.plan && { plan: true }, link?.plan && link.noGate && { noGate: true }, decision && { decision }, lastRound && { lastRound: true }, generation !== undefined && { generation }, about && { about }, retry && { retry }, auto && { auto: true }, retried && { retried: true }, maybe && { maybe: true });
     this.s.messages.push(msg);
     logEvent({ op: "send", id: msg.id, from, to: toEndpoint, kind, linkId, len: msg.text.length });
     return { id: msg.id };
@@ -1101,6 +1164,7 @@ class BrokerState {
     if (recent >= PEER_BURST.count) throw new Error(`more than ${PEER_BURST.count} messages in 10 minutes; looks like a loop, wait a bit`);
     const r = this.post({ from: endpoint.app, toEndpoint: to, kind: "message", linkId: link.id, text });
     Object.assign(this.s.messages.at(-1), { fromEndpoint: endpoint }, replyTo && { replyTo });
+    if (replyTo) this.answered(replyTo);
     // the chat it goes to was last seen failing: say so
     const failure = this.s.endpoints?.[autoKey(to)]?.lastFailure;
     return { ...r, to, linkId: link.id, ...(failure && { lastFailure: failure }) };
@@ -1122,7 +1186,7 @@ class BrokerState {
     logEvent({ op: "receive", side, endpoint, ids: out.map((m) => m.id) });
     // everything nextStep reads goes along, so the instruction is the same as in a wake
     return {
-      messages: out.map(({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about, retry, auto, retried }) => ({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about, retry, auto, retried })),
+      messages: out.map(({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about, retry, auto, retried, maybe }) => ({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about, retry, auto, retried, maybe })),
     };
   }
 }

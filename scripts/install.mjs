@@ -45,7 +45,8 @@ function setHooks(cfg, wanted) {
       .filter((g) => g.hooks.length);
     if (!cfg.hooks[event].length) delete cfg.hooks[event];
   }
-  if (!uninstall) for (const [event, hooks] of Object.entries(wanted)) (cfg.hooks[event] ??= []).push({ hooks });
+  // a list of hooks, or a group with its matcher
+  if (!uninstall) for (const [event, want] of Object.entries(wanted)) (cfg.hooks[event] ??= []).push(Array.isArray(want) ? { hooks: want } : want);
   if (!Object.keys(cfg.hooks).length) delete cfg.hooks;
   return cfg;
 }
@@ -85,6 +86,9 @@ const CLAUDE_HOOKS = {
   // the auto mode rules again after a compaction or a resumed session
   SessionStart: [claudeListener, quick("claude", "start")],
   UserPromptSubmit: [quick("claude", "prompt")],
+  // a chat working for another waits on the user to approve a tool: whoever
+  // waits on it is told (only when the prompt is really shown and unanswered)
+  Notification: { matcher: "permission_prompt", hooks: [quick("claude", "permission")] },
 };
 const CODEX_HOOKS = {
   Stop: [quick("openai", "stop")],

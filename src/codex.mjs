@@ -13,7 +13,7 @@ import readline from "node:readline";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { findCodexCli, openUrl, dataDir } from "./platform.mjs";
+import { findCodexCli, openUrl, dataDir, codexHome } from "./platform.mjs";
 import { assemble, normalizeName, inFolder } from "./readchat.mjs";
 
 // No call waits for ever: an app-server that doesn't answer is given up on
@@ -245,6 +245,140 @@ export function summarizeLimits(r) {
     secondary: win(snap?.secondary),
     credits,
   };
+}
+
+// Where a thread's rollout is. Current threads have UUIDv7 ids, whose first 48
+// bits are when they were made, and the rollout sits in that day's folder (local
+// time); the days around it cover a clock change. Older threads (v4 ids) aren't
+// found: null, as when it isn't there.
+export function rolloutOf(threadId) {
+  const hex = String(threadId).replace(/-/g, "");
+  if (hex[12] !== "7") return null; // not a UUIDv7
+  const ms = parseInt(hex.slice(0, 12), 16);
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  const pad = (n) => String(n).padStart(2, "0");
+  for (const shift of [0, -86_400_000, 86_400_000]) {
+    const d = new Date(ms + shift);
+    const dir = path.join(codexHome(), "sessions", String(d.getFullYear()), pad(d.getMonth() + 1), pad(d.getDate()));
+    let names;
+    try {
+      names = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    const hit = names.find((n) => n.startsWith("rollout-") && n.endsWith(`-${threadId}.jsonl`));
+    if (hit) return path.join(dir, hit);
+  }
+  return null;
+}
+
+// The newest request in a rollout to run a command outside the sandbox that has
+// no result yet and was made at or after `since` (ms): { callId, at,
+// justification }, null, or { partial: true } when the last line isn't fully
+// written (decide nothing on it). Only the end of the file is read. The rollout
+// records the request, never the approval decision.
+//
+// A command that runs long hands back an interim output ("Script running with
+// cell ID …" from exec, "Process running with session ID …" from exec_command)
+// and goes on in the background; a later wait (cell_id) or write_stdin
+// (session_id) call reports on it. Such a request stays open until one of those
+// reports says it's done. An exec call's notify() outputs don't end it either.
+const ROLLOUT_TAIL = 512 * 1024;
+export function pendingEscalation(file, since) {
+  let text;
+  let cut;
+  try {
+    const fd = fs.openSync(file, "r");
+    try {
+      const size = fs.fstatSync(fd).size;
+      // one byte before the tail too, so a tail that begins right after a newline
+      // keeps its first line
+      const start = Math.max(0, size - ROLLOUT_TAIL - 1);
+      const buf = Buffer.alloc(size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      text = buf.toString("utf8");
+      cut = start > 0;
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+  // a read that began mid-file drops everything up to its first newline
+  const lines = (cut ? text.slice(text.indexOf("\n") + 1) : text).split("\n");
+  const last = lines.at(-1) === "" ? null : lines.pop(); // not followed by a newline yet
+  if (last !== null) {
+    try {
+      JSON.parse(last);
+      lines.push(last);
+    } catch {
+      return { partial: true };
+    }
+  }
+  const open = new Map(); // call_id -> request
+  const running = new Map(); // "cell:<id>" or "session:<id>" -> request
+  const reports = new Map(); // call_id of a wait / write_stdin -> request
+  // what an output says about its command, read from its header (the lines
+  // before "Output:", never the command's own output): "done", "running" with
+  // the cell or session it goes on in, or null when it has no such header
+  const statusOf = (out) => {
+    const t = Array.isArray(out) ? out.map((x) => (typeof x?.text === "string" ? x.text : "")).join("\n") : String(out ?? "");
+    const head = t.split(/^Output:/m)[0];
+    if (/^(Script completed|Script failed|Process exited with code)\b/m.test(head)) return { done: true };
+    const cell = head.match(/^Script running with cell ID (\S+)/m)?.[1];
+    if (cell) return { running: `cell:${cell}` };
+    const session = head.match(/^Process running with session ID (\d+)/m)?.[1];
+    return session ? { running: `session:${session}` } : null;
+  };
+  for (const line of lines) {
+    let r;
+    try {
+      r = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const p = r?.type === "response_item" ? r.payload : null;
+    if (!p?.call_id) continue;
+    if (p.type === "custom_tool_call_output" || p.type === "function_call_output") {
+      const req = open.get(p.call_id) ?? reports.get(p.call_id);
+      if (!req) continue;
+      const st = statusOf(p.output);
+      // an exec output without a header is one of its notify() calls, which add
+      // outputs while it runs (the request's own exec, or an exec that reports
+      // on it); any other output without one (an error, a refusal, an older
+      // tool's result) is the result
+      if (!st && p.type === "custom_tool_call_output") continue;
+      reports.delete(p.call_id);
+      if (st?.running) running.set(st.running, req); // still running: not its result yet
+      else {
+        open.delete(req.callId);
+        for (const [k, v] of running) if (v === req) running.delete(k);
+      }
+    } else if (p.type === "custom_tool_call" || p.type === "function_call") {
+      const call = String(p.input ?? p.arguments ?? "");
+      // a report on a command that is still running
+      const cell = call.match(/cell_id"?\s*:\s*"([^"]+)"/)?.[1];
+      const session = call.match(/session_id"?\s*:\s*"?(\d+)/)?.[1];
+      const req = (cell && running.get(`cell:${cell}`)) || (session && running.get(`session:${session}`));
+      if (req) {
+        reports.set(p.call_id, req);
+        continue;
+      }
+      // the parameter itself, not the word in a command or text
+      if (!/sandbox_permissions["']?\s*:\s*["']require_escalated["']/.test(call)) continue;
+      const at = Date.parse(r.timestamp);
+      if (!(at >= since)) continue;
+      const raw = call.match(/justification"?\s*:\s*"((?:[^"\\]|\\.)*)"/)?.[1] ?? null;
+      let why = raw;
+      try {
+        why = raw && JSON.parse(`"${raw}"`); // a JSON or JS string literal's escapes
+      } catch {
+        // keep it as written
+      }
+      open.set(p.call_id, { callId: p.call_id, at, justification: why && why.slice(0, 200) });
+    }
+  }
+  return [...open.values()].at(-1) ?? null;
 }
 
 // What became of a queued prompt: the turn whose user message carries its
