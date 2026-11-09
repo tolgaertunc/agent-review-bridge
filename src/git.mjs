@@ -74,37 +74,66 @@ export function baseline(cwd) {
 const capList = (title, items) =>
   items.length ? `${title}:\n${items.slice(0, MAX_LIST).join("\n")}${items.length > MAX_LIST ? `\n… ${items.length - MAX_LIST} more` : ""}` : null;
 
+// A turn's changes as text, within maxChars: the stat (a long one cut to its
+// first lines plus the summary line), new and edited untracked files, then
+// the patch. `range` is what git diff compares: a ref (against the working
+// tree) or two refs.
+function changesText(cwd, range, added, edited, { note = null, empty, maxChars }) {
+  const statLines = git(cwd, ["diff", "--stat", ...range, "--", ".", ...EXCLUDES]).trimEnd().split("\n").filter(Boolean);
+  if (!statLines.length && !added.length && !edited.length) return empty;
+  const stat = statLines.length > MAX_LIST + 1 ? [...statLines.slice(0, MAX_LIST), `… ${statLines.length - MAX_LIST - 1} more files`, statLines.at(-1)] : statLines;
+  const head = [note, stat.join("\n"), capList("New untracked files", added), capList("Edited untracked files (content not tracked by git)", edited)]
+    .filter(Boolean)
+    .join("\n\n");
+  let patch = git(cwd, ["diff", ...range, "--", ".", ...EXCLUDES]);
+  const room = maxChars - head.length - 40;
+  if (patch.length > room) patch = room > 0 ? patch.slice(0, room) + "\n… (diff truncated)" : "";
+  return `${head}\n\n${patch}`.trim().slice(0, maxChars);
+}
+
 // Diff of the working tree against a baseline (or HEAD without one); the
 // whole result, summary included, stays within maxChars
 export function turnDiff(cwd, base, maxChars) {
   if (!inWorkTree(cwd)) return null;
   try {
     const ref = base?.ref ?? headOrEmpty(cwd);
-    const statLines = git(cwd, ["diff", "--stat", ref, "--", ".", ...EXCLUDES]).trimEnd().split("\n").filter(Boolean);
     const before = base?.untracked ?? {};
     const now = untracked(cwd);
-    const added = now.filter((f) => !(f in before));
     const known = now.filter((f) => f in before);
     const nowHashes = hashes(cwd, known);
+    const added = now.filter((f) => !(f in before));
     const edited = known.filter((f) => nowHashes[f] !== before[f]);
-    if (!statLines.length && !added.length && !edited.length) return base ? "(no changes)" : null;
-    // a long stat is cut to its first lines plus the summary line
-    const stat = statLines.length > MAX_LIST + 1 ? [...statLines.slice(0, MAX_LIST), `… ${statLines.length - MAX_LIST - 1} more files`, statLines.at(-1)] : statLines;
-    const head = [
-      base ? null : "(no turn baseline: uncommitted changes against HEAD)",
-      stat.join("\n"),
-      capList("New untracked files", added),
-      capList("Edited untracked files (content not tracked by git)", edited),
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-    let patch = git(cwd, ["diff", ref, "--", ".", ...EXCLUDES]);
-    const room = maxChars - head.length - 40;
-    if (patch.length > room) patch = room > 0 ? patch.slice(0, room) + "\n… (diff truncated)" : "";
-    return `${head}\n\n${patch}`.trim().slice(0, maxChars);
+    return changesText(cwd, [ref], added, edited, {
+      note: base ? null : "(no turn baseline: uncommitted changes against HEAD)",
+      empty: base ? "(no changes)" : null,
+      maxChars,
+    });
   } catch {
     return null;
   }
+}
+
+// A turn's own changes between two snapshots (baseline() at its start and at
+// its end), so it reads the same when it is put together later: what the
+// work tree did after the turn ended isn't in it. Untracked files compare by
+// the hashes each snapshot kept. null when either snapshot is missing.
+export function snapshotDiff(cwd, base, snap, maxChars) {
+  if (!base?.ref || !snap?.ref || !inWorkTree(cwd)) return null;
+  try {
+    const before = base.untracked ?? {};
+    const after = snap.untracked ?? {};
+    const added = Object.keys(after).filter((f) => !(f in before));
+    const edited = Object.keys(after).filter((f) => f in before && after[f] !== before[f]);
+    return changesText(cwd, [base.ref, snap.ref], added, edited, { empty: "(no changes)", maxChars });
+  } catch {
+    return null;
+  }
+}
+
+// The command that shows a snapshot diff in full (secret paths left out)
+export function snapshotCommand(cwd, base, snap) {
+  const q = (a) => `'${a.replace(/'/g, `'\\''`)}'`;
+  return ["git", "-C", q(cwd), "diff", "--no-ext-diff", "--no-textconv", base.ref, snap.ref, "--", ".", ...EXCLUDES.map(q)].join(" ");
 }
 
 // ------------------------------------------------------- paths for review

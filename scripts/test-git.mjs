@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { baseline, turnDiff, pathInfo, reviewSummary, fingerprint, usableBase } from "../src/git.mjs";
+import { baseline, turnDiff, snapshotDiff, snapshotCommand, pathInfo, reviewSummary, fingerprint, usableBase } from "../src/git.mjs";
 
 // the fingerprint keeps a small cache in the bridge's data folder: a throwaway one here
 process.env.AGENT_REVIEW_BRIDGE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-gitdata-"));
@@ -237,4 +237,40 @@ function repo({ commit = true } = {}) {
   r.git("commit", "-qm", "orphan");
   assert.ok(!usableBase(pathInfo(r.d), first), "a commit off this branch isn't");
   console.log("git 7 a base off the current history isn't used");
+}
+
+// 8. a turn's own changes between two snapshots: a turn that commits (with a
+// new staged file) still shows them, a clean tree's snapshot is HEAD, a repo
+// without commits works, untracked files compare by hash, what came after the
+// end isn't in it, and secret files stay out
+{
+  const r = repo();
+  r.write("a.js", "2\n");
+  r.write("notes.txt", "kept\n");
+  const base = baseline(r.d);
+  r.write("a.js", "3\n");
+  r.write("b.js", "new\n");
+  r.write("notes.txt", "edited\n");
+  r.write(".env", "SECRET=1\n");
+  r.git("add", "a.js", "b.js");
+  r.git("commit", "-qm", "in the turn");
+  const end = baseline(r.d); // a.js and b.js committed: HEAD moved
+  r.write("a.js", "4\n"); // after the turn ended
+  const d = snapshotDiff(r.d, base, end, 20_000);
+  assert.match(d, /-2\n\+3/, "the committed change is the turn's");
+  assert.match(d, /b\.js/, "a new staged file too");
+  assert.match(d, /Edited untracked files \(content not tracked by git\):\nnotes\.txt/);
+  assert.doesNotMatch(d, /\+4|SECRET|\.env/, "nothing after the end, no secrets");
+  assert.match(snapshotCommand(r.d, base, end), new RegExp(`diff --no-ext-diff --no-textconv ${base.ref} ${end.ref} -- \\. ':\\(glob,exclude\\)\\*\\*/\\.env\\*'`));
+  // a clean tree: stash create makes nothing, HEAD stands in
+  const clean = repo();
+  assert.equal(snapshotDiff(clean.d, baseline(clean.d), baseline(clean.d), 20_000), "(no changes)");
+  // a repo without commits
+  const empty = repo({ commit: false });
+  const b0 = baseline(empty.d);
+  empty.write("x.js", "x\n");
+  assert.match(snapshotDiff(empty.d, b0, baseline(empty.d), 20_000), /New untracked files:\nx\.js/);
+  assert.equal(snapshotDiff(r.d, base, null, 20_000), null, "no end snapshot: nothing");
+  for (const x of [r, clean, empty]) fs.rmSync(x.d, { recursive: true, force: true });
+  console.log("git 8 a turn's own changes between snapshots: commits and staged files in it, untracked by hash, nothing after its end, no secrets, clean and commit-less repos");
 }

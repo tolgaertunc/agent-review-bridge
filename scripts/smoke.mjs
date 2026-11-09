@@ -430,6 +430,68 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   console.log("5e3 auto mode from ChatGPT: the first review's Claude chat stays the reviewer; later reviews and rounds go to it (opened by its Claude Desktop id when closed); an explicit join gets one of its own; new_reviewer drops it and keeps the approvals");
 }
 
+// 5e4. auto mode reviewing every turn, from the tools: on the Claude side the
+// reviewer chat is made at once; on the ChatGPT side a join code is given at
+// once (and not made again); the user's setting is the default; it switches
+// while on, keeping what was approved; an open advisor link is pointed out
+{
+  const made = () => JSON.parse(fs.readFileSync(path.join(dir, "fake-threads.json"), "utf8"));
+  const events = () => fs.readFileSync(path.join(dir, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const ce = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-every-smoke", CLAUDE_PROJECT_DIR: repo });
+  const on = textOf(await call(ce, "bridge_auto", { on: true, every_turn: true, model: "gpt-6.1-sol" }));
+  assert.match(on, /^Auto mode is on, with ChatGPT chat gpt-new-\d+ as the reviewer\. Every turn is reviewed on its own\./);
+  assert.match(on, /Auto mode is on, reviewing every turn: when one of your turns ends, the bridge sends it/);
+  assert.match(made().at(-1).name, /Auto mode: every turn$/);
+  const st = JSON.parse(textOf(await call(ce, "bridge_status"))).auto;
+  assert.equal(st.everyTurn, true);
+  assert.equal(st.reviewer.id, made().at(-1).threadId);
+  // switched while on: what was approved stays
+  const paths = st.paths;
+  assert.doesNotMatch(textOf(await call(ce, "bridge_auto", { on: true, every_turn: false })), /Every turn is reviewed/);
+  const st2 = JSON.parse(textOf(await call(ce, "bridge_status"))).auto;
+  assert.equal(st2.everyTurn, false);
+  assert.deepEqual(st2.paths, paths, "approvals and paths stay");
+  await call(ce, "bridge_auto", { on: false });
+  // the user's setting is the default, read when it is turned on
+  const cfg = path.join(env.AGENT_REVIEW_BRIDGE_CONFIG_DIR, "config.json");
+  fs.writeFileSync(cfg, JSON.stringify({ autoReviews: "every-turn" }));
+  try {
+    assert.match(textOf(await call(ce, "bridge_auto", { on: true, thread_id: "gpt-every-named" })), /with ChatGPT chat gpt-every-named as the reviewer\. Every turn is reviewed on its own\./);
+  } finally {
+    fs.rmSync(cfg, { force: true });
+  }
+  await call(ce, "bridge_auto", { on: false });
+  // with an advisor link open, said so
+  await call(ce, "bridge_link", { advisor: "join" });
+  assert.match(textOf(await call(ce, "bridge_auto", { on: true, every_turn: true, thread_id: "gpt-every-named" })), /This chat also has an advisor link \(L\d+\), so each turn may be reviewed twice/);
+  await call(ce, "bridge_auto", { on: false });
+  await call(ce, "bridge_unlink");
+  await ce.close();
+  // the ChatGPT side: a join code at once, the same one while it waits
+  const W = "gpt-every-smoke";
+  const meta = { ...asGpt(W), "x-codex-turn-metadata": { cwd: repo } };
+  const g1 = textOf(await call(openai, "bridge_auto", { on: true, every_turn: true }, meta));
+  const code = g1.match(/join the agent-review-bridge link with code ([0-9a-f]{6})/)?.[1];
+  assert.ok(code, "a join code at once");
+  assert.match(g1, /Until one joins, the reviews of your turns wait\./);
+  assert.equal(textOf(await call(openai, "bridge_auto", { on: true }, meta)).match(/code ([0-9a-f]{6})/)?.[1], code, "not made again while it waits");
+  // off and on again before anyone joined: a new code, and the old one is gone
+  await call(openai, "bridge_auto", { on: false }, meta);
+  const fresh = textOf(await call(openai, "bridge_auto", { on: true, every_turn: true }, meta)).match(/code ([0-9a-f]{6})/)?.[1];
+  assert.ok(fresh && fresh !== code, "a new session, a new code");
+  const rv = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-every-reviewer", CLAUDE_PROJECT_DIR: repo });
+  assert.equal((await rv.callTool({ name: "bridge_link_join", arguments: { code } })).isError, true, "the earlier session's code is closed");
+  assert.match(textOf(await call(rv, "bridge_link_join", { code: fresh })), /This chat is now the reviewer of that chat's auto mode/);
+  const bind = await receiveUntil(rv, undefined, /nothing to review in this one: answer it approved/);
+  await call(rv, "bridge_advise", { request_id: bind.match(/ id=(m\d+)/)[1], decision: "approved" });
+  assert.deepEqual(JSON.parse(textOf(await call(openai, "bridge_status", {}, meta))).auto.reviewer, { app: "claude", id: "claude-every-reviewer" });
+  await sleep(300);
+  assert.ok(!events().some((e) => e.op === "fake-codex-deliver" && e.threadId === W), "the binding review's approval wakes no one");
+  await call(openai, "bridge_auto", { on: false }, meta);
+  await rv.close();
+  console.log("5e4 every turn from the tools: the ChatGPT reviewer made at once, a join code at once from ChatGPT (not made again), the setting as default, switching keeps approvals, an advisor link pointed out");
+}
+
 // 5f. one message per request: with many paths the file lists go first,
 // never a scope line or a command; past that the request is refused
 {

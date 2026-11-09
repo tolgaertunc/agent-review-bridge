@@ -14,8 +14,14 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import { dataDir } from "./platform.mjs";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dataDir, openUrl } from "./platform.mjs";
 import { autoKey, reviewerOf, standingReviewer } from "./auto.mjs";
+import { readConfig } from "./config.mjs";
+import { MAX_TEXT, MAX_DIFF, REVIEWER_ROLE } from "./common.mjs";
+
+export { MAX_TEXT, MAX_DIFF, REVIEWER_ROLE };
 
 export const DATA_DIR = dataDir();
 export const STATE_FILE = path.join(DATA_DIR, "state.json");
@@ -27,12 +33,11 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.AGENT_REVIEW_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 19);
+export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 20);
 
 export const SIDES = ["claude", "openai"];
 // Claude Desktop's session ids, as claude://code/continue?session= accepts them
 export const HOST_ID = /^local_[A-Za-z0-9-]{1,64}$/;
-export const MAX_TEXT = 40_000;
 const MAX_PROMPT = 6_000;
 // Claude Code's notice that a background task finished, delivered through
 // UserPromptSubmit like a prompt (measured)
@@ -41,7 +46,6 @@ const HOST_NOTICE = /^\s*<task-notification>/;
 const MID_TURN = "Added by the user while the turn was running:";
 const NOTICE_TURN = "(None: the app started this turn with a notice of its own, such as a background task finishing.)";
 const MAX_ANSWER = 10_000;
-export const MAX_DIFF = 20_000;
 const DECISIONS = ["approved", "changes_requested"];
 // Emergency stop for two agents stuck in a fix loop: rounds in a row without
 // approval. The primary decides when it's stuck well before this.
@@ -59,12 +63,38 @@ const PEER_BURST = { count: 60, windowMs: 10 * 60_000 };
 // deadline. Each read has its own time limit. (Tests scale it down.)
 const WATCH_SCALE = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_WATCH_SCALE) || 1;
 const WATCH = Object.fromEntries(
-  Object.entries({ first: 15_000, second: 60_000, every: 60_000, deadline: 6 * 3600_000, read: 15_000, stuck: 60_000, approval: 60_000 }).map(([k, v]) => [k, Math.max(20, v * WATCH_SCALE)]),
+  Object.entries({ first: 15_000, second: 60_000, every: 60_000, deadline: 6 * 3600_000, read: 15_000, stuck: 60_000, approval: 60_000, unheard: 10 * 60_000 }).map(([k, v]) => [
+    k,
+    Math.max(20, v * WATCH_SCALE),
+  ]),
 );
+// How long putting one turn's review together may take (the work tree is
+// read in a child process, so the broker's own loop never waits on it)
+const jobBudget = () => Number(process.env.AGENT_REVIEW_BRIDGE_TEST_JOB_BUDGET) || 60_000;
+const TURN_JOB = fileURLToPath(new URL("./turnjob.mjs", import.meta.url));
+// how often one turn's review is sent again after its reviewer couldn't
+// answer it; a reviewer that was only unavailable for a while (a usage limit,
+// an overload, a delivery that failed) doesn't use up a try, and is given
+// more time before each new attempt
+const TURN_TRIES = 3;
+// ...and how long it keeps trying one that stays unavailable: about a day,
+// then the turn is set aside (kept) until the reviewer answers again or auto
+// mode gets another (the chat may be gone: new_reviewer)
+const turnWaits = () => Number(process.env.AGENT_REVIEW_BRIDGE_TEST_TURN_WAITS) || 24;
+// (tests set a shorter unit)
+const retryUnit = () => Number(process.env.AGENT_REVIEW_BRIDGE_TEST_RETRY_MS) || WATCH.every;
+const backoff = (n) => Math.min(60, 2 ** Math.max(0, n - 1)) * retryUnit();
+// a failure that only means "not now"
+const UNAVAILABLE = /usage limit|usagelimit|rate.?limit|overload|capacity|too many requests|server.?error|unavailable|couldn't be handed|timed? ?out|network/i;
 
 for (const d of [DATA_DIR, OUTBOX_DIR, LISTENERS_DIR, TURNS_DIR]) fs.mkdirSync(d, { recursive: true });
 
 const sameEndpoint = (a, b) => !!a && !!b && a.app === b.app && a.id === b.id;
+// an auto mode entry as tools show it: without the turns' own texts
+const autoView = ({ jobs, turn, facts, parked, ...e }) => ({ ...e, ...(e.everyTurn && { waiting: (jobs ?? []).length, ...(parked?.length && { setAside: parked.length }) }) });
+
+// a chat as the bridge names it to agents
+export const chatName = (e) => (e.app === "openai" ? `ChatGPT chat ${e.id}` : `Claude Code session ${e.id}`);
 const safeName = (endpoint) => `${endpoint.app}-${endpoint.id.replace(/[^\w.-]/g, "_")}`;
 
 // Read-only view of the broker state for hooks (no broker process needed)
@@ -94,7 +124,7 @@ export function pendingFor(state, endpoint) {
 export const listenerFile = (endpoint) => path.join(LISTENERS_DIR, `${safeName(endpoint)}.json`);
 export const turnFile = (endpoint) => path.join(TURNS_DIR, `${safeName(endpoint)}.json`);
 
-const OUTBOX_OPS = new Set(["turn_start", "turn_end", "notes_ack", "wake_ack", "auto_prompt", "turn_ok", "turn_failed", "permission_wait"]);
+const OUTBOX_OPS = new Set(["turn_start", "turn_end", "turn_facts", "notes_ack", "wake_ack", "auto_prompt", "turn_ok", "turn_failed", "permission_wait"]);
 
 function token() {
   try {
@@ -149,6 +179,8 @@ export function nextStep(m) {
   if (m.kind === "advisory")
     return "Fix what holds up; if a finding is wrong, say why instead of complying. Your next turn is reviewed again. If you're going in circles or the rest needs a decision, stop and ask the user.";
   if (m.kind === "stop") return "Stop the fix loop now: tell the user where it stands and ask how to proceed. Don't keep fixing until they answer.";
+  if (m.kind === "review-result" && m.everyTurn)
+    return "Fix what holds up; if a finding is wrong, say why instead of complying. Your next turn is reviewed on its own: don't ask for a review yourself. If you're going in circles or the rest needs a decision, stop and ask the user.";
   if (m.kind === "review-result") {
     const step =
       m.decision === "approved"
@@ -164,17 +196,10 @@ export function nextStep(m) {
   return `It is a message, not a review request: if it needs a reply, send one with bridge_send and reply_to "${m.id}" (not bridge_advise).`;
 }
 
-// The reviewer's role in short, with every one-off review request and when a
-// Claude reviewer's session starts again: either side may have compacted its
-// context and lost the brief it got once
-export const REVIEWER_ROLE =
-  "As the reviewer: read-only, don't change the project. Answer once with bridge_advise: approved, or changes_requested with each must-fix item in blocking; " +
-  "minor points go in nits and never block. If the requester disagrees with a finding, accept or hold it and say why; in a later round, judge against your earlier findings " +
-  "and don't add new blocking points on parts you accepted unless serious. If you can't see your earlier findings or the request, say so instead of guessing. " +
-  "Then write the text bridge_advise returns as your reply.";
-
 // Heads an approval that answers an earlier [CHANGES REQUESTED]
 export const LOOP_DONE_NOTE = "Your advisor approved the fix: the earlier [CHANGES REQUESTED] is resolved.";
+// The same in auto mode reviewing every turn
+const FIX_DONE_NOTE = "Your reviewer approved the fix: the earlier [CHANGES REQUESTED] is resolved.";
 
 // Heads an advisor's answer that arrived after the user had moved on
 export const LATE_NOTE =
@@ -209,7 +234,7 @@ export function inlineText(m) {
   const title = {
     "review-request": `${m.plan ? "Plan review" : "Review"} request ${m.id}`,
     advisory: `Your advisor flagged your last turn: ${m.id}`,
-    "review-result": `The ${m.plan ? "plan review" : "review"} you asked for: ${m.id}`,
+    "review-result": m.everyTurn ? `The review of your last turn: ${m.id}` : `The ${m.plan ? "plan review" : "review"} you asked for: ${m.id}`,
     stop: `Stop the fix loop: ${m.id}`,
     failed: `No answer is coming to ${m.about}: ${m.id}`,
     waiting: m.maybe ? `The answer to ${m.about} may wait for the user's approval: ${m.id}` : `The answer to ${m.about} waits for the user's approval: ${m.id}`,
@@ -264,6 +289,41 @@ async function deliverToCodex(threadId, text, clientId) {
 // requester waits for the answer) and plain messages. Never advisor-mode
 // requests, nor the bridge's own notices.
 const watched = (m, link) => (m.kind === "review-request" && link?.mode === "review") || m.kind === "message";
+
+// One turn's review, put together in a child process (src/turnjob.mjs) so the
+// broker's loop doesn't wait on git and file reads: { text, reqPaths } or
+// { error }, never later than its time budget
+function buildTurn(input) {
+  const budget = jobBudget();
+  return new Promise((resolve) => {
+    let p;
+    try {
+      p = spawn(process.execPath, [TURN_JOB], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
+    } catch (e) {
+      return resolve({ error: String(e.message || e) });
+    }
+    let out = "";
+    const timer = setTimeout(() => {
+      p.kill();
+      resolve({ error: `putting it together took longer than ${Math.max(1, Math.round(budget / 1000))} s` });
+    }, budget);
+    p.stdout.on("data", (d) => (out += d));
+    p.on("error", (e) => {
+      clearTimeout(timer);
+      resolve({ error: String(e.message || e) });
+    });
+    p.on("close", () => {
+      clearTimeout(timer);
+      try {
+        resolve(JSON.parse(out));
+      } catch {
+        resolve({ error: "putting it together gave no result" });
+      }
+    });
+    p.stdin.on("error", () => {}); // a child that died early
+    p.stdin.end(JSON.stringify(input));
+  });
+}
 
 function reviewText({ heading, prompt, answer, diff }) {
   return [
@@ -456,7 +516,7 @@ class BrokerState {
   notHanded(m, error) {
     m.dispatch = { ...m.dispatch, state: "error", at: Date.now(), error };
     this.health(m, false, error, { note: false });
-    this.fail(m, `it couldn't be handed to ChatGPT Desktop (${error})`);
+    this.fail(m, `it couldn't be handed to ChatGPT Desktop (${error})`, { unavailable: true });
   }
 
   // ----------------------------------------------------- no answer coming
@@ -467,6 +527,24 @@ class BrokerState {
   watchTick() {
     const now = Date.now();
     let changed = false;
+    // turn reviews held back (no reviewer yet, a usage limit) go once they can
+    this.runJobs();
+    // a turn review that waits on a Claude reviewer that isn't listening: told
+    // once, as a note (it may only be busy with a long review)
+    for (const m of this.s.messages) {
+      const link = this.s.links[m.linkId];
+      if (!link?.everyTurn || !link.active || m.kind !== "review-request" || m.readAt || m.unheardTold || m.toEndpoint?.app !== "claude") continue;
+      if (now - m.ts > WATCH.unheard && !listenerAlive(m.toEndpoint)) {
+        m.unheardTold = now;
+        const before = this.s.notes.length;
+        this.note(
+          link.primary,
+          `auto:${autoKey(link.primary)}:unheard`,
+          `Your reviewer, the Claude Code session ${m.toEndpoint.id}, isn't listening right now: the reviews of your turns wait for it, and go to it once it is open in Claude Desktop.`,
+        );
+        changed ||= this.s.notes.length !== before;
+      }
+    }
     for (const m of this.s.messages) {
       const w = m.watch;
       if (!w || w.done || !w.clientId) continue;
@@ -522,7 +600,9 @@ class BrokerState {
       // not over yet
     } else if (r.state === "failed" || r.state === "interrupted") {
       const e = r.error;
-      this.fail(m, `its turn ${r.state === "failed" ? "failed" : "was interrupted (someone may have stopped it in the app)"}${e?.message ? `: ${e.message}` : ""}${e?.codexErrorInfo && typeof e.codexErrorInfo === "string" ? ` (${e.codexErrorInfo})` : ""}`);
+      this.fail(m, `its turn ${r.state === "failed" ? "failed" : "was interrupted (someone may have stopped it in the app)"}${e?.message ? `: ${e.message}` : ""}${e?.codexErrorInfo && typeof e.codexErrorInfo === "string" ? ` (${e.codexErrorInfo})` : ""}`, {
+        unavailable: r.state === "failed" && UNAVAILABLE.test(`${e?.message ?? ""} ${typeof e?.codexErrorInfo === "string" ? e.codexErrorInfo : ""}`),
+      });
     } else if (r.state === "completed") {
       if (m.kind === "review-request" && !this.settled(m)) this.fail(m, "the reviewer's turn ended without an answer");
       else w.done = true;
@@ -541,7 +621,7 @@ class BrokerState {
   // for an answered review, a replied message or the bridge's own notices (two
   // unavailable sides can't bounce them); a review's link closes, a plain
   // message's link stays as it is.
-  fail(m, why) {
+  fail(m, why, { unavailable = false } = {}) {
     const link = this.s.links[m.linkId];
     if (!watched(m, link) || this.settled(m)) return;
     let to = m.fromEndpoint;
@@ -556,6 +636,51 @@ class BrokerState {
     const what = m.kind === "review-request" ? "review result" : "reply";
     const text = `${who} can't answer ${m.id}: ${why}. No ${what} was received.`;
     const review = m.kind === "review-request";
+    // a turn auto mode reviewed on its own: a note, not a wake, so a failing
+    // reviewer can't start a turn that is reviewed (and fails) again. The
+    // next turn is reviewed as usual.
+    if (link?.everyTurn && review) {
+      // the same turn's review is sent again once the reviewer can answer (at
+      // ChatGPT's usage limit it waits for the reset), a few times at most;
+      // the chat isn't woken and no fix round is used up
+      const entry = this.s.auto?.[autoKey(link.primary)];
+      // one note per turn while it is sent again (not one per try), one when it's left
+      const turnKey = `auto:${autoKey(link.primary)}:retry:${link.turn?.endAt ?? link.id}`;
+      const tries = (link.turn?.tries ?? 1) + (unavailable ? 0 : 1);
+      const waits = (link.turn?.waits ?? 0) + (unavailable ? 1 : 0);
+      const live = link.turn && entry?.on && entry.everyTurn && entry.since === link.autoSince;
+      const tooLong = waits > turnWaits();
+      const again = live && tries <= TURN_TRIES && !tooLong;
+      const job = live && { ...link.turn, id: "j" + ++this.s.seq, tries, waits, retry: link.id };
+      if (again) {
+        (entry.jobs ??= []).unshift({ ...job, waitUntil: Date.now() + (unavailable ? backoff(waits) : retryUnit()) });
+        setImmediate(() => this.runJobs());
+      }
+      // unavailable for too long: set aside, kept, out of the way of later turns
+      const parked = live && unavailable && tooLong;
+      if (parked) (entry.parked ??= []).push(job);
+      delete link.turn; // the queued try has it now, or it isn't sent again
+      this.s.notes = this.s.notes.filter((n) => n.deliveredAt || n.key !== `${link.id}:waiting`);
+      this.note(
+        to,
+        `${turnKey}:${again ? "again" : "left"}`,
+        `${text} It was the review of one of your turns: ` +
+          (again
+            ? "it is sent again once the reviewer can answer."
+            : parked
+              ? "the reviewer has been unavailable for too long, so it is set aside and kept: it goes once the reviewer answers again, or once auto mode has another (bridge_auto with new_reviewer, if that chat is gone). Later turns are sent as usual."
+              : "it isn't sent again; later turns are reviewed as usual."),
+      );
+      logEvent({ op: "failed", id: m.id, why, everyTurn: true, ...(again && { again: tries }), ...(unavailable && { unavailable: true }) });
+      return;
+    }
+    // a plain message that got no reply, told to a chat in every-turn auto
+    // mode: a note too, not a wake
+    if (this.everyTurn(to)) {
+      this.note(to, `${m.id}:failed`, text);
+      logEvent({ op: "failed", id: m.id, why, note: true });
+      return;
+    }
     this.post({
       from: "bridge",
       toEndpoint: to,
@@ -607,7 +732,7 @@ class BrokerState {
       unread: Object.fromEntries(SIDES.map((x) => [x, s.messages.filter((m) => m.to === x && !m.readAt).length])),
       olderLinks: all.length - open.length - recent.length,
       links: [...open, ...recent]
-        .map(({ advisories, lastPrompt, request, reqPaths, ...l }) => ({
+        .map(({ advisories, lastPrompt, request, reqPaths, turn, ...l }) => ({
           ...l,
           advisories: advisories?.length ?? 0,
           lastAdvice: advisories?.at(-1) ?? null,
@@ -623,7 +748,11 @@ class BrokerState {
           .filter((e) => e && !sameEndpoint(e, endpoint) && s.endpoints?.[autoKey(e)]?.lastFailure)
           .map((e) => [autoKey(e), s.endpoints[autoKey(e)].lastFailure]),
       ),
-      ...(endpoint && s.auto?.[autoKey(endpoint)] && { auto: s.auto[autoKey(endpoint)] }),
+      // auto mode, without the turns' own texts
+      ...(endpoint &&
+        s.auto?.[autoKey(endpoint)] && {
+          auto: autoView(s.auto[autoKey(endpoint)]),
+        }),
     };
   }
 
@@ -633,24 +762,46 @@ class BrokerState {
   // path enters when auto mode is turned on (the chat's folder, as it is then)
   // or when a review names it.
 
-  op_auto_set({ endpoint, on, reviewer, model, effort, paths }) {
+  op_auto_set({ endpoint, on, reviewer, model, effort, paths, everyTurn }) {
     if (!endpoint?.app || !endpoint?.id) throw new Error("this chat is unknown");
     const key = autoKey(endpoint);
     if (!on) {
-      if (this.s.auto?.[key]) this.s.auto[key].on = false;
+      // turns still waiting for their review go with it
+      if (this.s.auto?.[key]) Object.assign(this.s.auto[key], { on: false, jobs: [], parked: [], turn: null });
       return { on: false };
     }
     const prev = this.s.auto?.[key];
     // turned on again after it was off: a fresh start, with a new reviewer
-    // chat (unless one is named) and the paths as they are now
-    const entry = prev?.on ? { ...prev } : { paths: {}, turns: 0, on: true, since: Date.now(), reviewer: null };
-    if (reviewer !== undefined) entry.reviewer = reviewer;
+    // chat (unless one is named) and the paths as they are now. While on, the
+    // same entry is changed in place, so a turn's review being put together
+    // sees what changed meanwhile.
+    const entry = prev?.on ? prev : { paths: {}, turns: 0, on: true, since: Date.now(), reviewer: null, generation: 0 };
+    // codes from an earlier session's first review can't bind this one: closed
+    if (!prev?.on)
+      for (const l of Object.values(this.s.links))
+        if (l.active && l.autoReviewer && !l.advisor && sameEndpoint(l.primary, endpoint)) {
+          Object.assign(l, { active: false, closedAt: Date.now() });
+          delete l.request;
+          if (!l.bind)
+            this.note(endpoint, `${l.id}:closed`, `Review ${l.id} was waiting for a chat to join with its code; it was closed when auto mode was turned on again, and no answer is coming. Ask again if it's still needed.`);
+        }
+    if (reviewer !== undefined) {
+      const changed = !sameEndpoint(reviewerOf(entry), reviewer);
+      entry.reviewer = reviewer;
+      if (changed) this.unpark(entry); // another reviewer, or none yet: it waits for the next
+    }
+    // every turn reviewed on its own, or the agent asks at key moments; what
+    // was approved stays when it switches
+    if (everyTurn !== undefined && !!everyTurn !== !!entry.everyTurn) {
+      entry.everyTurn = !!everyTurn;
+      Object.assign(entry, { jobs: [], parked: [], turn: null, rounds: 0, stopped: false, chain: null });
+    }
     if (model !== undefined) entry.model = model;
     if (effort !== undefined) entry.effort = effort;
     // paths named when turning it on start from their state at that moment
     for (const p of paths ?? []) entry.paths[p.path] ??= { approved: p.fp, base: p.head ?? null };
     this.s.auto = { ...(this.s.auto ?? {}), [key]: entry };
-    return entry;
+    return autoView(entry);
   }
 
   // the reviewer chat auto mode keeps using, once the bridge has made it, and
@@ -659,6 +810,7 @@ class BrokerState {
     const entry = this.s.auto?.[autoKey(endpoint)];
     if (!entry?.on) return { ok: true };
     entry.reviewer = reviewer;
+    this.unpark(entry);
     if (model && entry.model == null) entry.model = model;
     if (effort && entry.effort == null) entry.effort = effort;
     return { ok: true };
@@ -682,6 +834,344 @@ class BrokerState {
       if (!p.fp) continue;
       entry.paths[p.path] = { approved: p.fp, base: p.head ?? entry.paths[p.path]?.base ?? null };
     }
+  }
+
+  // Turns set aside while the reviewer was unavailable for too long go back
+  // in front of the queue, with their waits counted afresh: the reviewer has
+  // answered again, or auto mode has another
+  unpark(entry) {
+    if (!entry?.parked?.length) return;
+    entry.jobs = [...entry.parked.map(({ waitUntil, ...j }) => ({ ...j, waits: 0 })), ...(entry.jobs ?? [])];
+    entry.parked = [];
+    setImmediate(() => this.runJobs());
+  }
+
+  // this chat's auto mode, if it is on and reviews every turn
+  everyTurn(endpoint) {
+    const e = endpoint && this.s.auto?.[autoKey(endpoint)];
+    return e?.on && e.everyTurn ? e : null;
+  }
+
+  // A note for a chat, with its next prompt and without waking it; one per
+  // key until delivered. Every-turn mode tells its chat everything this way
+  // except a review that requests changes (kind "review": from the reviewer).
+  note(to, key, text, kind = "bridge") {
+    if (!to || this.s.notes.some((n) => n.key === key && !n.deliveredAt)) return;
+    this.s.notes.push({ id: "n" + ++this.s.seq, linkId: null, to, kind, key, text, at: Date.now(), deliveredAt: null });
+  }
+
+  // A prompt of an every-turn chat. The user's own starts a new generation:
+  // the fix loop's count starts over, a stop is lifted, and answers about
+  // older turns become notes. One typed while the turn runs joins its task.
+  // The app's own notices, the bridge's deliveries and the Stop check's own
+  // words aren't the user's (`own`).
+  everyTurnPrompt(entry, { turnId, prompt, own, at }) {
+    const t = entry.turn;
+    if (turnId && t?.turnId === turnId) {
+      if (!own) t.text = [t.text, `${MID_TURN}\n${prompt}`].filter(Boolean).join("\n\n").slice(0, MAX_PROMPT);
+      return;
+    }
+    // when the turn started is the hook's time, not when this ran
+    entry.turn = { turnId: turnId ?? null, text: own ? null : prompt.slice(0, MAX_PROMPT), at: at ?? Date.now() };
+    if (!own) Object.assign(entry, { generation: (entry.generation ?? 0) + 1, rounds: 0, stopped: false, chain: null, lastRejected: null });
+  }
+
+  // A turn of an every-turn chat ended: its review is put together and sent
+  // in the background, in order, and the job stays in state until then (see
+  // runJobs). Not while the fix loop is stopped at its cap.
+  queueTurn(entry, endpoint, { turnId, lastMessage, cwd, base, snap, ends, at, more }) {
+    const t = entry.turn && (!entry.turn.turnId || !turnId || entry.turn.turnId === turnId) ? entry.turn : null;
+    entry.turn = null;
+    const since = t?.at ?? entry.lastEnd ?? entry.since ?? 0;
+    entry.lastEnd = Date.now();
+    if (entry.stopped) {
+      logEvent({ op: "turn_not_reviewed", endpoint, why: "stopped" });
+      return null;
+    }
+    // a turn in which this chat answered a review was its work as a reviewer:
+    // not reviewed itself, so two chats reviewing each other can't go round
+    if (this.s.messages.some((m) => m.kind === "review-request" && sameEndpoint(m.toEndpoint, endpoint) && m.answeredAt >= since)) {
+      logEvent({ op: "turn_not_reviewed", endpoint, why: "answered a review" });
+      return null;
+    }
+    const job = {
+      id: "j" + ++this.s.seq,
+      endpoint,
+      turnId: turnId ?? null,
+      generation: entry.generation ?? 0,
+      startedAt: t?.at ?? null,
+      at: Date.now(),
+      prompt: t?.text ?? null,
+      lastMessage: String(lastMessage ?? "").slice(0, MAX_ANSWER),
+      cwd: cwd ?? null,
+      base: base ?? null,
+      snap: snap ?? null,
+      ends: ends ?? null,
+      // the paths tracked at the turn's end: coverage needs each one's end
+      tracked: Object.keys(entry.paths ?? {}),
+      endAt: at ?? null,
+      // the Stop hook sends the facts that take time (the end snapshot, what
+      // each path holds) right after: a short wait for them, then the review
+      // goes without them
+      ...(more && { factsDue: Date.now() + WATCH.read }),
+    };
+    const early = at != null && entry.facts?.[at];
+    if (early) {
+      Object.assign(job, { snap: early.snap ?? null, ends: early.ends ?? null, factsDue: 0 });
+      delete entry.facts[at];
+    }
+    (entry.jobs ??= []).push(job);
+    logEvent({ op: "turn_queued", job: job.id, endpoint });
+    setImmediate(() => this.runJobs());
+    return job;
+  }
+
+  // Puts together and sends the turn reviews that wait, each chat's in
+  // order: after a turn ends and on every watch tick, so one held back (no
+  // reviewer yet, ChatGPT's usage limit) goes as soon as it can, without
+  // waiting for another turn. A job leaves the queue once its review is
+  // sent, once it turns out to need none, or once it can't be put together
+  // (said so).
+  async runJobs() {
+    if (this.jobsBusy || this.retired) return;
+    this.jobsBusy = true;
+    const notes = this.s.notes.length;
+    try {
+      for (const [key, entry] of Object.entries(this.s.auto ?? {})) {
+        while (!this.retired && entry.on && entry.everyTurn && entry.jobs?.length) {
+          const job = entry.jobs[0];
+          const done = await this.runJob(key, entry, job);
+          if (this.retired || entry.jobs?.[0] !== job || !done) break;
+          entry.jobs.shift();
+          this.save();
+          this.dispatch(); // a review for a ChatGPT reviewer goes now, not with the next op
+        }
+      }
+      // what a held-back job told its chat is on disk for the hooks
+      if (!this.retired && this.s.notes.length !== notes) this.save();
+    } catch (e) {
+      logEvent({ op: "turn_jobs", error: String(e.message || e) });
+    } finally {
+      this.jobsBusy = false;
+    }
+  }
+
+  // From the Stop hook, after its turn_end: the snapshot of the turn's end and
+  // what each tracked path held then, for the job of the turn that ended at
+  // `at` (kept a while if they come in first)
+  op_turn_facts({ endpoint, at, snap, ends }) {
+    const entry = this.everyTurn(endpoint);
+    if (!entry || at == null) return { skipped: true };
+    const job = (entry.jobs ?? []).find((j) => j.endAt === at);
+    if (job) {
+      Object.assign(job, { snap: snap ?? null, ends: ends ?? null, factsDue: 0 });
+      setImmediate(() => this.runJobs());
+      return { ok: true };
+    }
+    const now = Date.now();
+    entry.facts = Object.fromEntries(Object.entries(entry.facts ?? {}).filter(([, f]) => now - f.ts < 10 * 60_000));
+    entry.facts[at] = { snap: snap ?? null, ends: ends ?? null, ts: now };
+    return { ok: true, early: true };
+  }
+
+  // One job: true once it is finished with, false to try again later. After
+  // each wait it checks the entry as it is now: the same auto session, still
+  // every turn, the job still first, the same reviewer.
+  async runJob(key, entry, job) {
+    const to = job.endpoint;
+    const since = entry.since;
+    const stoppedHere = () => entry.stopped && job.generation === (entry.generation ?? 0);
+    // the loop stopped at its cap: that generation's turns aren't reviewed
+    if (stoppedHere()) {
+      logEvent({ op: "turn_not_reviewed", job: job.id, why: "stopped" });
+      return true;
+    }
+    const reviewer = reviewerOf(entry);
+    if (!reviewer) {
+      this.note(
+        to,
+        `auto:${key}:no-reviewer`,
+        "Auto mode reviews every turn, but it has no reviewer yet, so the reviews of your turns wait for one" +
+          (to.app === "openai" ? ": the Claude Code chat that joins with auto mode's code becomes it." : "."),
+      );
+      return false;
+    }
+    if (job.waitUntil && Date.now() < job.waitUntil) return false;
+    if (job.factsDue && Date.now() < job.factsDue) return false;
+    if (reviewer.app === "openai") {
+      let limits = null;
+      try {
+        const { readLimits } = await import("./codex.mjs");
+        limits = await readLimits();
+      } catch {
+        // unknown limits don't hold it back
+      }
+      if (!this.liveJob(key, entry, job, since, reviewer)) return false;
+      if (limits?.blocked) {
+        job.waitUntil = limits.resetsAt ?? Date.now() + 5 * WATCH.every;
+        const until = limits.resetsAt ? ` until ${new Date(limits.resetsAt).toLocaleString()}` : "";
+        this.note(to, `auto:${key}:limit`, `The reviews of your turns wait: ChatGPT's usage limit is reached${until}. They are sent once it opens again.`);
+        this.save();
+        return false;
+      }
+    } else if (!listenerAlive(reviewer) && readConfig().openClosedApps === "always" && this.s.hosts?.[reviewer.id] && !process.env.AGENT_REVIEW_BRIDGE_FAKE_OPEN) {
+      // the user said to open closed apps: Claude Desktop opens the session
+      try {
+        openUrl(`claude://code/continue?session=${this.s.hosts[reviewer.id]}`);
+      } catch {
+        // it gets the request when it is opened
+      }
+    }
+    // a fix turn's review is the next round of the review it answers (unless
+    // that one was already continued, by hand: then this one starts afresh);
+    // a review sent again after its reviewer couldn't answer keeps its round
+    const failed = job.retry ? this.s.links[job.retry] : null;
+    const answered = !failed && entry.chain && entry.chain.generation === job.generation ? this.s.links[entry.chain.linkId] : null;
+    const prev = answered && !answered.continuedBy ? answered : null;
+    const round = failed ? (failed.round ?? 1) : prev ? (prev.round ?? 1) + 1 : 1;
+    const built = await buildTurn({
+      chat: chatName(to),
+      turnId: job.turnId,
+      prompt: job.prompt,
+      fixTurn: !!(prev || failed?.roundOf),
+      heading: failed
+        ? `Retry of round ${round} of review ${this.firstRound(failed).id}: the previous attempt (${failed.id}) got no answer.`
+        : prev
+          ? `Round ${round} of review ${this.firstRound(prev).id}: this turn answers your changes requested in ${prev.id}. Answer each point the agent disagrees with: accept it or hold, and say why.`
+          : null,
+      previous: failed ? (failed.roundOf ? this.lastAnswer(failed) : null) : prev ? this.lastAnswer(prev) : null,
+      lastMessage: job.lastMessage,
+      cwd: job.cwd,
+      base: job.base,
+      snap: job.snap,
+      tracked: entry.paths ?? {},
+    });
+    if (stoppedHere()) return true;
+    if (!this.liveJob(key, entry, job, since, reviewer)) return false;
+    if (built.error) {
+      this.note(to, `auto:${key}:build:${job.id}`, `The review of one of your turns couldn't be put together (${built.error}), so it wasn't sent. The next review of the same folder covers its changes.`);
+      logEvent({ op: "turn_build_failed", job: job.id, error: built.error });
+      return true;
+    }
+    if (!failed && this.coveredByOwn(job)) {
+      logEvent({ op: "turn_covered", job: job.id });
+      return true;
+    }
+    if (prev && entry.chain?.linkId === prev.id) entry.chain = null; // continued once
+    const id = "L" + ++this.s.linkSeq;
+    const link = {
+      id,
+      mode: "review",
+      everyTurn: true,
+      name: null,
+      active: true,
+      createdAt: Date.now(),
+      primary: to,
+      advisor: reviewer,
+      reviews: 0,
+      advisories: [],
+      round,
+      generation: job.generation,
+      autoSince: entry.since,
+      ...((prev || failed?.roundOf) && { roundOf: prev?.id ?? failed.roundOf }),
+      ...(failed && { retry: true }),
+      ...(built.reqPaths?.length && { reqPaths: built.reqPaths }),
+      request: built.text,
+      // what it was put together from, to send it again if it gets no answer
+      turn: (({ id, retry, waitUntil, factsDue, ...t }) => t)(job),
+    };
+    if (prev) prev.continuedBy = id;
+    if (failed) failed.continuedBy = id;
+    this.s.links[id] = link;
+    this.registerPaths(to, built.reqPaths);
+    logEvent({ op: "turn_review", id, job: job.id, round });
+    this.sendReviewRequest(link);
+    return true;
+  }
+
+  // Is this job still the one to send, as things are now?
+  liveJob(key, entry, job, since, reviewer) {
+    const cur = this.s.auto?.[key];
+    return !this.retired && cur === entry && cur.on && cur.everyTurn && cur.since === since && cur.jobs?.[0] === job && sameEndpoint(reviewerOf(cur), reviewer);
+  }
+
+  // A code review the agent asked for in this turn, of exactly the content
+  // the turn ended with (as the Stop hook found it, whatever happened since),
+  // needs no second review: one still waiting for its answer, or answered.
+  // Not one that failed or was closed unanswered, and never a plan review.
+  coveredByOwn(job) {
+    // every path tracked at the turn's end, with what it held then: one the
+    // hook couldn't check in time is unknown, and then the turn is reviewed
+    const paths = job.tracked ?? Object.keys(job.ends ?? {});
+    if (!job.startedAt || !paths.length || !paths.every((p) => job.ends?.[p])) return false;
+    const ends = paths.map((p) => [p, job.ends[p]]);
+    const own = Object.values(this.s.links).filter(
+      (l) =>
+        l.mode === "review" &&
+        !l.plan &&
+        !l.everyTurn &&
+        sameEndpoint(l.primary, job.endpoint) &&
+        l.createdAt >= job.startedAt &&
+        l.createdAt <= job.at &&
+        l.reqPaths?.length &&
+        ((l.active && l.advisor) || ["approved", "changes_requested"].includes(l.decision)),
+    );
+    return ends.every(([p, fp]) => fp && own.some((l) => l.reqPaths.some((q) => q.path === p && q.fp === fp)));
+  }
+
+  // The answer to a turn auto mode reviewed on its own, delivered as advisor
+  // mode delivers its advice: only changes requested wakes the chat (the fix
+  // loop, its next turn reviewed again); an approval is silent, its nits and
+  // the approval that ends a fix loop come with the next prompt; an answer
+  // about a turn before the user's latest prompt is a note too. Past the
+  // round cap the chat is told to stop, and turns aren't reviewed until the
+  // user writes.
+  everyTurnAnswer(link, endpoint, { decision, text, nits }) {
+    Object.assign(link, { active: false, closedAt: Date.now(), decision });
+    delete link.turn; // answered: it won't be sent again
+    // a note that the answer waited for an approval: not after the answer
+    this.s.notes = this.s.notes.filter((n) => n.deliveredAt || n.key !== `${link.id}:waiting`);
+    // the request that only bound the reviewer: its answer is only that
+    if (link.bind) return { delivered: "none", text };
+    if (decision === "approved") this.approvePaths(link);
+    const entry = this.s.auto?.[autoKey(link.primary)];
+    const key = autoKey(link.primary);
+    if (!entry?.on || !entry.everyTurn || link.autoSince !== entry.since) return { delivered: "none", text };
+    // auto mode's reviewer answers again: turns set aside while it was away
+    // go now (not for an answer from a reviewer it no longer has)
+    if (sameEndpoint(link.advisor, reviewerOf(entry))) this.unpark(entry);
+    // the loop stopped at its cap: answers still coming in about this
+    // generation's turns neither wake the chat nor start the loop again
+    const generation = entry.generation ?? 0;
+    if (entry.stopped && (link.generation ?? 0) === generation) {
+      if (decision === "approved" && !nits.length) return { delivered: "none", stopped: true, text };
+      this.note(link.primary, `auto:${key}:answer:${link.id}`, text, "review");
+      return { delivered: "next prompt", stopped: true, text };
+    }
+    // the approval of a fix: the review it answers had requested changes. It
+    // ends the loop only if that was the loop's last "changes requested", not
+    // with an approval of another turn's review
+    const fixApproved = decision === "approved" && !!link.roundOf && this.s.links[link.roundOf]?.decision === "changes_requested";
+    const endsLoop = fixApproved && !!entry.lastRejected && link.roundOf === entry.lastRejected;
+    if ((link.generation ?? 0) !== generation) {
+      if (decision === "approved" && !nits.length && !fixApproved) return { delivered: "none", stale: true, text };
+      this.note(link.primary, `auto:${key}:answer:${link.id}`, `${LATE_NOTE}\n\n${fixApproved ? `${FIX_DONE_NOTE}\n\n` : ""}${text}`, "review");
+      return { delivered: "next prompt", stale: true, text };
+    }
+    if (decision === "approved") {
+      if (endsLoop) Object.assign(entry, { rounds: 0, chain: null, lastRejected: null });
+      if (!nits.length && !endsLoop) return { delivered: "none", text };
+      this.note(link.primary, `auto:${key}:answer:${link.id}`, endsLoop ? `${FIX_DONE_NOTE}\n\n${text}` : text, "review");
+      return { delivered: "next prompt", text };
+    }
+    entry.rounds = (entry.rounds ?? 0) + 1;
+    if (entry.rounds >= MAX_ROUNDS()) {
+      Object.assign(entry, { stopped: true, chain: null });
+      const stop = `${entry.rounds} rounds in a row without approval.\n\n${text}`;
+      return { delivered: "now", text, stopped: true, ...this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "stop", linkId: link.id, text: stop }) };
+    }
+    Object.assign(entry, { chain: { linkId: link.id, generation: link.generation }, lastRejected: link.id });
+    return { delivered: "now", text, ...this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "review-result", linkId: link.id, text, decision, everyTurn: true }) };
   }
 
   // which auto mode session a review belongs to, if any
@@ -733,7 +1223,7 @@ class BrokerState {
   // mode "advisor": every turn of the primary is reviewed; one per primary.
   // mode "review": one request, one answer, then the link closes.
   // The advisor is bound now (a thread the bridge created) or later via code.
-  op_link_create({ primary, advisor, mode = "advisor", name, request, plan, noGate, reqPaths, autoReviewer }) {
+  op_link_create({ primary, advisor, mode = "advisor", name, request, plan, noGate, reqPaths, autoReviewer, everyTurn }) {
     if (!primary?.app || !primary?.id) throw new Error("primary endpoint unknown (caller identity missing)");
     if (mode === "advisor")
       for (const l of Object.values(this.s.links))
@@ -751,6 +1241,10 @@ class BrokerState {
       // auto mode's first review where the bridge can't make the reviewer
       // chat: the chat that joins becomes auto mode's reviewer
       if (autoReviewer && !advisor && link.autoSince != null) link.autoReviewer = true;
+      // a review in every-turn mode's own terms (its answer as a note, unless
+      // it requests changes): only the bridge's own, never one the agent asks for
+      const entry = this.everyTurn(primary);
+      if (everyTurn && entry) Object.assign(link, { everyTurn: true, generation: entry.generation ?? 0 }, !reqPaths?.length && { bind: true });
     } else link.generation = 0; // bumped by each real user prompt
     this.s.links[id] = link;
     // a plan's paths are context: a plan approval approves no content
@@ -776,9 +1270,15 @@ class BrokerState {
     const adopted = link.mode === "review" && !!link.autoReviewer && link.autoSince === this.autoSession(link.primary) && !reviewerOf(auto);
     if (adopted) {
       auto.reviewer = endpoint;
+      this.unpark(auto);
       // codes from earlier tries at that first review aren't needed any more
       for (const l of Object.values(this.s.links))
-        if (l !== link && l.active && l.autoReviewer && !l.advisor && sameEndpoint(l.primary, link.primary)) Object.assign(l, { active: false, closedAt: Date.now() });
+        if (l !== link && l.active && l.autoReviewer && !l.advisor && sameEndpoint(l.primary, link.primary)) {
+          Object.assign(l, { active: false, closedAt: Date.now() });
+          delete l.request; // never sent
+        }
+      // turns that waited for a reviewer go now
+      setImmediate(() => this.runJobs());
     }
     logEvent({ op: "link_join", id: link.id, advisor: endpoint, ...(adopted && { autoReviewer: true }) });
     this.sendReviewRequest(link);
@@ -921,28 +1421,37 @@ class BrokerState {
   // types while the turn runs and for the app's own notices (a background
   // task finished): those belong to the turn and start nothing. Only ids that
   // are both present and equal count as the same turn.
-  op_turn_start({ endpoint, turnId, prompt }) {
+  op_turn_start({ endpoint, turnId, prompt, user, at }) {
     const link = this.linkFor("primary", endpoint, "advisor");
-    if (!link || typeof prompt !== "string") return { skipped: "no link" };
+    const entry = this.everyTurn(endpoint);
+    if ((!link && !entry) || typeof prompt !== "string") return { skipped: "no link" };
     const notice = HOST_NOTICE.test(prompt);
+    // one test for an advisor link and every-turn auto mode: a delivery
+    // matches only once
+    const bridged = !notice && this.fromBridge(endpoint, prompt);
+    // the hook knows the Stop check's own words (user: false)
+    if (entry) this.everyTurnPrompt(entry, { turnId, prompt, own: notice || bridged || user === false, at });
+    if (!link) return { ok: true };
     const p = link.lastPrompt;
     if (turnId && p?.turnId === turnId) {
-      if (notice || this.fromBridge(endpoint, prompt)) return { ok: true, sameTurn: true };
+      if (notice || bridged) return { ok: true, sameTurn: true };
       p.text = `${p.text}\n\n${MID_TURN}\n${prompt}`.slice(0, MAX_PROMPT);
       return { ok: true, sameTurn: true };
     }
     link.lastPrompt = { turnId: turnId ?? null, text: notice ? NOTICE_TURN : prompt.slice(0, MAX_PROMPT), at: Date.now() };
     if (notice) return { ok: true, notice: true };
-    if (this.fromBridge(endpoint, prompt)) return { ok: true, fromBridge: true };
+    if (bridged) return { ok: true, fromBridge: true };
     Object.assign(link, { generation: (link.generation ?? 0) + 1, rounds: 0, stopped: false });
     return { ok: true };
   }
 
   // From the primary's Stop hook. A turn the advisor itself triggered is not
   // sent back for review (no advisor → primary → advisor cascade).
-  op_turn_end({ endpoint, turnId, lastMessage, diff }) {
+  op_turn_end({ endpoint, turnId, lastMessage, diff, cwd, base, snap, ends, at, more }) {
+    const entry = this.everyTurn(endpoint);
+    const job = entry ? this.queueTurn(entry, endpoint, { turnId, lastMessage, cwd, base, snap, ends, at, more }) : null;
     const link = this.linkFor("primary", endpoint, "advisor");
-    if (!link?.advisor) return { skipped: link ? "advisor not joined" : "no link" };
+    if (!link?.advisor) return { skipped: link ? "advisor not joined" : "no link", ...(job && { job: job.id }) };
     // a prompt belongs to this turn if the ids match, or if either side has none
     const p = link.lastPrompt;
     const prompt = p && (!p.turnId || !turnId || p.turnId === turnId) ? p.text : null;
@@ -988,6 +1497,7 @@ class BrokerState {
     this.answered(req.id);
     const text = renderAnswer({ decision, note: withoutCitations(note), blocking, nits });
     link.advisories.push({ at: Date.now(), decision, text });
+    if (link.everyTurn) return this.everyTurnAnswer(link, endpoint, { decision, text, nits });
     if (link.mode === "review") {
       const lastRound = decision === "changes_requested" && (link.round ?? 1) >= MAX_ROUNDS();
       Object.assign(link, { active: false, closedAt: Date.now(), decision });
@@ -1073,7 +1583,7 @@ class BrokerState {
     if (!(ep.lastOkAt >= at) && !(ep.lastFailure?.at >= at)) ep.lastFailure = { at, error: error ?? "unknown", details: details ?? null };
     const why = `an error ended its turn (${error ?? "unknown"}${details ? `: ${String(details).slice(0, 300)}` : ""})`;
     for (const m of this.s.messages)
-      if (sameEndpoint(m.toEndpoint, endpoint) && m.wokenAt && m.wokenAt <= at && !m.settledAt) this.fail(m, why);
+      if (sameEndpoint(m.toEndpoint, endpoint) && m.wokenAt && m.wokenAt <= at && !m.settledAt) this.fail(m, why, { unavailable: UNAVAILABLE.test(`${error ?? ""} ${details ?? ""}`) });
     return { ok: true };
   }
 
@@ -1094,7 +1604,8 @@ class BrokerState {
       if (!to) continue;
       m.approvalToldAt = at;
       const text = `The Claude Code session ${endpoint.id} is waiting for the user to approve a tool in Claude Desktop${tool}. Its answer to ${m.id} comes after that.`;
-      this.post({ from: "bridge", toEndpoint: to, kind: "waiting", linkId: m.linkId, text, about: m.id });
+      if (link.everyTurn) this.note(to, `${m.linkId}:waiting`, text);
+      else this.post({ from: "bridge", toEndpoint: to, kind: "waiting", linkId: m.linkId, text, about: m.id });
       logEvent({ op: "waiting", id: m.id });
     }
     return { ok: true };
@@ -1124,17 +1635,18 @@ class BrokerState {
     m.approvalToldAt = Date.now();
     const why = p.justification ? ` (${p.justification})` : "";
     const text = `The ChatGPT chat ${m.toEndpoint.id} asked to run a command outside its sandbox more than a minute ago and has no result yet${why}: it may be waiting for the user's approval in ChatGPT Desktop, or the command may still be running. Its answer to ${m.id} comes after that.`;
-    this.post({ from: "bridge", toEndpoint: to, kind: "waiting", linkId: m.linkId, text, about: m.id, maybe: true });
+    if (link.everyTurn) this.note(to, `${m.linkId}:waiting`, text);
+    else this.post({ from: "bridge", toEndpoint: to, kind: "waiting", linkId: m.linkId, text, about: m.id, maybe: true });
     logEvent({ op: "waiting", id: m.id, maybe: true });
   }
 
-  post({ from, toEndpoint, kind, linkId, text, decision, lastRound, generation, about, retry, auto, retried, maybe }) {
+  post({ from, toEndpoint, kind, linkId, text, decision, lastRound, generation, about, retry, auto, retried, maybe, everyTurn }) {
     const msg = { id: "m" + ++this.s.seq, from, to: toEndpoint.app, toEndpoint, kind, linkId, text: text.slice(0, MAX_TEXT), ts: Date.now(), readAt: null };
     // a review's request and result say whether it is a plan, and whether
     // its plan waits for the user, as its link decided (each message is
     // rendered on its own later, by the hooks too)
     const link = ["review-request", "review-result"].includes(kind) ? this.s.links[linkId] : null;
-    Object.assign(msg, link?.plan && { plan: true }, link?.plan && link.noGate && { noGate: true }, decision && { decision }, lastRound && { lastRound: true }, generation !== undefined && { generation }, about && { about }, retry && { retry }, auto && { auto: true }, retried && { retried: true }, maybe && { maybe: true });
+    Object.assign(msg, link?.plan && { plan: true }, link?.plan && link.noGate && { noGate: true }, decision && { decision }, lastRound && { lastRound: true }, generation !== undefined && { generation }, about && { about }, retry && { retry }, auto && { auto: true }, retried && { retried: true }, maybe && { maybe: true }, everyTurn && { everyTurn: true });
     this.s.messages.push(msg);
     logEvent({ op: "send", id: msg.id, from, to: toEndpoint, kind, linkId, len: msg.text.length });
     return { id: msg.id };
@@ -1231,7 +1743,24 @@ class BrokerState {
     logEvent({ op: "receive", side, endpoint, ids: out.map((m) => m.id) });
     // everything nextStep reads goes along, so the instruction is the same as in a wake
     return {
-      messages: out.map(({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about, retry, auto, retried, maybe }) => ({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about, retry, auto, retried, maybe })),
+      messages: out.map(({ id, from, kind, linkId, text, ts, plan, noGate, decision, lastRound, about, retry, auto, retried, maybe, everyTurn }) => ({
+        id,
+        from,
+        kind,
+        linkId,
+        text,
+        ts,
+        plan,
+        noGate,
+        decision,
+        lastRound,
+        about,
+        retry,
+        auto,
+        retried,
+        maybe,
+        everyTurn,
+      })),
     };
   }
 }

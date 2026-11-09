@@ -18,7 +18,7 @@ const sameTo = (a, b) => !!a && a.app === b.app && a.id === b.id;
 // It runs the version before this one, as after a real update.
 const brokerUrl = new URL("../src/broker.mjs", import.meta.url).href;
 const stale = spawn(process.execPath, ["--input-type=module", "-e", `const b=await import(${JSON.stringify(brokerUrl)});await b.call("status");console.log("owner");setInterval(()=>{},1000);`], {
-  env: { ...process.env, AGENT_REVIEW_BRIDGE_TEST_PROTOCOL: "18" },
+  env: { ...process.env, AGENT_REVIEW_BRIDGE_TEST_PROTOCOL: "19" },
 });
 await new Promise((r) => stale.stdout.once("data", r));
 const { call, inlineText, nextStep } = await import("../src/broker.mjs");
@@ -1058,6 +1058,311 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
     assert.equal(done.code, 0, "auto mode off: it stops listening on its own");
     assert.equal((await runHook("openai", "start", { session_id: W.id, source: "resume" })).out, "", "auto mode off: nothing at session start");
     console.log("37 auto mode from ChatGPT: the turn check once per set of changes (continued turns too, bounded even if its words were taken for the user's), deliveries and the check's own words aren't user prompts, an unjoined review doesn't hold it back, rules at session start, its Claude reviewer listens until auto mode is off");
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+}
+
+// 38. auto mode reviewing every turn, Claude working with a ChatGPT reviewer:
+// every turn that ends is reviewed on its own (a user turn, a fix turn, a turn
+// the app's own notice started), put together later by the broker from what
+// the Stop hook wrote down; the Stop check doesn't stop the turn; only a
+// review that requests changes wakes the chat, the rest comes with the next
+// prompt; a fix turn's review is the next round; the cap stops the loop until
+// the user writes; the agent's own review of exactly the turn's end counts,
+// a plan review doesn't; the chat keeps listening between reviews
+{
+  const { execFileSync } = await import("node:child_process");
+  const { fingerprint } = await import("../src/git.mjs");
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-every-"));
+  try {
+    const g = (...a) => execFileSync("git", ["-C", work, "-c", "user.name=t", "-c", "user.email=t@t", ...a], { encoding: "utf8" });
+    g("init", "-q");
+    fs.writeFileSync(path.join(work, "a.js"), "1\n");
+    g("add", ".");
+    g("commit", "-qm", "init");
+    const head = g("rev-parse", "HEAD").trim();
+    const C = { app: "claude", id: "claude-every-38" };
+    const G = { app: "openai", id: "gpt-every-38" };
+    const key = `claude:${C.id}`;
+    const entry = () => state().auto[key];
+    await call("auto_set", { endpoint: C, on: true, everyTurn: true, reviewer: G, paths: [{ path: work, fp: fingerprint(work).hash, head }] });
+    let turn = 0;
+    const prompt = (p) => runHook("claude", "prompt", { session_id: C.id, cwd: work, prompt: p, prompt_id: `t${++turn}` });
+    const stop = (last) => runHook("claude", "stop", { session_id: C.id, cwd: work, prompt_id: `t${turn}`, last_assistant_message: last });
+    const reviewOf = (n) => until(() => state().messages.filter((m) => m.kind === "review-request" && sameTo(m.toEndpoint, G) && state().links[m.linkId]?.everyTurn)[n], 15000);
+    const answer = (m, decision, extra = {}) => call("advise", { endpoint: G, requestId: m.id, decision, ...(decision === "changes_requested" && { blocking: [{ title: "Handle the empty case." }] }), ...extra });
+    const toC = (kind) => state().messages.filter((m) => sameTo(m.toEndpoint, C) && m.kind === kind);
+    const notesFor = () => state().notes.filter((n) => sameTo(n.to, C) && !n.deliveredAt);
+    // a user turn: reviewed on its own, the Stop hook doesn't stop it
+    await prompt("Make a.js print 2.");
+    fs.writeFileSync(path.join(work, "a.js"), "2\n");
+    fs.writeFileSync(path.join(work, "new.txt"), "x\n");
+    const s1 = await stop("a.js prints 2 now.");
+    assert.equal(s1.out, "", "every turn reviewed on its own: the Stop check doesn't stop it");
+    const r1 = await reviewOf(0);
+    assert.match(r1.text, /^Automatic review of a turn of Claude Code session claude-every-38 \(turn t1\), sent by the bridge/);
+    assert.match(r1.text, /User's message:\nMake a\.js print 2\./);
+    assert.match(r1.text, /Agent's final message:\na\.js prints 2 now\./);
+    assert.match(r1.text, /The turn's own changes, from its start to its end:\n```diff\na\.js \| 2 \+-[\s\S]*New untracked files:\nnew\.txt[\s\S]*-1\n\+2/);
+    assert.match(r1.text, /This is auto mode's review of one turn/);
+    assert.match(r1.text, /Where the changes are/);
+    // the turn's own changes stay what they were at its end
+    fs.writeFileSync(path.join(work, "a.js"), "2\n");
+    // approved: silent, and the content recorded
+    await answer(r1, "approved");
+    assert.equal(toC("review-result").length, 0, "an approval wakes no one");
+    assert.equal(entry().paths[work].approved, state().links[r1.linkId].reqPaths[0].fp, "the approval covers what was sent");
+    // the chat keeps listening between reviews
+    const file = path.join(dir, "listeners", `claude-${C.id}.json`);
+    const listener = runHook("claude", "listen", { session_id: C.id }, { killAfter: 2500 });
+    await until(() => fs.existsSync(file));
+    // changes requested: the chat is woken, told its next turn is reviewed on its own
+    await prompt("Handle empty input too.");
+    fs.writeFileSync(path.join(work, "a.js"), "3\n");
+    await stop("Done.");
+    const r2 = await reviewOf(1);
+    await answer(r2, "changes_requested");
+    const woke = await listener;
+    assert.equal(woke.code, 2, "a review that requests changes wakes the chat");
+    assert.match(woke.err, /The review of your last turn: m\d+[\s\S]*Your next turn is reviewed on its own: don't ask for a review yourself/);
+    // the fix turn (started by that wake, not by the user): the next round,
+    // with the reviewer's last answer
+    const genBefore = entry().generation;
+    await prompt("<task-notification>\n<task-id>w1</task-id>\n<status>completed</status>\n</task-notification>");
+    fs.writeFileSync(path.join(work, "a.js"), "4\n");
+    await stop("Handled the empty case.");
+    const r3 = await reviewOf(2);
+    assert.equal(entry().generation, genBefore, "a notice isn't the user's prompt");
+    assert.match(r3.text, new RegExp(`Round 2 of review ${r2.linkId}: this turn answers your changes requested in ${r2.linkId}`));
+    assert.match(r3.text, /Your answer to the previous round[\s\S]*Handle the empty case\./);
+    assert.match(r3.text, /User's message:\n\(None: this turn answers your previous review's changes requested\.\)/);
+    assert.equal(state().links[r3.linkId].roundOf, r2.linkId);
+    // the approval that ends the loop comes with the next prompt, no wake
+    await answer(r3, "approved", { nits: [{ title: "Name it better." }] });
+    assert.equal(toC("review-result").length, 1, "still only the one wake");
+    const ctx = JSON.parse((await prompt("Next: tidy up.")).out).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /From your reviewer, about earlier turns[\s\S]*approved the fix[\s\S]*Name it better\./);
+    assert.match(ctx, /Auto mode is on, reviewing every turn/);
+    assert.doesNotMatch(ctx, /you haven't consulted the reviewer/, "no reminder in every-turn mode");
+    // a late answer (the user wrote again meanwhile) is a note, no wake
+    fs.writeFileSync(path.join(work, "a.js"), "5\n");
+    await stop("Tidied.");
+    const r4 = await reviewOf(3);
+    const gen = entry().generation;
+    await prompt("And one more thing.");
+    await until(() => entry().generation === gen + 1); // the broker has the prompt
+    await answer(r4, "changes_requested");
+    assert.equal(toC("review-result").length, 1, "a late answer wakes no one");
+    assert.ok(notesFor().some((n) => n.kind === "review" && /On an earlier turn, before your latest prompt/.test(n.text)));
+    // a turn the app's own notice started is reviewed too
+    await stop("Answered.");
+    await reviewOf(4);
+    await prompt("<task-notification>\n<task-id>build-1</task-id>\n<status>completed</status>\n</task-notification>");
+    fs.writeFileSync(path.join(work, "a.js"), "6\n");
+    await stop("Fixed the build.");
+    const r6 = await reviewOf(5);
+    assert.match(r6.text, /User's message:\n\(None: the app or a bridge message started this turn, not the user\.\)/);
+    for (const m of state().messages.filter((x) => x.kind === "review-request" && sameTo(x.toEndpoint, G) && !x.answeredAt && state().links[x.linkId]?.active)) await answer(m, "approved");
+    // the agent's own code review of exactly the turn's end: no second review;
+    // after a plan review the turn is reviewed
+    await prompt("Rename it.");
+    fs.writeFileSync(path.join(work, "a.js"), "7\n");
+    const own = await call("link_create", { primary: C, mode: "review", advisor: G, request: "my own", reqPaths: [{ path: work, fp: fingerprint(work).hash, head }] });
+    const before = state().messages.filter((m) => m.kind === "review-request" && sameTo(m.toEndpoint, G)).length;
+    await stop("Renamed.");
+    await until(() => events().some((e) => e.op === "turn_covered"), 15000);
+    assert.equal(state().messages.filter((m) => m.kind === "review-request" && sameTo(m.toEndpoint, G)).length, before, "covered by the agent's own review");
+    await answer(state().messages.find((m) => m.linkId === own.id && m.kind === "review-request"), "approved");
+    await prompt("Plan the next part.");
+    await call("link_create", { primary: C, mode: "review", advisor: G, request: "a plan", plan: true, reqPaths: [{ path: work, fp: fingerprint(work).hash, head }] });
+    fs.writeFileSync(path.join(work, "a.js"), "8\n");
+    await stop("Planned and started.");
+    const r8 = await reviewOf(6);
+    assert.match(r8.text, /User's message:\nPlan the next part\./, "a plan review doesn't count for the code");
+    // the cap: rounds in a row without approval stop the loop until the user writes
+    process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS = "2";
+    try {
+      await answer(state().messages.find((m) => m.kind === "review-request" && m.linkId !== r8.linkId && !m.answeredAt && sameTo(m.toEndpoint, G) && state().links[m.linkId]?.active) ?? r8, "approved").catch(() => {});
+      await prompt("Try the hard part.");
+      fs.writeFileSync(path.join(work, "a.js"), "9\n");
+      await stop("Tried.");
+      const c1 = await reviewOf(7);
+      await answer(c1, "changes_requested");
+      await prompt("<task-notification>\n<task-id>w2</task-id>\n</task-notification>");
+      fs.writeFileSync(path.join(work, "a.js"), "10\n");
+      await stop("Fixed once.");
+      const c2 = await reviewOf(8);
+      await answer(c2, "changes_requested");
+      assert.equal(toC("stop").length, 1, "the cap stops the loop");
+      assert.equal(entry().stopped, true);
+      const n = state().messages.filter((m) => m.kind === "review-request" && sameTo(m.toEndpoint, G)).length;
+      await stop("Stopped, asking the user.");
+      await sleep(1500);
+      assert.equal(state().messages.filter((m) => m.kind === "review-request" && sameTo(m.toEndpoint, G)).length, n, "not reviewed while stopped");
+      await prompt("Go on, differently.");
+      await until(() => entry().stopped === false); // the user's prompt lifts the stop
+      // a turn the bridge's wake starts with no prompt hook in between starts
+      // where the last one ended: its own changes are still there
+      fs.writeFileSync(path.join(work, "a.js"), "11\n");
+      await stop("Went on.");
+      await reviewOf(9);
+      fs.writeFileSync(path.join(work, "a.js"), "12\n");
+      await stop("Woken, no prompt hook.");
+      const woken = await reviewOf(10);
+      assert.match(woken.text, /The turn's own changes, from its start to its end:[\s\S]*-11\n\+12/);
+      assert.doesNotMatch(woken.text, /-10\n/, "only this turn's own change");
+    } finally {
+      delete process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS;
+    }
+    await call("auto_set", { endpoint: C, on: false });
+    console.log("38 every turn, Claude working: turns reviewed on their own (user, fix, app notice), no Stop check, silent approvals, a woken fix loop with rounds, late answers and loop ends as notes, the agent's own exact review counts and a plan review doesn't, the cap, listening between reviews");
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+}
+
+// 39. auto mode reviewing every turn, ChatGPT working with a Claude reviewer:
+// turns wait until a Claude chat joins with auto mode's code, then go to it;
+// the chat's own folder is used when none is tracked; the bridge's deliveries
+// run as prompts and aren't the user's, so a fix turn is the next round; the
+// Stop hook doesn't stop the turn; a Claude reviewer's failure or approval
+// wait reaches the working chat as a note, not a wake
+{
+  const { execFileSync } = await import("node:child_process");
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-every-gpt-"));
+  try {
+    const g = (...a) => execFileSync("git", ["-C", work, "-c", "user.name=t", "-c", "user.email=t@t", ...a], { encoding: "utf8" });
+    g("init", "-q");
+    fs.writeFileSync(path.join(work, "b.js"), "1\n");
+    g("add", ".");
+    g("commit", "-qm", "init");
+    const W = { app: "openai", id: "gpt-every-39" };
+    const R = { app: "claude", id: "claude-reviewer-39" };
+    const key = `openai:${W.id}`;
+    const entry = () => state().auto[key];
+    await call("auto_set", { endpoint: W, on: true, everyTurn: true }); // no folder known yet
+    let turn = 0;
+    const prompt = (p) => runHook("openai", "prompt", { session_id: W.id, cwd: work, prompt: p, turn_id: `u${++turn}` });
+    const stop = (last) => runHook("openai", "stop", { session_id: W.id, cwd: work, turn_id: `u${turn}`, last_assistant_message: last });
+    const reviewOf = (n) => until(() => state().messages.filter((m) => m.kind === "review-request" && sameTo(m.toEndpoint, R) && state().links[m.linkId]?.everyTurn && !state().links[m.linkId].request)[n], 15000);
+    const notesFor = () => state().notes.filter((n) => sameTo(n.to, W) && !n.deliveredAt);
+    // no reviewer yet: the turn waits, and the chat hears why with its next prompt
+    await prompt("Make b.js print 2.");
+    fs.writeFileSync(path.join(work, "b.js"), "2\n");
+    assert.equal((await stop("b.js prints 2.")).out, "", "the Stop hook doesn't stop the turn");
+    await until(() => notesFor().some((n) => /has no reviewer yet, so the reviews of your turns wait/.test(n.text)), 8000);
+    assert.equal(entry().jobs.length, 1, "the turn waits for a reviewer");
+    // a Claude chat joins with auto mode's code: it becomes the reviewer, and the turn goes to it
+    const bind = await call("link_create", { primary: W, mode: "review", request: "Bind me.", autoReviewer: true, everyTurn: true });
+    assert.equal((await call("link_join", { code: bind.joinCode, endpoint: R })).autoReviewer, true);
+    const bindReq = state().messages.find((m) => m.linkId === bind.id && m.kind === "review-request");
+    await call("receive", { side: "claude", endpoint: R });
+    // whatever the reviewer answers to the request that only binds it
+    await call("advise", { endpoint: R, requestId: bindReq.id, decision: "changes_requested", blocking: [{ title: "Nothing to bind?" }] });
+    const r1 = await until(() => state().messages.find((m) => m.kind === "review-request" && sameTo(m.toEndpoint, R) && m.linkId !== bind.id), 15000);
+    assert.match(r1.text, /^Automatic review of a turn of ChatGPT chat gpt-every-39 \(turn u1\)/);
+    assert.match(r1.text, /User's message:\nMake b\.js print 2\./);
+    assert.ok(work in entry().paths || fs.realpathSync(work) in entry().paths, "the chat's own folder is used and tracked");
+    assert.equal(state().messages.filter((m) => sameTo(m.toEndpoint, W) && m.kind === "review-result").length, 0, "the binding review's answer wakes no one");
+    assert.equal(entry().chain ?? null, null, "nor starts a fix loop");
+    // changes requested: delivered to the ChatGPT chat as a prompt, which isn't
+    // the user's, so the turn it starts is the fix turn
+    await call("receive", { side: "claude", endpoint: R });
+    await call("advise", { endpoint: R, requestId: r1.id, decision: "changes_requested", blocking: [{ title: "Print 3." }] });
+    const result = await until(() => state().messages.find((m) => sameTo(m.toEndpoint, W) && m.kind === "review-result" && m.dispatch?.state === "sent"));
+    const gen = entry().generation;
+    await prompt(inlineText(result));
+    fs.writeFileSync(path.join(work, "b.js"), "3\n");
+    await stop("Prints 3.");
+    const r2 = await until(() => state().messages.find((m) => m.kind === "review-request" && sameTo(m.toEndpoint, R) && state().links[m.linkId]?.roundOf === r1.linkId), 15000);
+    assert.equal(entry().generation, gen, "a delivery isn't the user's prompt");
+    assert.match(r2.text, new RegExp(`Round 2 of review ${r1.linkId}`));
+    // the reviewer fails (an API error ends its turn): a note, not a wake
+    process.env.AGENT_REVIEW_BRIDGE_TEST_RETRY_MS = "200"; // a short wait before it's sent again
+    await call("wake_ack", { ids: [r2.id], at: Date.now() });
+    await runHook("claude", "stopfail", { session_id: R.id, error: "rate_limit" });
+    await until(() => notesFor().some((n) => /can't answer .*rate_limit[\s\S]*it is sent again once the reviewer can answer/.test(n.text)));
+    assert.equal(state().messages.filter((m) => sameTo(m.toEndpoint, W) && m.kind === "failed").length, 0, "no failure wake");
+    // sent again to the same reviewer, which gets it once it listens again
+    const retry = await until(() => state().messages.find((m) => m.kind === "review-request" && sameTo(m.toEndpoint, R) && state().links[m.linkId]?.retry), 15000);
+    assert.match(retry.text, new RegExp(`Retry of round 2 of review ${r1.linkId}: the previous attempt \\(${r2.linkId}\\) got no answer`));
+    await call("receive", { side: "claude", endpoint: R });
+    await call("advise", { endpoint: R, requestId: retry.id, decision: "approved" });
+    // a tool approval the reviewer waits on: a note too
+    await prompt("Go on.");
+    fs.writeFileSync(path.join(work, "b.js"), "4\n");
+    await stop("Went on.");
+    const r3 = await until(() => state().messages.filter((m) => m.kind === "review-request" && sameTo(m.toEndpoint, R) && state().links[m.linkId]?.everyTurn && state().links[m.linkId].active).at(-1), 15000);
+    await call("wake_ack", { ids: [r3.id], at: Date.now() });
+    await runHook("claude", "permission", { session_id: R.id, message: "Claude needs your permission to use Bash" });
+    await until(() => notesFor().some((n) => /waiting for the user to approve a tool/.test(n.text)));
+    assert.equal(state().messages.filter((m) => sameTo(m.toEndpoint, W) && m.kind === "waiting").length, 0, "no waiting wake");
+    // the reviewer has every-turn auto mode too, reviewed by this chat: the
+    // turn it spends answering a review isn't reviewed, so they don't go round
+    await call("auto_set", { endpoint: R, on: true, everyTurn: true, reviewer: W });
+    await sleep(20);
+    await call("receive", { side: "claude", endpoint: R });
+    await call("advise", { endpoint: R, requestId: r3.id, decision: "approved" });
+    assert.ok(!notesFor().some((n) => /waiting for the user to approve a tool/.test(n.text)), "the waiting note goes once the answer is in");
+    await runHook("claude", "stop", { session_id: R.id, cwd: work, last_assistant_message: "Reviewed it." });
+    await until(() => events().some((e) => e.op === "turn_not_reviewed" && e.endpoint?.id === R.id && e.why === "answered a review"));
+    assert.equal((state().auto[`claude:${R.id}`].jobs ?? []).length, 0);
+    await call("auto_set", { endpoint: R, on: false });
+    // a plain message on an open review's link that gets no answer: a note,
+    // and the review isn't sent a second time
+    await prompt("One more.");
+    fs.writeFileSync(path.join(work, "b.js"), "5\n");
+    await stop("One more done.");
+    const r4 = await until(() => state().messages.find((m) => m.kind === "review-request" && sameTo(m.toEndpoint, R) && /One more done\./.test(m.text)), 15000);
+    const msg = await call("send", { endpoint: W, text: "Also check b.js.", linkId: r4.linkId });
+    await call("wake_ack", { ids: [msg.id], at: Date.now() });
+    const retries = () => state().messages.filter((m) => m.kind === "review-request" && sameTo(m.toEndpoint, R) && state().links[m.linkId]?.retry).length;
+    const before = retries();
+    await runHook("claude", "stopfail", { session_id: R.id, error: "rate_limit" });
+    await until(() => notesFor().some((n) => new RegExp(`can't answer ${msg.id}`).test(n.text)));
+    await sleep(500);
+    assert.equal(retries(), before, "no second review for a message that failed");
+    assert.equal(state().links[r4.linkId].active, true, "the review stays open");
+    assert.ok(!notesFor().some((n) => new RegExp(`can't answer ${msg.id}[\\s\\S]*one of your turns`).test(n.text)), "told as a message, not a turn");
+    await call("receive", { side: "claude", endpoint: R });
+    await call("advise", { endpoint: R, requestId: r4.id, decision: "approved" });
+    await call("auto_set", { endpoint: W, on: false });
+    console.log("39 every turn, ChatGPT working: turns wait for the joined Claude reviewer, then go to it; the chat's folder used; deliveries aren't user prompts, so a fix turn is the next round; no Stop check; the reviewer's failure and approval wait come as notes");
+  } finally {
+    fs.rmSync(work, { recursive: true, force: true });
+  }
+}
+
+// 40. auto mode at key moments, from ChatGPT: while its first review waits
+// for a chat to join with the code, the Stop check says to remind the user of
+// that code instead of asking for another review (once per code); the user's
+// prompt clears what the check stopped a continued turn for
+{
+  const { fingerprint } = await import("../src/git.mjs");
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-joinwait-"));
+  try {
+    fs.writeFileSync(path.join(work, "c.txt"), "1");
+    const W = { app: "openai", id: "gpt-joinwait-40" };
+    await call("auto_set", { endpoint: W, on: true, paths: [{ path: work, fp: fingerprint(work).hash, head: null }] });
+    const first = await call("link_create", { primary: W, mode: "review", request: "first", autoReviewer: true });
+    fs.writeFileSync(path.join(work, "c.txt"), "2");
+    const stop = async (extra = {}) => {
+      const r = await runHook("openai", "stop", { session_id: W.id, cwd: work, ...extra });
+      return r.out ? JSON.parse(r.out) : null;
+    };
+    const b = await stop();
+    assert.match(b?.reason ?? "", new RegExp(`review ${first.id} is waiting for a chat in the other app to join with its code ${first.joinCode}\\. Remind the user to paste it there`));
+    assert.doesNotMatch(b.reason, /Ask for a review \(bridge_review\)/);
+    assert.equal(await stop({ stop_hook_active: true }), null, "once per code");
+    // the user's prompt clears the record of the continued turn too
+    const chain = path.join(dir, "turns", `openai-${W.id}.auto-chain.json`);
+    assert.ok(fs.existsSync(chain));
+    await runHook("openai", "prompt", { session_id: W.id, cwd: work, prompt: "ok, I pasted it", turn_id: "j1" });
+    assert.ok(!fs.existsSync(chain), "a user prompt clears it");
+    await call("link_close", { linkId: first.id });
+    await call("auto_set", { endpoint: W, on: false });
+    console.log("40 key moments from ChatGPT: a waiting join code is recalled once instead of asking again; a user prompt clears the continued turn's record");
   } finally {
     fs.rmSync(work, { recursive: true, force: true });
   }

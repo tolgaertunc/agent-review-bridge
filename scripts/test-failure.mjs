@@ -810,6 +810,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   assert.equal((await call("link_join", { code: first.joinCode, endpoint: R })).autoReviewer, true);
   assert.deepEqual(state().auto["openai:gpt-auto-worker"].reviewer, R);
   assert.equal(state().links[earlier.id].active, false, "the earlier try's code goes");
+  assert.equal(state().links[earlier.id].request, undefined, "with its unsent request");
   await assert.rejects(call("link_join", { code: earlier.joinCode, endpoint: other }), /no open link with that join code/);
   // a second one doesn't replace it
   const second = await call("link_create", { primary: W, mode: "review", request: "Another first?", autoReviewer: true });
@@ -836,7 +837,9 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   assert.equal((await call("read_chat_allowed", { endpoint: R })).allowed, true, "no longer a reviewer once auto mode is off");
   await sleep(5);
   await call("auto_set", { endpoint: W, on: true });
-  assert.equal((await call("link_join", { code: late.joinCode, endpoint: R })).autoReviewer, undefined, "another auto session");
+  await assert.rejects(call("link_join", { code: late.joinCode, endpoint: R }), /no open link with that join code/, "an earlier session's code is closed");
+  assert.ok(state().notes.some((n) => n.to.id === W.id && new RegExp(`Review ${late.id} was waiting for a chat to join with its code; it was closed`).test(n.text)), "the chat that asked is told");
+  assert.equal(state().links[late.id].request, undefined, "with its unsent request");
   assert.equal(state().auto["openai:gpt-auto-worker"].reviewer, null, "a fresh start has no reviewer yet");
   // without auto mode on: never marked
   await call("auto_set", { endpoint: W, on: false });
@@ -844,6 +847,292 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   assert.equal(state().links[noAuto.id].autoReviewer, undefined);
   for (const id of [second.id, late.id, noAuto.id, plain.id]) await call("link_close", { linkId: id });
   console.log("17 auto mode from ChatGPT: the Claude chat that joins its first review stays its reviewer (not another join, a second one or an earlier session's); a chat in the same app can't, an earlier try's code goes; a standing reviewer reads no other chats, in either direction, until it unlinks or auto mode is off");
+}
+
+// 18. auto mode reviewing every turn, what can go wrong: at ChatGPT's usage
+// limit a turn's review waits and goes once the limit opens, without another
+// turn; a review whose turn fails is told as a note, not a wake; a review that
+// can't be put together, or takes too long, is told once; a Claude reviewer
+// that doesn't listen is told about once, as a note
+{
+  const C = { app: "claude", id: "claude-every-fail" };
+  const G = { app: "openai", id: "gpt-every-fail" };
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-every-fail-"));
+  fs.writeFileSync(path.join(work, "f.txt"), "x");
+  await call("auto_set", { endpoint: C, on: true, everyTurn: true, reviewer: G, paths: [{ path: work, fp: null, head: null }] });
+  const notesFor = (who = C) => state().notes.filter((n) => n.to.id === who.id && !n.deliveredAt);
+  const reviewsTo = (to) => state().messages.filter((m) => m.kind === "review-request" && m.toEndpoint.id === to.id && state().links[m.linkId]?.everyTurn);
+  const end = (who, last) => runHook(who.app, "stop", { session_id: who.id, cwd: work, last_assistant_message: last });
+  // at the limit: held back with one note, then sent once it opens
+  fake({ limits: { ordinaryUsageAllowed: false, rateLimits: { primary: { usedPercent: 100, resetsAt: Math.floor(Date.now() / 1000) + 2 } } } });
+  await end(C, "One.");
+  await until(() => notesFor().some((n) => /The reviews of your turns wait: ChatGPT's usage limit is reached until/.test(n.text)));
+  assert.equal(reviewsTo(G).length, 0, "held back at the limit");
+  fake({});
+  const sent = await until(() => reviewsTo(G)[0], 8000);
+  assert.match(sent.text, /Agent's final message:\nOne\./);
+  assert.match(sent.text, /The turn's own changes: not available/, "outside git there is no snapshot");
+  // its turn fails because the reviewer is unavailable (a usage limit): a
+  // note, no wake, and the same turn's review goes again once it can, as often
+  // as it takes, keeping its round; a failure of another kind is tried three
+  // times at most
+  const failTurn = (m, { limited = false, ended = false } = {}) =>
+    fake({
+      turns: { [m.watch.clientId]: ended ? { state: "completed", completedAt: 1 } : { state: "failed", completedAt: 1, error: { message: "usage limit" } } },
+      ...(limited && { limits: { ordinaryUsageAllowed: false, rateLimits: { primary: { usedPercent: 100, resetsAt: Math.floor(Date.now() / 1000) + 2 } } } }),
+    });
+  const tryN = (n) => until(() => reviewsTo(G)[n]?.watch?.clientId && reviewsTo(G)[n], 10000);
+  const m = await tryN(0);
+  failTurn(m, { limited: true });
+  await until(() => notesFor().some((n) => /can't answer .*usage limit[\s\S]*it is sent again once the reviewer can answer/.test(n.text)));
+  assert.equal(state().messages.filter((x) => x.toEndpoint.id === C.id && x.kind === "failed").length, 0, "no failure wake");
+  await sleep(500);
+  assert.equal(reviewsTo(G).length, 1, "it waits for the limit");
+  fake({});
+  const again = await tryN(1);
+  assert.match(again.text, new RegExp(`Retry of round 1 of review ${m.linkId}: the previous attempt \\(${m.linkId}\\) got no answer`));
+  assert.match(again.text, /Agent's final message:\nOne\./, "the same turn");
+  // more than three unavailable tries: still sent again
+  for (const n of [1, 2, 3]) failTurn(await tryN(n));
+  const fifth = await tryN(4);
+  assert.equal(state().links[fifth.linkId].round, 1, "the same round");
+  assert.ok(!notesFor().some((n) => /it isn't sent again/.test(n.text)), "not given up");
+  // failures of another kind (its turn ended without an answer): three tries
+  failTurn(fifth, { ended: true });
+  failTurn(await tryN(5), { ended: true });
+  failTurn(await tryN(6), { ended: true });
+  await until(() => notesFor().some((n) => /ended without an answer[\s\S]*it isn't sent again; later turns are reviewed as usual/.test(n.text)));
+  await sleep(500);
+  assert.equal(reviewsTo(G).length, 7, "four unavailable tries, then three of another kind");
+  fake({});
+  // a reviewer that stays unavailable is left after a while, told once, with how to get another
+  process.env.AGENT_REVIEW_BRIDGE_TEST_TURN_WAITS = "2";
+  try {
+    const C6 = { app: "claude", id: "claude-every-gone" };
+    const G6 = { app: "openai", id: "gpt-every-gone" };
+    await call("auto_set", { endpoint: C6, on: true, everyTurn: true, reviewer: G6, paths: [{ path: work, fp: null, head: null }] });
+    await end(C6, "Gone?");
+    for (const n of [0, 1, 2]) failTurn(await until(() => reviewsTo(G6)[n]?.watch?.clientId && reviewsTo(G6)[n], 10000));
+    await until(() => notesFor(C6).some((x) => /unavailable for too long, so it is set aside and kept: it goes once the reviewer answers again, or once auto mode has another \(bridge_auto with new_reviewer/.test(x.text)));
+    await sleep(500);
+    assert.equal(reviewsTo(G6).length, 3, "no more tries once the waits run out");
+    assert.equal(notesFor(C6).filter((x) => /it is sent again/.test(x.text)).length, 1, "one note while it was sent again, not one per try");
+    assert.equal(state().auto[`claude:${C6.id}`].parked.length, 1, "the turn is kept");
+    assert.equal(state().auto[`claude:${C6.id}`].jobs.length, 0, "out of the way of later turns");
+    fake({});
+    // another reviewer: the turn kept aside is reviewed after all
+    const G7 = { app: "openai", id: "gpt-every-replacement" };
+    await call("auto_set", { endpoint: C6, on: true, reviewer: G7 });
+    const late = await until(() => reviewsTo(G7)[0], 10000);
+    assert.match(late.text, /Agent's final message:\nGone\?/, "the same turn, reviewed after all");
+    assert.equal(state().auto[`claude:${C6.id}`].parked.length, 0);
+    await call("auto_set", { endpoint: C6, on: false });
+    // an answer from a reviewer auto mode no longer has doesn't bring back
+    // what was set aside for the current one; the current one's answer does
+    const C7 = { app: "claude", id: "claude-every-parked" };
+    const [old1, cur] = [{ app: "openai", id: "gpt-every-old" }, { app: "openai", id: "gpt-every-cur" }];
+    await call("auto_set", { endpoint: C7, on: true, everyTurn: true, reviewer: old1, paths: [{ path: work, fp: null, head: null }] });
+    await end(C7, "To the old one.");
+    const toOld = await until(() => reviewsTo(old1)[0], 10000);
+    await call("auto_set", { endpoint: C7, on: true, reviewer: cur });
+    await end(C7, "To the current one.");
+    for (const n of [0, 1, 2]) failTurn(await until(() => reviewsTo(cur)[n]?.watch?.clientId && reviewsTo(cur)[n], 10000));
+    await until(() => state().auto[`claude:${C7.id}`].parked?.length === 1);
+    fake({});
+    await call("advise", { endpoint: old1, requestId: toOld.id, decision: "approved" });
+    await sleep(300);
+    assert.equal(state().auto[`claude:${C7.id}`].parked.length, 1, "the old reviewer's answer changes nothing here");
+    await end(C7, "Another turn.");
+    const next = await until(() => reviewsTo(cur).find((x) => /Another turn\./.test(x.text)), 10000);
+    await call("advise", { endpoint: cur, requestId: next.id, decision: "approved" });
+    await until(() => reviewsTo(cur).filter((x) => /To the current one\./.test(x.text)).length === 4, 10000);
+    assert.equal(state().auto[`claude:${C7.id}`].parked.length, 0, "the current reviewer answering brings it back");
+    await call("auto_set", { endpoint: C7, on: false });
+  } finally {
+    delete process.env.AGENT_REVIEW_BRIDGE_TEST_TURN_WAITS;
+  }
+  // the Stop hook cut off right after it wrote the turn: the review still goes
+  process.env.AGENT_REVIEW_BRIDGE_TEST_STOP_CUT = "1";
+  try {
+    await end(C, "Cut short.");
+    const cut = await until(() => reviewsTo(G).find((x) => /Agent's final message:\nCut short\./.test(x.text)), 10000);
+    assert.match(cut.text, /The turn's own changes: not available/);
+  } finally {
+    delete process.env.AGENT_REVIEW_BRIDGE_TEST_STOP_CUT;
+  }
+  // it can't be put together: told once, and the turn leaves the queue
+  process.env.AGENT_REVIEW_BRIDGE_TEST_TURNJOB = "fail";
+  try {
+    await end(C, "Two.");
+    await until(() => notesFor().some((n) => /couldn't be put together \(a test failure\)/.test(n.text)), 8000);
+    await until(() => !state().auto[`claude:${C.id}`].jobs.length);
+    // or takes too long
+    process.env.AGENT_REVIEW_BRIDGE_TEST_TURNJOB = "slow";
+    process.env.AGENT_REVIEW_BRIDGE_TEST_JOB_BUDGET = "300";
+    await end(C, "Three.");
+    await until(() => notesFor().some((n) => /took longer than 1 s/.test(n.text)), 8000);
+  } finally {
+    delete process.env.AGENT_REVIEW_BRIDGE_TEST_TURNJOB;
+    delete process.env.AGENT_REVIEW_BRIDGE_TEST_JOB_BUDGET;
+  }
+  await call("auto_set", { endpoint: C, on: false });
+  // a Claude reviewer that doesn't listen: told once, as a note
+  const W = { app: "openai", id: "gpt-every-worker" };
+  const R = { app: "claude", id: "claude-every-silent" };
+  await call("auto_set", { endpoint: W, on: true, everyTurn: true, reviewer: R, paths: [{ path: work, fp: null, head: null }] });
+  await end(W, "Four.");
+  await until(() => reviewsTo(R)[0], 8000);
+  await until(() => notesFor(W).some((n) => /isn't listening right now: the reviews of your turns wait for it/.test(n.text)));
+  assert.equal(notesFor(W).filter((n) => /isn't listening/.test(n.text)).length, 1, "once");
+  await call("auto_set", { endpoint: W, on: false });
+  // while a turn's review is being put together: switching to key moments
+  // sends nothing; another reviewer gets it instead
+  const { fingerprint } = await import("../src/git.mjs");
+  const C2 = { app: "claude", id: "claude-every-race" };
+  const [G2, G3] = [{ app: "openai", id: "gpt-every-race-a" }, { app: "openai", id: "gpt-every-race-b" }];
+  const jobsOf = (who) => state().auto[`${who.app}:${who.id}`].jobs ?? [];
+  await call("auto_set", { endpoint: C2, on: true, everyTurn: true, reviewer: G2, paths: [{ path: work, fp: null, head: null }] });
+  process.env.AGENT_REVIEW_BRIDGE_TEST_TURNJOB = "delay:1500";
+  try {
+    await end(C2, "Five.");
+    await until(() => jobsOf(C2).length === 1);
+    await call("auto_set", { endpoint: C2, on: true, everyTurn: false });
+    await sleep(2500);
+    assert.equal(reviewsTo(G2).length, 0, "switched to key moments while it was put together: nothing sent");
+    await call("auto_set", { endpoint: C2, on: true, everyTurn: true });
+    await end(C2, "Six.");
+    await until(() => jobsOf(C2).length === 1);
+    await call("auto_set", { endpoint: C2, on: true, reviewer: G3 });
+    await until(() => reviewsTo(G3)[0], 10000);
+    assert.equal(reviewsTo(G2).length, 0, "the reviewer it was put together for isn't the one any more");
+  } finally {
+    delete process.env.AGENT_REVIEW_BRIDGE_TEST_TURNJOB;
+  }
+  // the agent's own code review of exactly the turn's end: one still open
+  // counts; one closed unanswered doesn't
+  await call("auto_set", { endpoint: C2, on: true, reviewer: G2 });
+  const tracked = state().links[reviewsTo(G3)[0].linkId].reqPaths[0].path; // as the bridge names it
+  // the reviews of one turn (an unanswered fake review times out within
+  // seconds on this test's scaled clock and is sent again: those aren't counted)
+  const reviewsOfTurn = (last) => reviewsTo(G2).filter((m) => m.text.includes(`Agent's final message:\n${last}\n`) && !state().links[m.linkId].retry);
+  // the reviewer answers what it gets, so nothing waits long enough here to be
+  // sent again
+  const approver = setInterval(() => {
+    for (const m of reviewsTo(G2).filter((x) => !x.answeredAt && state().links[x.linkId]?.active))
+      call("advise", { endpoint: G2, requestId: m.id, decision: "approved" }).catch(() => {});
+  }, 100);
+  const covered = () => fs.readFileSync(path.join(dir, "events.jsonl"), "utf8").split("\n").filter((l) => l.includes('"op":"turn_covered"')).length;
+  // the turn's review was sent, or it was found covered (counted from before its Stop)
+  const turnSettled = async (last, coveredBefore) => {
+    await until(() => reviewsOfTurn(last).length || covered() > coveredBefore, 10000);
+    await until(() => !jobsOf(C2).some((j) => j.lastMessage === last), 10000);
+  };
+  const ownTurn = async (n, close) => {
+    await runHook("claude", "prompt", { session_id: C2.id, cwd: work, prompt: `Turn ${n}.`, prompt_id: `p${n}` });
+    await sleep(700);
+    const own = await call("link_create", { primary: C2, mode: "review", advisor: G2, request: "mine", reqPaths: [{ path: tracked, fp: fingerprint(tracked, { fresh: true }).hash, head: null }] });
+    if (close) await call("link_close", { linkId: own.id });
+    const before = covered();
+    await runHook("claude", "stop", { session_id: C2.id, cwd: work, prompt_id: `p${n}`, last_assistant_message: `Turn ${n}.` });
+    await turnSettled(`Turn ${n}.`, before); // reviewed, or found covered
+    await call("link_close", { linkId: own.id });
+    return reviewsOfTurn(`Turn ${n}.`).length;
+  };
+  assert.equal(await ownTurn(7, false), 0, "an open review of exactly that content covers the turn");
+  assert.equal(await ownTurn(8, true), 1, "one closed unanswered doesn't");
+  // compared with what the turn ended with, not with what is there when the
+  // review is put together
+  const f = path.join(work, "f.txt");
+  const coverTurn = async (n, { reviewed, ended, later }) => {
+    await runHook("claude", "prompt", { session_id: C2.id, cwd: work, prompt: `Turn ${n}.`, prompt_id: `p${n}` });
+    await sleep(700);
+    fs.writeFileSync(f, reviewed);
+    const own = await call("link_create", { primary: C2, mode: "review", advisor: G2, request: "mine", reqPaths: [{ path: tracked, fp: fingerprint(tracked, { fresh: true }).hash, head: null }] });
+    fs.writeFileSync(f, ended);
+    process.env.AGENT_REVIEW_BRIDGE_TEST_TURNJOB = "delay:1200";
+    try {
+      const before = covered();
+      await runHook("claude", "stop", { session_id: C2.id, cwd: work, prompt_id: `p${n}`, last_assistant_message: `Turn ${n}.` });
+      await until(() => jobsOf(C2).some((j) => j.lastMessage === `Turn ${n}.`));
+      fs.writeFileSync(f, later); // another turn changes it meanwhile
+      await turnSettled(`Turn ${n}.`, before);
+    } finally {
+      delete process.env.AGENT_REVIEW_BRIDGE_TEST_TURNJOB;
+    }
+    await call("link_close", { linkId: own.id });
+    return reviewsOfTurn(`Turn ${n}.`).length;
+  };
+  assert.equal(await coverTurn(9, { reviewed: "A", ended: "B", later: "A" }), 1, "it ended with B, which the agent's review didn't cover");
+  assert.equal(await coverTurn(10, { reviewed: "B", ended: "B", later: "C" }), 0, "it ended with exactly what the agent's review covered");
+  // a path the Stop hook couldn't check in time is unknown: the turn is reviewed
+  process.env.AGENT_REVIEW_BRIDGE_TEST_STOP_BUDGET = "-1";
+  try {
+    assert.equal(await ownTurn(11, false), 1, "out of the hook's time: reviewed, not taken as covered");
+  } finally {
+    delete process.env.AGENT_REVIEW_BRIDGE_TEST_STOP_BUDGET;
+  }
+  clearInterval(approver);
+  await call("auto_set", { endpoint: C2, on: false });
+  // two reviews open in one generation: the newer requests changes, then the
+  // older is approved; that approval doesn't end the fix loop
+  {
+    const C4 = { app: "claude", id: "claude-every-order" };
+    const G5 = { app: "openai", id: "gpt-every-order" };
+    await call("auto_set", { endpoint: C4, on: true, everyTurn: true, reviewer: G5, paths: [{ path: work, fp: null, head: null }] });
+    for (const last of ["first", "second"]) {
+      await end(C4, last);
+      await until(() => !jobsOf(C4).length, 10000);
+    }
+    const [older, newer] = await until(() => reviewsTo(G5).length === 2 && reviewsTo(G5));
+    await call("advise", { endpoint: G5, requestId: newer.id, decision: "changes_requested", blocking: [{ title: "Fix the second." }] });
+    await call("advise", { endpoint: G5, requestId: older.id, decision: "approved" });
+    const e = state().auto[`claude:${C4.id}`];
+    assert.deepEqual([e.rounds, e.chain?.linkId], [1, newer.linkId], "the fix loop stays");
+    assert.ok(!notesFor(C4).some((n) => /approved the fix/.test(n.text)), "not told the loop ended");
+    await call("auto_set", { endpoint: C4, on: false });
+  }
+  // at the cap with several reviews open: the second "changes requested" stops
+  // the loop; the rest come as notes, and wake no one
+  process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS = "2";
+  try {
+    const C3 = { app: "claude", id: "claude-every-cap" };
+    const G4 = { app: "openai", id: "gpt-every-cap" };
+    await call("auto_set", { endpoint: C3, on: true, everyTurn: true, reviewer: G4, paths: [{ path: work, fp: null, head: null }] });
+    for (const last of ["a", "b", "c"]) {
+      await end(C3, last);
+      await until(() => !jobsOf(C3).length, 10000);
+    }
+    const open = await until(() => reviewsTo(G4).length === 3 && reviewsTo(G4));
+    for (const m of open) await call("advise", { endpoint: G4, requestId: m.id, decision: "changes_requested", blocking: [{ title: `fix ${m.id}` }] });
+    const toC3 = (kind) => state().messages.filter((x) => x.toEndpoint.id === C3.id && x.kind === kind);
+    assert.deepEqual([toC3("review-result").length, toC3("stop").length], [1, 1], "one fix wake, one stop, no more");
+    assert.ok(notesFor(C3).some((n) => new RegExp(`fix ${open[2].id}`).test(n.text)), "the third answer is a note");
+    assert.equal(state().auto[`claude:${C3.id}`].stopped, true);
+    await call("auto_set", { endpoint: C3, on: false });
+  } finally {
+    delete process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS;
+  }
+  // an owner that went away with a turn's review still to send: the next
+  // owner sends it (the job is in the state file)
+  {
+    const old = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-takeover-"));
+    try {
+      const job = { id: "j1", endpoint: { app: "claude", id: "c-takeover" }, turnId: "t1", generation: 0, startedAt: null, at: Date.now(), prompt: "Left behind.", lastMessage: "Done.", cwd: work, base: null, snap: null, ends: null };
+      const entry = { on: true, since: 1, paths: { [work]: { approved: null, base: null } }, turns: 0, everyTurn: true, generation: 0, reviewer: { app: "claude", id: "c-takeover-reviewer" }, jobs: [job] };
+      fs.writeFileSync(path.join(old, "state.json"), JSON.stringify({ seq: 5, messages: [], links: {}, linkSeq: 0, notes: [], endpoints: {}, auto: { "claude:c-takeover": entry } }));
+      const brokerUrl = new URL("../src/broker.mjs", import.meta.url).href;
+      const script = `const b = await import(${JSON.stringify(brokerUrl)}); await b.call("status"); await new Promise((r) => setTimeout(r, 4000)); process.exit(0);`;
+      execFileSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, AGENT_REVIEW_BRIDGE_DIR: old, AGENT_REVIEW_BRIDGE_PORT: "7478" } });
+      const after = JSON.parse(fs.readFileSync(path.join(old, "state.json"), "utf8"));
+      const req = after.messages.find((x) => x.kind === "review-request" && x.toEndpoint.id === "c-takeover-reviewer");
+      assert.match(req?.text ?? "", /User's message:\nLeft behind\./, "the next owner sent it");
+      assert.equal(after.auto["claude:c-takeover"].jobs.length, 0);
+    } finally {
+      fs.rmSync(old, { recursive: true, force: true });
+    }
+  }
+  fs.rmSync(work, { recursive: true, force: true });
+  console.log("18 every turn: a job left by an owner that went away is sent by the next one; held at ChatGPT's limit and sent once it opens; a failed review, a build that fails or takes too long, and a silent Claude reviewer are told once, as notes; a switch or a new reviewer while it's put together, an own review closed unanswered, coverage judged at the turn's end (unknown when the hook ran out of time), a failed review sent again (while unavailable as often as it takes, else three tries), a Stop hook cut short, out-of-order verdicts, several answers at the cap");
 }
 
 fs.rmSync(dir, { recursive: true, force: true });

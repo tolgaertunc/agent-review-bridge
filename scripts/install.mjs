@@ -35,7 +35,10 @@ function backup(file) {
 // Ours are recognised by the hook script path; other hooks are left alone.
 const hookScript = path.resolve(import.meta.dirname, "../src/hook.mjs");
 const hookCmd = (app, event) => `"${process.execPath}" "${hookScript}" --app ${app} --event ${event}`;
-const isOurs = (h) => h.command?.includes(hookScript) || h.command?.includes("codex-stop-hook.mjs");
+// any of this bridge's hooks, wherever its checkout was when they were
+// installed: a moved folder or a second checkout replaces them, never adds to
+// them (each hook would run twice)
+const isOurs = (h) => /[\\/]src[\\/]hook\.mjs"?\s+--app\s+(claude|openai)\s+--event\s/.test(h.command ?? "") || h.command?.includes("codex-stop-hook.mjs");
 
 function setHooks(cfg, wanted) {
   cfg.hooks ??= {};
