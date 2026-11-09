@@ -563,7 +563,7 @@ server.registerTool(
   async (a, extra) => {
     const { request_id, ...rest } = a;
     const r = await call("advise", { endpoint: await self(extra), requestId: request_id, ...rest });
-    const how = { none: "Recorded; nothing sent.", "next prompt": "Will reach the other chat with its user's next prompt.", now: "Sent; the other chat is being woken." };
+    const how = { none: "Recorded; nothing sent.", "next prompt": "Will reach the other chat with its next prompt.", now: "Sent; the other chat is being woken." };
     // the user can't see tool calls, so the answer goes into the chat too
     return withRules(`${how[r.delivered]} The user can't see tool calls: write this as your reply, unchanged:\n\n${r.text}`, r, { first: true });
   },

@@ -6,8 +6,8 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { baseline, snapshotDiff, snapshotCommand, pathInfo, reviewSummary, fingerprint, usableBase } from "../src/git.mjs";
+import { execFileSync, execSync } from "node:child_process";
+import { baseline, snapshotSummary, snapshotCommand, pathInfo, reviewSummary, fingerprint, usableBase } from "../src/git.mjs";
 
 // the fingerprint keeps a small cache in the bridge's data folder: a throwaway one here
 process.env.AGENT_REVIEW_BRIDGE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-gitdata-"));
@@ -24,8 +24,10 @@ function repo({ commit = true } = {}) {
   return { d, git, write: (f, c) => (fs.mkdirSync(path.dirname(path.join(d, f)), { recursive: true }), fs.writeFileSync(path.join(d, f), c)) };
 }
 
-// a turn's own changes, from a snapshot at its start to one taken now (its end)
-const turnChanges = (d, base, maxChars) => snapshotDiff(d, base, baseline(d), maxChars);
+// a turn's own changes, from a snapshot at its start to one taken now (its
+// end): the summary the request carries, and what its command prints
+const turnSummary = (d, base) => snapshotSummary(d, base, baseline(d));
+const shown = (d, base, end) => execSync(snapshotCommand(d, base, end), { encoding: "utf8" });
 
 // secrets: files and directories, never content nor name
 {
@@ -33,8 +35,9 @@ const turnChanges = (d, base, maxChars) => snapshotDiff(d, base, baseline(d), ma
   const base = baseline(r.d);
   for (const f of ["secrets/config.json", ".envrc", ".env.local", "my-credentials/x.txt", "deploy/server.pem", ".ssh/id_ed25519", "config/app_secret.yml"]) r.write(f, "TOPSECRET\n");
   r.write("a.js", "2\n");
-  const d = turnChanges(r.d, base, 20000);
-  assert.match(d, /a\.js/);
+  const end = baseline(r.d);
+  const d = snapshotSummary(r.d, base, end) + shown(r.d, base, end);
+  assert.match(d, /a\.js[\s\S]*-1\n\+2/);
   assert.doesNotMatch(d, /TOPSECRET|secrets|envrc|\.env|credentials|\.pem|\.ssh|app_secret/);
   console.log("git 1 secret files and directories excluded (content and names)");
 }
@@ -47,10 +50,10 @@ const turnChanges = (d, base, maxChars) => snapshotDiff(d, base, baseline(d), ma
   assert.ok(base, "baseline in a repo without commits");
   r.write("x.js", "changed\n");
   r.write("y.js", "new\n");
-  const d = turnChanges(r.d, base, 20000);
+  const d = turnSummary(r.d, base);
   assert.match(d, /New untracked files:\ny\.js/);
   assert.match(d, /Edited untracked files[^\n]*:\nx\.js/);
-  assert.equal(turnChanges(r.d, null, 20000), null, "no snapshot at the start: no diff");
+  assert.equal(turnSummary(r.d, null), null, "no snapshot at the start: nothing");
   console.log("git 2 repo without commits: new and edited untracked files reported");
 }
 
@@ -59,9 +62,9 @@ const turnChanges = (d, base, maxChars) => snapshotDiff(d, base, baseline(d), ma
   const r = repo();
   r.write("notes.md", "v1\n");
   const base = baseline(r.d);
-  assert.equal(turnChanges(r.d, base, 20000), "(no changes)");
+  assert.equal(turnSummary(r.d, base), "", "nothing changed");
   r.write("notes.md", "v2\n");
-  assert.match(turnChanges(r.d, base, 20000), /Edited untracked files[^\n]*:\nnotes\.md/);
+  assert.match(turnSummary(r.d, base), /Edited untracked files[^\n]*:\nnotes\.md/);
   console.log("git 3 edited pre-existing untracked file reported");
 }
 
@@ -74,11 +77,11 @@ const turnChanges = (d, base, maxChars) => snapshotDiff(d, base, baseline(d), ma
   const base = baseline(r.d);
   for (let i = 0; i < 300; i++) r.write(`f${i}.txt`, "b".repeat(500) + "\n");
   for (let i = 0; i < 120; i++) r.write(`new${i}.txt`, "n\n");
-  const d = turnChanges(r.d, base, 3000);
-  assert.ok(d.length <= 3000, `capped at 3000 (got ${d.length})`);
+  const d = turnSummary(r.d, base);
+  assert.ok(d.length < 6000, `a long turn's summary stays short (${d.length} chars)`);
   assert.match(d, /more files/);
   assert.match(d, /… 70 more/);
-  console.log(`git 4 size cap holds for stat, lists and patch (${d.length} chars)`);
+  console.log(`git 4 a long turn's summary is cut: stat and lists (${d.length} chars)`);
 }
 
 // review paths: the summary and the reviewer's command leave secrets out and
@@ -259,21 +262,48 @@ const turnChanges = (d, base, maxChars) => snapshotDiff(d, base, baseline(d), ma
   r.git("commit", "-qm", "in the turn");
   const end = baseline(r.d); // a.js and b.js committed: HEAD moved
   r.write("a.js", "4\n"); // after the turn ended
-  const d = snapshotDiff(r.d, base, end, 20_000);
-  assert.match(d, /-2\n\+3/, "the committed change is the turn's");
-  assert.match(d, /b\.js/, "a new staged file too");
+  const d = snapshotSummary(r.d, base, end);
+  const patch = shown(r.d, base, end);
+  assert.match(patch, /-2\n\+3/, "the committed change is the turn's, as its command shows");
+  assert.match(d + patch, /b\.js/, "a new staged file too");
   assert.match(d, /Edited untracked files \(content not tracked by git\):\nnotes\.txt/);
-  assert.doesNotMatch(d, /\+4|SECRET|\.env/, "nothing after the end, no secrets");
+  assert.doesNotMatch(d + patch, /\+4|SECRET|\.env/, "nothing after the end, no secrets");
   assert.match(snapshotCommand(r.d, base, end), new RegExp(`diff --no-ext-diff --no-textconv ${base.ref} ${end.ref} -- \\. ':\\(glob,exclude\\)\\*\\*/\\.env\\*'`));
   // a clean tree: stash create makes nothing, HEAD stands in
   const clean = repo();
-  assert.equal(snapshotDiff(clean.d, baseline(clean.d), baseline(clean.d), 20_000), "(no changes)");
+  assert.equal(snapshotSummary(clean.d, baseline(clean.d), baseline(clean.d)), "");
   // a repo without commits
   const empty = repo({ commit: false });
   const b0 = baseline(empty.d);
   empty.write("x.js", "x\n");
-  assert.match(snapshotDiff(empty.d, b0, baseline(empty.d), 20_000), /New untracked files:\nx\.js/);
-  assert.equal(snapshotDiff(r.d, base, null, 20_000), null, "no end snapshot: nothing");
-  for (const x of [r, clean, empty]) fs.rmSync(x.d, { recursive: true, force: true });
-  console.log("git 8 a turn's own changes between snapshots: commits and staged files in it, untracked by hash, nothing after its end, no secrets, clean and commit-less repos");
+  assert.match(snapshotSummary(empty.d, b0, baseline(empty.d)), /New untracked files:\nx\.js/);
+  assert.equal(snapshotSummary(r.d, base, null), null, "no end snapshot: nothing");
+  // a merge with conflicts: git can't save the work tree, so there is no
+  // snapshot (HEAD would misstate the turn)
+  const m = repo();
+  m.git("checkout", "-q", "-b", "other");
+  m.write("a.js", "other\n");
+  m.git("commit", "-qam", "other");
+  m.git("checkout", "-q", "-");
+  m.write("a.js", "mine\n");
+  m.git("commit", "-qam", "mine");
+  assert.throws(() => m.git("merge", "-q", "other"), "the merge conflicts");
+  assert.equal(baseline(m.d), null, "a conflicted merge: no snapshot");
+  // git can't say what HEAD is (a timeout, an error): no snapshot either, not
+  // the empty tree of a repo without commits
+  if (process.platform !== "win32") {
+    const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+    const fake = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-fakegit-"));
+    fs.writeFileSync(path.join(fake, "git"), `#!/bin/sh\nfor a in "$@"; do [ "$a" = "--verify" ] && exit 2; done\nexec '${real}' "$@"\n`, { mode: 0o755 });
+    const PATH = process.env.PATH;
+    process.env.PATH = `${fake}${path.delimiter}${PATH}`;
+    try {
+      assert.equal(baseline(clean.d), null, "HEAD unknown: no snapshot");
+    } finally {
+      process.env.PATH = PATH;
+      fs.rmSync(fake, { recursive: true, force: true });
+    }
+  }
+  for (const x of [r, clean, empty, m]) fs.rmSync(x.d, { recursive: true, force: true });
+  console.log("git 8 a turn's own changes between snapshots: its command shows commits and staged files in it, untracked by hash, nothing after its end, no secrets, clean and commit-less repos; no snapshot in a conflicted merge or when git can't say what HEAD is");
 }

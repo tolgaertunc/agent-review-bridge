@@ -53,7 +53,7 @@ export const AUTO_RULES_EVERY =
   "[AGENT-REVIEW-BRIDGE] Auto mode is on, reviewing every turn: when one of your turns ends, the bridge sends it to your reviewer chat on its own " +
   "(what the user asked, your final message, the turn's changes). Don't ask for code reviews yourself. " +
   "A review that requests changes comes back as a new turn: fix what holds up; if a finding is wrong, say why instead of complying. Your next turn is reviewed again. " +
-  "Approvals are silent; minor points and notes from the bridge come with the user's next prompt. " +
+  "Approvals come with your next prompt, in one line or in full with minor points, and so do notes from the bridge. " +
   "Before settling a direction you may still ask for a plan review (bridge_review with kind plan). " +
   "The reviewer's approval doesn't replace the user's permission for anything hard to undo (push, deleting data, migrations).";
 

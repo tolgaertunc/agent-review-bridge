@@ -675,6 +675,12 @@ class BrokerState {
     // a turn auto mode reviewed on its own: a note, not a wake, so a failing
     // reviewer can't start a turn that is reviewed (and fails) again. The
     // next turn is reviewed as usual.
+    // the request that only bound auto mode's reviewer: nothing to send again
+    // or tell (the reviewer is bound already)
+    if (link?.everyTurn && review && link.bind) {
+      logEvent({ op: "failed", id: m.id, why, bind: true });
+      return;
+    }
     if (link?.everyTurn && review) {
       // the same turn's review is sent again once the reviewer can answer (at
       // ChatGPT's usage limit it waits for the reset), a few times at most;
@@ -1156,12 +1162,11 @@ class BrokerState {
   }
 
   // The answer to a turn auto mode reviewed on its own: only changes
-  // requested wakes the chat (the fix
-  // loop, its next turn reviewed again); an approval is silent, its nits and
-  // the approval that ends a fix loop come with the next prompt; an answer
-  // about a turn before the user's latest prompt is a note too. Past the
-  // round cap the chat is told to stop, and turns aren't reviewed until the
-  // user writes.
+  // requested wakes the chat (the fix loop, its next turn reviewed again).
+  // An approval comes with the next prompt, in one line, or in full with its
+  // nits or when it ends a fix loop; an answer about a turn before the user's
+  // latest prompt is a note too. Past the round cap the chat is told to stop,
+  // and turns aren't reviewed until the user writes.
   everyTurnAnswer(link, endpoint, { decision, text, nits }) {
     Object.assign(link, { active: false, closedAt: Date.now(), decision });
     delete link.turn; // answered: it won't be sent again
@@ -1176,12 +1181,14 @@ class BrokerState {
     // auto mode's reviewer answers again: turns set aside while it was away
     // go now (not for an answer from a reviewer it no longer has)
     if (sameEndpoint(link.advisor, reviewerOf(entry))) this.unpark(entry);
+    // an approval without nits is one line, so every turn's outcome is seen
+    const plain = decision === "approved" && !nits.length;
+    const said = (full, earlier = false) => (plain ? `Your reviewer approved the turn in review ${link.id}${earlier ? ", from before your latest prompt" : ""}.` : full);
     // the loop stopped at its cap: answers still coming in about this
     // generation's turns neither wake the chat nor start the loop again
     const generation = entry.generation ?? 0;
     if (entry.stopped && (link.generation ?? 0) === generation) {
-      if (decision === "approved" && !nits.length) return { delivered: "none", stopped: true, text };
-      this.note(link.primary, `auto:${key}:answer:${link.id}`, text, "review");
+      this.note(link.primary, `auto:${key}:answer:${link.id}`, said(text), "review");
       return { delivered: "next prompt", stopped: true, text };
     }
     // the approval of a fix: the review it answers had requested changes. It
@@ -1190,14 +1197,13 @@ class BrokerState {
     const fixApproved = decision === "approved" && !!link.roundOf && this.s.links[link.roundOf]?.decision === "changes_requested";
     const endsLoop = fixApproved && !!entry.lastRejected && link.roundOf === entry.lastRejected;
     if ((link.generation ?? 0) !== generation) {
-      if (decision === "approved" && !nits.length && !fixApproved) return { delivered: "none", stale: true, text };
-      this.note(link.primary, `auto:${key}:answer:${link.id}`, `${LATE_NOTE}\n\n${fixApproved ? `${FIX_DONE_NOTE}\n\n` : ""}${text}`, "review");
+      const late = fixApproved ? `${LATE_NOTE}\n\n${FIX_DONE_NOTE}\n\n${text}` : said(`${LATE_NOTE}\n\n${text}`, true);
+      this.note(link.primary, `auto:${key}:answer:${link.id}`, late, "review");
       return { delivered: "next prompt", stale: true, text };
     }
     if (decision === "approved") {
       if (endsLoop) Object.assign(entry, { rounds: 0, chain: null, lastRejected: null });
-      if (!nits.length && !endsLoop) return { delivered: "none", text };
-      this.note(link.primary, `auto:${key}:answer:${link.id}`, endsLoop ? `${FIX_DONE_NOTE}\n\n${text}` : text, "review");
+      this.note(link.primary, `auto:${key}:answer:${link.id}`, endsLoop ? `${FIX_DONE_NOTE}\n\n${text}` : said(text), "review");
       return { delivered: "next prompt", text };
     }
     entry.rounds = (entry.rounds ?? 0) + 1;

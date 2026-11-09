@@ -853,7 +853,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   fake({});
   const sent = await until(() => reviewsTo(G)[0], 8000);
   assert.match(sent.text, /Agent's final message:\nOne\./);
-  assert.match(sent.text, /The turn's own changes: not available/, "outside git there is no snapshot");
+  assert.match(sent.text, /This turn's own changes: not available/, "outside git there is no snapshot");
   // its turn fails because the reviewer is unavailable (a usage limit): a
   // note, no wake, and the same turn's review goes again once it can, as often
   // as it takes, keeping its round; a failure of another kind is tried three
@@ -938,7 +938,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   try {
     await end(C, "Cut short.");
     const cut = await until(() => reviewsTo(G).find((x) => /Agent's final message:\nCut short\./.test(x.text)), 10000);
-    assert.match(cut.text, /The turn's own changes: not available/);
+    assert.match(cut.text, /This turn's own changes: not available/);
   } finally {
     delete process.env.AGENT_REVIEW_BRIDGE_TEST_STOP_CUT;
   }

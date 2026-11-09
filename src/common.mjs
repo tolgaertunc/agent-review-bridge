@@ -1,7 +1,7 @@
 // What the broker, the hooks and the review request builder share, with no
 // side effects of their own: the request builder also runs in a child
-// process (src/turnjob.mjs), which must not set up the broker's folders or
-// token.
+// process (src/turnjob.mjs), which must not load the broker (its state, token
+// or outbox).
 
 export const MAX_TEXT = 40_000;
 export const MAX_DIFF = 20_000;

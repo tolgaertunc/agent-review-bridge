@@ -54,61 +54,60 @@ function hashes(cwd, files) {
   return Object.fromEntries(files.map((f, i) => [f, out[i]]));
 }
 
-// Snapshot at turn start, or null when cwd isn't a git work tree
+// Snapshot of the work tree (a turn's start or end), or null when cwd isn't
+// a git work tree or git can't take one: a git failure (a merge with
+// conflicts, a timeout) is no snapshot, never a guess
 export function baseline(cwd) {
   if (!inWorkTree(cwd)) return null;
   try {
-    let ref = "";
-    try {
-      ref = git(cwd, ["stash", "create"]).trim();
-    } catch {
-      // fails in a repo without commits
-    }
+    const head = commitOf(cwd);
+    // a commit of the tracked changes, empty when there are none (HEAD is
+    // the snapshot then); before the first commit there's nothing to stash
+    const ref = head === EMPTY_TREE ? head : git(cwd, ["stash", "create"]).trim() || head;
     const files = untracked(cwd).slice(0, 500);
-    return { cwd, ref: ref || headOrEmpty(cwd), untracked: hashes(cwd, files) };
+    return { cwd, ref, untracked: hashes(cwd, files) };
   } catch {
     return null;
+  }
+}
+
+// HEAD's commit, or the empty tree before the first commit (git says HEAD
+// doesn't resolve: exit 1); throws when git can't tell
+function commitOf(cwd) {
+  try {
+    return git(cwd, ["rev-parse", "--verify", "-q", "HEAD"]).trim();
+  } catch (e) {
+    if (e.status === 1) return EMPTY_TREE;
+    throw e;
   }
 }
 
 const capList = (title, items) =>
   items.length ? `${title}:\n${items.slice(0, MAX_LIST).join("\n")}${items.length > MAX_LIST ? `\n… ${items.length - MAX_LIST} more` : ""}` : null;
 
-// A turn's changes as text, within maxChars: the stat (a long one cut to its
-// first lines plus the summary line), new and edited untracked files, then
-// the patch. `range` is the two refs git diff compares.
-function changesText(cwd, range, added, edited, { empty, maxChars }) {
-  const statLines = git(cwd, ["diff", "--stat", ...range, "--", ".", ...EXCLUDES]).trimEnd().split("\n").filter(Boolean);
-  if (!statLines.length && !added.length && !edited.length) return empty;
-  const stat = statLines.length > MAX_LIST + 1 ? [...statLines.slice(0, MAX_LIST), `… ${statLines.length - MAX_LIST - 1} more files`, statLines.at(-1)] : statLines;
-  const head = [stat.join("\n"), capList("New untracked files", added), capList("Edited untracked files (content not tracked by git)", edited)]
-    .filter(Boolean)
-    .join("\n\n");
-  let patch = git(cwd, ["diff", ...range, "--", ".", ...EXCLUDES]);
-  const room = maxChars - head.length - 40;
-  if (patch.length > room) patch = room > 0 ? patch.slice(0, room) + "\n… (diff truncated)" : "";
-  return `${head}\n\n${patch}`.trim().slice(0, maxChars);
-}
-
 // A turn's own changes between two snapshots (baseline() at its start and at
-// its end), so it reads the same when it is put together later: what the
-// work tree did after the turn ended isn't in it. Untracked files compare by
-// the hashes each snapshot kept. null when either snapshot is missing. The
-// whole result, summary included, stays within maxChars.
-export function snapshotDiff(cwd, base, snap, maxChars) {
+// its end), as a summary: the stat (a long one cut to its first lines plus the
+// summary line) and the untracked files that are new or edited, compared by
+// the hashes each snapshot kept. The command below shows the changes
+// themselves. "" when nothing changed; null when a snapshot is missing or
+// can't be read (git may have pruned it).
+export function snapshotSummary(cwd, base, snap) {
   if (!base?.ref || !snap?.ref || !inWorkTree(cwd)) return null;
   try {
     const before = base.untracked ?? {};
     const after = snap.untracked ?? {};
     const added = Object.keys(after).filter((f) => !(f in before));
     const edited = Object.keys(after).filter((f) => f in before && after[f] !== before[f]);
-    return changesText(cwd, [base.ref, snap.ref], added, edited, { empty: "(no changes)", maxChars });
+    const statLines = git(cwd, ["diff", "--stat", base.ref, snap.ref, "--", ".", ...EXCLUDES]).trimEnd().split("\n").filter(Boolean);
+    const stat = statLines.length > MAX_LIST + 1 ? [...statLines.slice(0, MAX_LIST), `… ${statLines.length - MAX_LIST - 1} more files`, statLines.at(-1)] : statLines;
+    return [stat.join("\n"), capList("New untracked files", added), capList("Edited untracked files (content not tracked by git)", edited)].filter(Boolean).join("\n\n");
   } catch {
     return null;
   }
 }
 
-// The command that shows a snapshot diff in full (secret paths left out)
+// The command that shows a turn's own changes between its two snapshots
+// (secret paths left out)
 export function snapshotCommand(cwd, base, snap) {
   const q = (a) => `'${a.replace(/'/g, `'\\''`)}'`;
   return ["git", "-C", q(cwd), "diff", "--no-ext-diff", "--no-textconv", base.ref, snap.ref, "--", ".", ...EXCLUDES.map(q)].join(" ");

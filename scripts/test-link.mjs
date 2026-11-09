@@ -931,9 +931,11 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
 // the user writes; the agent's own review of exactly the turn's end counts,
 // a plan review doesn't; the chat keeps listening between reviews
 {
-  const { execFileSync } = await import("node:child_process");
+  const { execFileSync, execSync } = await import("node:child_process");
   const { fingerprint } = await import("../src/git.mjs");
   const work = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-every-"));
+  // what the command for a turn's own changes, in its request, shows
+  const shown = (m) => execSync(m.text.match(/Show them[^\n]*:\n```sh\n(.+)\n```/)[1], { encoding: "utf8" });
   try {
     const g = (...a) => execFileSync("git", ["-C", work, "-c", "user.name=t", "-c", "user.email=t@t", ...a], { encoding: "utf8" });
     g("init", "-q");
@@ -963,14 +965,17 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
     assert.match(r1.text, /^Automatic review of a turn of Claude Code session claude-every-38 \(turn t1\), sent by the bridge/);
     assert.match(r1.text, /User's message:\nMake a\.js print 2\./);
     assert.match(r1.text, /Agent's final message:\na\.js prints 2 now\./);
-    assert.match(r1.text, /The turn's own changes, from its start to its end:\n```diff\na\.js \| 2 \+-[\s\S]*New untracked files:\nnew\.txt[\s\S]*-1\n\+2/);
+    assert.match(r1.text, /This turn's own changes, from its start to its end[^\n]*:\n```text\n a\.js \| 2 \+-[\s\S]*New untracked files:\nnew\.txt\n```\nShow them[^\n]*:\n```sh\ngit -C /);
+    assert.doesNotMatch(r1.text, /^[-+][12]$/m, "the changes themselves aren't pasted");
+    assert.match(shown(r1), /-1\n\+2/, "its command shows them");
     assert.match(r1.text, /This is auto mode's review of one turn/);
     assert.match(r1.text, /Where the changes are/);
     // the turn's own changes stay what they were at its end
     fs.writeFileSync(path.join(work, "a.js"), "2\n");
-    // approved: silent, and the content recorded
+    // approved: no wake, one line with the next prompt, and the content recorded
     await answer(r1, "approved");
     assert.equal(toC("review-result").length, 0, "an approval wakes no one");
+    assert.ok(notesFor().some((n) => n.kind === "review" && /^Your reviewer approved the turn in review L\d+\.$/.test(n.text)), "it comes as one line");
     assert.equal(entry().paths[work].approved, state().links[r1.linkId].reqPaths[0].fp, "the approval covers what was sent");
     // the chat keeps listening between reviews
     const file = path.join(dir, "listeners", `claude-${C.id}.json`);
@@ -1069,13 +1074,13 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
       fs.writeFileSync(path.join(work, "a.js"), "12\n");
       await stop("Woken, no prompt hook.");
       const woken = await reviewOf(10);
-      assert.match(woken.text, /The turn's own changes, from its start to its end:[\s\S]*-11\n\+12/);
-      assert.doesNotMatch(woken.text, /-10\n/, "only this turn's own change");
+      assert.match(shown(woken), /-11\n\+12/);
+      assert.doesNotMatch(shown(woken), /-10\n/, "only this turn's own change");
     } finally {
       delete process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS;
     }
     await call("auto_set", { endpoint: C, on: false });
-    console.log("38 every turn, Claude working: turns reviewed on their own (user, fix, app notice), no Stop check, silent approvals, a woken fix loop with rounds, late answers and loop ends as notes, the agent's own exact review counts and a plan review doesn't, the cap, listening between reviews");
+    console.log("38 every turn, Claude working: turns reviewed on their own (user, fix, app notice), no Stop check, approvals as one line without a wake, a woken fix loop with rounds, late answers and loop ends as notes, the agent's own exact review counts and a plan review doesn't, the cap, listening between reviews");
   } finally {
     fs.rmSync(work, { recursive: true, force: true });
   }
