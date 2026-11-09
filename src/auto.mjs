@@ -48,7 +48,7 @@ export const AUTO_RULES_SHORT =
 
 // The same, when auto mode reviews every turn on its own (the setting
 // "autoReviews": "every-turn", or bridge_auto's every_turn): the agent doesn't
-// ask for code reviews; the bridge sends each turn, as advisor mode does
+// ask for code reviews; the bridge sends each turn
 export const AUTO_RULES_EVERY =
   "[AGENT-REVIEW-BRIDGE] Auto mode is on, reviewing every turn: when one of your turns ends, the bridge sends it to your reviewer chat on its own " +
   "(what the user asked, your final message, the turn's changes). Don't ask for code reviews yourself. " +

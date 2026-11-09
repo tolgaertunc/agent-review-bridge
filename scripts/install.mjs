@@ -8,9 +8,10 @@
 //   Its tools are allowed in ~/.claude/settings.json (no permission prompt).
 // - ChatGPT Desktop: ~/.codex/config.toml → [mcp_servers.agent_review_bridge] with
 //   default_tools_approval_mode = "approve".
-// - Hooks in both apps (src/hook.mjs): a Stop hook that queues each turn of a
-//   linked primary for review without blocking, a UserPromptSubmit hook that
-//   hands over the advisor's nits, and on Claude a background listener that
+// - Hooks in both apps (src/hook.mjs): a Stop hook that queues each turn for
+//   review without blocking (auto mode reviewing every turn) or checks it (at
+//   key moments), a UserPromptSubmit hook that hands over the reviewer's
+//   nits and the bridge's notes, and on Claude a background listener that
 //   wakes the session when something arrives for it, and a StopFailure hook
 //   that tells whoever waits when an API error (a usage limit) ends a turn.
 //   In both, a SessionStart hook gives auto mode's rules again after a
@@ -158,7 +159,7 @@ const CODEX_HOOKS = {
     text =
       text.trimEnd() +
       `\n\n${begin}\n[mcp_servers.agent_review_bridge]\ncommand = ${toml(process.execPath)}\nargs = [${toml(server)}, "--side", "openai"]\n` +
-      // a looping advisor can't stop for an approval click on every call
+      // a reviewer answering every turn can't stop for an approval click on every call
       `default_tools_approval_mode = "approve"\n${end}\n`;
   }
   fs.mkdirSync(path.dirname(file), { recursive: true });

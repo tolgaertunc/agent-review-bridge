@@ -7,7 +7,7 @@ import { configDir } from "./platform.mjs";
 
 const OPEN = ["ask", "always"];
 // auto mode: the agent asks at the moments that matter, or every turn is
-// reviewed on its own, as advisor mode does
+// reviewed on its own
 const AUTO_REVIEWS = ["key-moments", "every-turn"];
 const DEFAULTS = { openClosedApps: "ask", autoReviews: "key-moments" };
 

@@ -113,7 +113,7 @@ const GPT = { app: "openai", id: "gpt-fail-thread" };
 const brokerUrl = new URL("../src/broker.mjs", import.meta.url).href;
 const first = spawn(
   process.execPath,
-  ["--input-type=module", "-e", `const b=await import(${JSON.stringify(brokerUrl)});const r=await b.call("link_create",{primary:${JSON.stringify(CLAUDE)},advisor:${JSON.stringify(GPT)},mode:"review",request:"Review before takeover."});console.log(r.id);setInterval(()=>{},1000);`],
+  ["--input-type=module", "-e", `const b=await import(${JSON.stringify(brokerUrl)});const r=await b.call("link_create",{primary:${JSON.stringify(CLAUDE)},advisor:${JSON.stringify(GPT)},request:"Review before takeover."});console.log(r.id);setInterval(()=>{},1000);`],
   { env: process.env },
 );
 const takeoverLink = (await new Promise((r) => first.stdout.once("data", r))).toString().trim();
@@ -127,7 +127,7 @@ await sleep(100);
 fake({ deliverRejectAfter: 1500 });
 const second = spawn(
   process.execPath,
-  ["--input-type=module", "-e", `const b=await import(${JSON.stringify(brokerUrl)});const r=await b.call("link_create",{primary:${JSON.stringify(CLAUDE)},advisor:${JSON.stringify(GPT)},mode:"review",request:"Review by an older owner."});console.log(r.id);setInterval(()=>{},1000);`],
+  ["--input-type=module", "-e", `const b=await import(${JSON.stringify(brokerUrl)});const r=await b.call("link_create",{primary:${JSON.stringify(CLAUDE)},advisor:${JSON.stringify(GPT)},request:"Review by an older owner."});console.log(r.id);setInterval(()=>{},1000);`],
   { env: { ...process.env, AGENT_REVIEW_BRIDGE_TEST_PROTOCOL: "13" } },
 );
 const olderLink = (await new Promise((r) => second.stdout.once("data", r))).toString().trim();
@@ -167,7 +167,7 @@ const failedFor = (id) => state().messages.filter((m) => m.kind === "failed" && 
 // 3. only the turn that carries the request's own id counts; a turn still
 // queued or running keeps the watch going past the early checks
 {
-  const { id } = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Second review." });
+  const { id } = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Second review." });
   const m = await until(() => reqOf(id)?.watch?.clientId && reqOf(id));
   fake({ turns: { "someone-else": { state: "failed", completedAt: 1, error: { message: "other" } }, [m.watch.clientId]: { state: "queued" } } });
   await until(() => reqOf(id).watch.checks >= 4);
@@ -185,7 +185,7 @@ const failedFor = (id) => state().messages.filter((m) => m.kind === "failed" && 
 
 // 4. an answer that arrived is never undone by a later failure
 {
-  const { id } = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Third review." });
+  const { id } = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Third review." });
   const m = await until(() => reqOf(id)?.watch?.clientId && reqOf(id));
   await call("advise", { endpoint: GPT, requestId: m.id, decision: "approved" });
   fake({ turns: { [m.watch.clientId]: { state: "failed", completedAt: 1, error: { message: "crashed while writing" } } } });
@@ -197,7 +197,7 @@ const failedFor = (id) => state().messages.filter((m) => m.kind === "failed" && 
 
 // 5. the deadline: no answer confirmed, even while every read hangs
 {
-  const { id } = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Fourth review." });
+  const { id } = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Fourth review." });
   const m = await until(() => reqOf(id)?.watch?.clientId && reqOf(id));
   fake({ hang: true });
   const n = await until(() => failedFor(m.id)[0], 8000);
@@ -209,7 +209,7 @@ const failedFor = (id) => state().messages.filter((m) => m.kind === "failed" && 
 // 6. Claude as the reviewer: an API error ends the woken turn (StopFailure)
 const gptPrimary = { app: "openai", id: "gpt-asker" };
 {
-  const { id } = await call("link_create", { primary: gptPrimary, advisor: CLAUDE2, mode: "review", request: "Review this, Claude." });
+  const { id } = await call("link_create", { primary: gptPrimary, advisor: CLAUDE2, request: "Review this, Claude." });
   const m = reqOf(id);
   const woke = await runHook("claude", "listen", { session_id: CLAUDE2.id });
   assert.equal(woke.code, 2, "the listener wakes the session");
@@ -232,7 +232,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
 // 7. plain messages to Claude: one handled by a turn that ended normally is
 // settled; one whose turn failed gets a notice, and its link stays open
 {
-  const { id } = await call("link_create", { primary: gptPrimary, advisor: CLAUDE2, mode: "review", request: "Another review." });
+  const { id } = await call("link_create", { primary: gptPrimary, advisor: CLAUDE2, request: "Another review." });
   await runHook("claude", "listen", { session_id: CLAUDE2.id });
   await runHook("claude", "stop", { session_id: CLAUDE2.id });
   await until(() => state().messages.find((x) => x.id === reqOf(id).id).settledAt);
@@ -270,7 +270,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
 // 9. a ChatGPT plain message whose turn failed tells its sender; one already
 // replied to doesn't
 {
-  const { id } = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Keep this open." });
+  const { id } = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Keep this open." });
   const replied = await call("send", { endpoint: CLAUDE, text: "One question.", linkId: id });
   const plain = await call("send", { endpoint: CLAUDE, text: "Another one.", linkId: id });
   const msg = (mid) => state().messages.find((x) => x.id === mid);
@@ -291,7 +291,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
 {
   const delivered = (cid) => fs.readFileSync(path.join(dir, "events.jsonl"), "utf8").split("\n").filter((l) => l.includes('"fake-codex-deliver"') && l.includes(cid)).length;
   fake({ deliverHang: true });
-  const a = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Stuck send A." });
+  const a = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Stuck send A." });
   const ma = await until(() => reqOf(a.id)?.dispatch?.clientId && reqOf(a.id));
   const cid = ma.dispatch.clientId;
   fake({ deliverHang: true, turns: { [cid]: { state: "queued" } } });
@@ -299,7 +299,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   await call("status"); // any op runs dispatch: the stuck send is checked
   await until(() => reqOf(a.id).dispatch.state === "sent");
   assert.equal(delivered(cid), 1, "the thread had it: not sent twice");
-  const b = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Stuck send B." });
+  const b = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Stuck send B." });
   const mb = await until(() => reqOf(b.id)?.dispatch?.clientId && reqOf(b.id));
   fake({});
   await sleep(50);
@@ -312,7 +312,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   await call("link_close", { linkId: b.id });
   // a late error from the first attempt doesn't undo a send the thread confirmed
   fake({ deliverRejectAfter: 400 });
-  const c = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Late error." });
+  const c = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Late error." });
   const mc = await until(() => reqOf(c.id)?.dispatch?.clientId && reqOf(c.id));
   fake({ deliverRejectAfter: 400, turns: { [mc.dispatch.clientId]: { state: "queued" } } });
   await sleep(50);
@@ -325,20 +325,20 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   await call("link_close", { linkId: c.id });
   // a send that fails: queued after all → sent; no trace → the requester is told
   fake({ deliverRejectAfter: 150 });
-  const d = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Error but queued." });
+  const d = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Error but queued." });
   const md = await until(() => reqOf(d.id)?.dispatch?.clientId && reqOf(d.id));
   fake({ deliverRejectAfter: 150, turns: { [md.dispatch.clientId]: { state: "queued" } } });
   await until(() => reqOf(d.id).dispatch.state === "sent");
   assert.equal(failedFor(md.id).length, 0, "the thread had it: no notice");
   await call("link_close", { linkId: d.id });
-  const e = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Error, not queued." });
+  const e = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Error, not queued." });
   const me = await until(() => reqOf(e.id)?.dispatch?.clientId && reqOf(e.id));
   const n = await until(() => failedFor(me.id)[0]);
   assert.match(n.text, /it couldn't be handed to ChatGPT Desktop \(no answer from ChatGPT Desktop within 60 s \(test\)\)/);
   // a failed send while the thread can't be read either: nothing is decided;
   // the watch confirms it later, or finds no trace and tells
   fake({ deliverRejectAfter: 150, hang: true });
-  const g = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Unconfirmed, then queued." });
+  const g = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Unconfirmed, then queued." });
   const mg = await until(() => reqOf(g.id)?.dispatch?.state === "unconfirmed" && reqOf(g.id));
   assert.equal(state().links[g.id].active, true, "an unreadable thread doesn't close the review");
   fake({ turns: { [mg.dispatch.clientId]: { state: "queued" } } });
@@ -348,7 +348,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   assert.equal(state().links[g.id].active, true);
   await call("link_close", { linkId: g.id });
   fake({ deliverRejectAfter: 150, hang: true });
-  const h = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Unconfirmed, then no trace." });
+  const h = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Unconfirmed, then no trace." });
   const mh = await until(() => reqOf(h.id)?.dispatch?.state === "unconfirmed" && reqOf(h.id));
   fake({});
   const nh = await until(() => failedFor(mh.id)[0]);
@@ -359,7 +359,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
 // 11. a review Claude takes with bridge_receive (after joining) is covered
 // too; a Stop that the auto mode check blocks isn't a finished turn
 {
-  const { id, joinCode } = await call("link_create", { primary: gptPrimary, mode: "review", request: "Joined review." });
+  const { id, joinCode } = await call("link_create", { primary: gptPrimary, request: "Joined review." });
   const J = { app: "claude", id: "claude-fail-join" };
   await call("link_join", { code: joinCode, endpoint: J });
   const m = reqOf(id);
@@ -386,7 +386,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
 {
   const A = { app: "claude", id: "claude-fail-auto" };
   await call("auto_set", { endpoint: A, on: true, reviewer: { app: "openai", id: "old-thread" }, paths: [{ path: "/x", fp: "f1", head: "h1" }] });
-  const { id } = await call("link_create", { primary: A, advisor: GPT, mode: "review", request: "Old session.", reqPaths: [{ path: "/x", fp: "f2", head: "h2" }] });
+  const { id } = await call("link_create", { primary: A, advisor: GPT, request: "Old session.", reqPaths: [{ path: "/x", fp: "f2", head: "h2" }] });
   await call("auto_set", { endpoint: A, on: false });
   await sleep(5);
   const fresh = await call("auto_set", { endpoint: A, on: true });
@@ -405,7 +405,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
 // notice says how; a retry is continued once only and keeps the plan gate
 {
   const { nextStep } = await import("../src/broker.mjs");
-  const r1 = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Retry round one.", plan: true, noGate: true });
+  const r1 = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Retry round one.", plan: true, noGate: true });
   await call("advise", { endpoint: GPT, requestId: reqOf(r1.id).id, decision: "changes_requested", blocking: [{ title: "Order the steps." }] });
   const info = await call("round_info", { primary: CLAUDE, roundOf: r1.id });
   assert.equal(info.round, 2);
@@ -430,7 +430,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   await assert.rejects(call("link_continue", { primary: CLAUDE, roundOf: r2.id, request: "twice" }), /already continued/);
   await call("advise", { endpoint: GPT, requestId: reqOf(r3.id).id, decision: "approved" });
   // a retry of a first round has no earlier answer
-  const f1 = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Lost first round." });
+  const f1 = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Lost first round." });
   const mf = await until(() => reqOf(f1.id)?.watch?.clientId && reqOf(f1.id));
   fake({ turns: { [mf.watch.clientId]: { state: "failed", completedAt: 1, error: { message: "limit" } } } });
   await until(() => failedFor(mf.id)[0]);
@@ -440,7 +440,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   // at the round cap a retry is still allowed, a further round isn't
   process.env.AGENT_REVIEW_BRIDGE_MAX_ROUNDS = "2";
   try {
-    const c1 = await call("link_create", { primary: CLAUDE, advisor: GPT, mode: "review", request: "Cap one." });
+    const c1 = await call("link_create", { primary: CLAUDE, advisor: GPT, request: "Cap one." });
     await call("advise", { endpoint: GPT, requestId: reqOf(c1.id).id, decision: "changes_requested", blocking: [{ title: "a" }] });
     const c2 = await call("link_continue", { primary: CLAUDE, roundOf: c1.id, request: "Cap two." });
     const mc = await until(() => reqOf(c2.id)?.watch?.clientId && reqOf(c2.id));
@@ -472,7 +472,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
     assert.ok(got, "the notice is received with its fields");
     return got;
   };
-  const r1 = await call("link_create", { primary: A, advisor: GPT, mode: "review", request: "Auto review." });
+  const r1 = await call("link_create", { primary: A, advisor: GPT, request: "Auto review." });
   const n1 = await fail(r1.id, { state: "interrupted", completedAt: 1 });
   assert.deepEqual([n1.auto, n1.retried], [true, undefined]);
   assert.match(n1.text, /its turn was interrupted \(someone may have stopped it in the app\)/);
@@ -489,19 +489,18 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
 
 // 15. a Claude chat working for another waits on the user to approve a tool
 // (Notification, permission_prompt): whoever waits on it is told, once per
-// message; nothing for advisor mode, answered, closed or ended work, or a chat
-// working for nobody; a notice not yet read is dropped once the answer is in
+// message; nothing for answered, closed or ended work, or a chat working
+// for nobody; a notice not yet read is dropped once the answer is in
 {
   const { call, nextStep, inlineText } = await import("../src/broker.mjs");
   const C = { app: "claude", id: "claude-approver" };
   const P = { app: "openai", id: "gpt-asks-claude" };
-  const A = { app: "openai", id: "gpt-advised" };
   const waiting = (about) => state().messages.filter((x) => x.kind === "waiting" && x.about === about);
   const prompt = (message = "Claude needs your permission to use Bash") =>
     runHook("claude", "permission", { session_id: C.id, hook_event_name: "Notification", notification_type: "permission_prompt", message });
   const handOver = async (id) => call("receive", { side: "claude", endpoint: C, id });
   const reviewOn = async (request) => {
-    const l = await call("link_create", { primary: P, advisor: C, mode: "review", request });
+    const l = await call("link_create", { primary: P, advisor: C, request });
     return { link: l, req: await until(() => state().messages.find((x) => x.linkId === l.id && x.kind === "review-request")) };
   };
   const quiet = async (id, why) => {
@@ -532,7 +531,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   assert.match((await until(() => waiting(sent.id)[0])).text, /\(Read\)/);
   // the answer arrives before a Claude requester read the notice: it's dropped
   const Q = { app: "claude", id: "claude-asker" };
-  const stale = await call("link_create", { primary: Q, advisor: C, mode: "review", request: "Stale check." });
+  const stale = await call("link_create", { primary: Q, advisor: C, request: "Stale check." });
   const sreq = await until(() => state().messages.find((x) => x.linkId === stale.id && x.kind === "review-request"));
   await handOver(sreq.id);
   await prompt();
@@ -542,7 +541,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   assert.ok(state().messages.find((x) => x.id === sn.id).readAt, "dropped once the answer is in");
   assert.ok(!(await call("receive", { side: "claude", endpoint: Q })).messages.some((x) => x.kind === "waiting"), "not handed to the requester");
   // the same for a message answered with a reply
-  const open2 = await call("link_create", { primary: Q, advisor: C, mode: "review", request: "Reply check." });
+  const open2 = await call("link_create", { primary: Q, advisor: C, request: "Reply check." });
   const asked = await call("send", { endpoint: Q, text: "Which test covers it?" });
   await handOver(asked.id);
   await prompt();
@@ -552,13 +551,6 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   assert.ok(state().messages.find((x) => x.id === an.id).readAt, "dropped once the reply is in");
   await call("link_close", { linkId: open2.id });
   await call("link_close", { linkId: review.id });
-  // advisor mode: nothing (it would start the primary's turn, and a new review)
-  const adv = await call("link_create", { primary: A, advisor: C });
-  await runHook("openai", "stop", { session_id: A.id, last_assistant_message: "Done with step one." });
-  const areq = await until(() => state().messages.find((x) => x.linkId === adv.id && x.kind === "review-request"));
-  await handOver(areq.id);
-  await quiet(areq.id, "advisor mode");
-  await call("link_close", { linkId: adv.id });
   // nothing for work that is already over, each told nothing before its first prompt
   const { link: r2, req: req2 } = await reviewOn("Second look.");
   await handOver(req2.id);
@@ -580,7 +572,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   await runHook("claude", "permission", { session_id: "claude-alone", hook_event_name: "Notification", notification_type: "permission_prompt", message: "Claude needs your permission to use Bash" });
   await sleep(300);
   assert.equal(state().messages.filter((x) => x.kind === "waiting").length, total);
-  console.log("15 a tool approval waiting: told once (review, message), dropped once answered; not for advisor mode, answered, closed or ended work, or an idle chat");
+  console.log("15 a tool approval waiting: told once (review, message), dropped once answered; not for answered, closed or ended work, or an idle chat");
 }
 
 // 16. a ChatGPT reviewer asked to run a command outside its sandbox and has no
@@ -614,7 +606,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   const waiting = (about) => state().messages.filter((x) => x.kind === "waiting" && x.about === about);
   const review = async (request, running = true) => {
     const thread = newThread();
-    const link = await call("link_create", { primary: R, advisor: { app: "openai", id: thread }, mode: "review", request });
+    const link = await call("link_create", { primary: R, advisor: { app: "openai", id: thread }, request });
     const m = await until(() => {
       const x = state().messages.find((y) => y.linkId === link.id && y.kind === "review-request");
       return x?.watch?.clientId && x;
@@ -751,21 +743,11 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   fake({ turns, hang: true });
   await until(() => waiting(j.m.id)[0], 8000);
   fake({ turns });
-  // advisor mode: the review of a primary's turn is never watched, never told
-  const advThread = newThread();
-  const adv = await call("link_create", { primary: R, advisor: { app: "openai", id: advThread } });
-  await runHook("claude", "stop", { session_id: R.id, last_assistant_message: "Step one done." });
-  const areq = await until(() => state().messages.find((x) => x.linkId === adv.id && x.kind === "review-request"));
-  write(advThread, [custom("call-adv", Date.now())]);
-  await sleep(400);
-  assert.equal(state().messages.find((x) => x.id === areq.id).watch, undefined, "not watched");
-  assert.equal(waiting(areq.id).length, 0, "advisor mode");
   for (const l of [a, b, c, d, e, f, g, g2, h, h2, i, j, k, y1, y2, y3, y4, y5, y6, y7, y8, y9, y10]) await call("link_close", { linkId: l.link.id }).catch(() => {});
-  await call("link_close", { linkId: adv.id });
   fake({});
   delete process.env.CODEX_HOME;
   fs.rmSync(home, { recursive: true, force: true });
-  console.log("16 a ChatGPT reviewer with an unanswered sandbox escalation: told once as a possibility (both call shapes, turn unknown or unreadable, only the end of a large rollout, a rollout that shows up late, a yielded command still running, notify() outputs before or after a yield); nothing when answered (also through a later wait or write_stdin, one that notified first, or with a running line in the command's own output), too new, from before, half written, without a rollout, or for the word in a command; advisor mode out");
+  console.log("16 a ChatGPT reviewer with an unanswered sandbox escalation: told once as a possibility (both call shapes, turn unknown or unreadable, only the end of a large rollout, a rollout that shows up late, a yielded command still running, notify() outputs before or after a yield); nothing when answered (also through a later wait or write_stdin, one that notified first, or with a running line in the command's own output), too new, from before, half written, without a rollout, or for the word in a command");
 }
 
 // 17. auto mode from ChatGPT: the bridge can't make a Claude chat, so the
@@ -797,14 +779,14 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   }
   await call("auto_set", { endpoint: W, on: true });
   // a join that isn't auto mode's own review doesn't bind anything
-  const plain = await call("link_create", { primary: W, mode: "review", request: "A join of its own." });
+  const plain = await call("link_create", { primary: W, request: "A join of its own." });
   assert.equal((await call("link_join", { code: plain.joinCode, endpoint: other })).autoReviewer, undefined);
   assert.equal(state().auto["openai:gpt-auto-worker"].reviewer, null);
   // auto mode's first review, asked twice before anyone joined: a chat in the
   // same app can't take it (the code stays valid); the chat that joins
   // becomes the reviewer, and the earlier try's code goes
-  const earlier = await call("link_create", { primary: W, mode: "review", request: "Auto's first review, first try.", autoReviewer: true });
-  const first = await call("link_create", { primary: W, mode: "review", request: "Auto's first review.", autoReviewer: true });
+  const earlier = await call("link_create", { primary: W, request: "Auto's first review, first try.", autoReviewer: true });
+  const first = await call("link_create", { primary: W, request: "Auto's first review.", autoReviewer: true });
   await assert.rejects(call("link_join", { code: first.joinCode, endpoint: { app: "openai", id: "gpt-same-app" } }), /for auto mode's reviewer, a chat in the other app: paste it into a Claude Code chat/);
   assert.ok(state().links[first.id].joinCode, "the code stays valid");
   assert.equal((await call("link_join", { code: first.joinCode, endpoint: R })).autoReviewer, true);
@@ -813,7 +795,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   assert.equal(state().links[earlier.id].request, undefined, "with its unsent request");
   await assert.rejects(call("link_join", { code: earlier.joinCode, endpoint: other }), /no open link with that join code/);
   // a second one doesn't replace it
-  const second = await call("link_create", { primary: W, mode: "review", request: "Another first?", autoReviewer: true });
+  const second = await call("link_create", { primary: W, request: "Another first?", autoReviewer: true });
   assert.equal((await call("link_join", { code: second.joinCode, endpoint: other })).autoReviewer, undefined);
   assert.deepEqual(state().auto["openai:gpt-auto-worker"].reviewer, R, "auto mode keeps its reviewer");
   // between reviews: refused other chats, in both directions
@@ -832,7 +814,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   assert.equal((await call("read_chat_allowed", { endpoint: R })).allowed, true);
   await call("auto_set", { endpoint: W, on: true, reviewer: R }); // as it was, for what follows
   // a review from an earlier auto session doesn't bind the new one
-  const late = await call("link_create", { primary: W, mode: "review", request: "Before off and on.", autoReviewer: true });
+  const late = await call("link_create", { primary: W, request: "Before off and on.", autoReviewer: true });
   await call("auto_set", { endpoint: W, on: false });
   assert.equal((await call("read_chat_allowed", { endpoint: R })).allowed, true, "no longer a reviewer once auto mode is off");
   await sleep(5);
@@ -843,7 +825,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   assert.equal(state().auto["openai:gpt-auto-worker"].reviewer, null, "a fresh start has no reviewer yet");
   // without auto mode on: never marked
   await call("auto_set", { endpoint: W, on: false });
-  const noAuto = await call("link_create", { primary: W, mode: "review", request: "No auto mode.", autoReviewer: true });
+  const noAuto = await call("link_create", { primary: W, request: "No auto mode.", autoReviewer: true });
   assert.equal(state().links[noAuto.id].autoReviewer, undefined);
   for (const id of [second.id, late.id, noAuto.id, plain.id]) await call("link_close", { linkId: id });
   console.log("17 auto mode from ChatGPT: the Claude chat that joins its first review stays its reviewer (not another join, a second one or an earlier session's); a chat in the same app can't, an earlier try's code goes; a standing reviewer reads no other chats, in either direction, until it unlinks or auto mode is off");
@@ -1030,7 +1012,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
   const ownTurn = async (n, close) => {
     await runHook("claude", "prompt", { session_id: C2.id, cwd: work, prompt: `Turn ${n}.`, prompt_id: `p${n}` });
     await sleep(700);
-    const own = await call("link_create", { primary: C2, mode: "review", advisor: G2, request: "mine", reqPaths: [{ path: tracked, fp: fingerprint(tracked, { fresh: true }).hash, head: null }] });
+    const own = await call("link_create", { primary: C2, advisor: G2, request: "mine", reqPaths: [{ path: tracked, fp: fingerprint(tracked, { fresh: true }).hash, head: null }] });
     if (close) await call("link_close", { linkId: own.id });
     const before = covered();
     await runHook("claude", "stop", { session_id: C2.id, cwd: work, prompt_id: `p${n}`, last_assistant_message: `Turn ${n}.` });
@@ -1047,7 +1029,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
     await runHook("claude", "prompt", { session_id: C2.id, cwd: work, prompt: `Turn ${n}.`, prompt_id: `p${n}` });
     await sleep(700);
     fs.writeFileSync(f, reviewed);
-    const own = await call("link_create", { primary: C2, mode: "review", advisor: G2, request: "mine", reqPaths: [{ path: tracked, fp: fingerprint(tracked, { fresh: true }).hash, head: null }] });
+    const own = await call("link_create", { primary: C2, advisor: G2, request: "mine", reqPaths: [{ path: tracked, fp: fingerprint(tracked, { fresh: true }).hash, head: null }] });
     fs.writeFileSync(f, ended);
     process.env.AGENT_REVIEW_BRIDGE_TEST_TURNJOB = "delay:1200";
     try {

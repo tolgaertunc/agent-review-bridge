@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { baseline, turnDiff, snapshotDiff, snapshotCommand, pathInfo, reviewSummary, fingerprint, usableBase } from "../src/git.mjs";
+import { baseline, snapshotDiff, snapshotCommand, pathInfo, reviewSummary, fingerprint, usableBase } from "../src/git.mjs";
 
 // the fingerprint keeps a small cache in the bridge's data folder: a throwaway one here
 process.env.AGENT_REVIEW_BRIDGE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-gitdata-"));
@@ -24,13 +24,16 @@ function repo({ commit = true } = {}) {
   return { d, git, write: (f, c) => (fs.mkdirSync(path.dirname(path.join(d, f)), { recursive: true }), fs.writeFileSync(path.join(d, f), c)) };
 }
 
+// a turn's own changes, from a snapshot at its start to one taken now (its end)
+const turnChanges = (d, base, maxChars) => snapshotDiff(d, base, baseline(d), maxChars);
+
 // secrets: files and directories, never content nor name
 {
   const r = repo();
   const base = baseline(r.d);
   for (const f of ["secrets/config.json", ".envrc", ".env.local", "my-credentials/x.txt", "deploy/server.pem", ".ssh/id_ed25519", "config/app_secret.yml"]) r.write(f, "TOPSECRET\n");
   r.write("a.js", "2\n");
-  const d = turnDiff(r.d, base, 20000);
+  const d = turnChanges(r.d, base, 20000);
   assert.match(d, /a\.js/);
   assert.doesNotMatch(d, /TOPSECRET|secrets|envrc|\.env|credentials|\.pem|\.ssh|app_secret/);
   console.log("git 1 secret files and directories excluded (content and names)");
@@ -44,10 +47,10 @@ function repo({ commit = true } = {}) {
   assert.ok(base, "baseline in a repo without commits");
   r.write("x.js", "changed\n");
   r.write("y.js", "new\n");
-  const d = turnDiff(r.d, base, 20000);
+  const d = turnChanges(r.d, base, 20000);
   assert.match(d, /New untracked files:\ny\.js/);
   assert.match(d, /Edited untracked files[^\n]*:\nx\.js/);
-  assert.ok(turnDiff(r.d, null, 20000), "no-baseline diff works without HEAD too");
+  assert.equal(turnChanges(r.d, null, 20000), null, "no snapshot at the start: no diff");
   console.log("git 2 repo without commits: new and edited untracked files reported");
 }
 
@@ -56,9 +59,9 @@ function repo({ commit = true } = {}) {
   const r = repo();
   r.write("notes.md", "v1\n");
   const base = baseline(r.d);
-  assert.equal(turnDiff(r.d, base, 20000), "(no changes)");
+  assert.equal(turnChanges(r.d, base, 20000), "(no changes)");
   r.write("notes.md", "v2\n");
-  assert.match(turnDiff(r.d, base, 20000), /Edited untracked files[^\n]*:\nnotes\.md/);
+  assert.match(turnChanges(r.d, base, 20000), /Edited untracked files[^\n]*:\nnotes\.md/);
   console.log("git 3 edited pre-existing untracked file reported");
 }
 
@@ -71,7 +74,7 @@ function repo({ commit = true } = {}) {
   const base = baseline(r.d);
   for (let i = 0; i < 300; i++) r.write(`f${i}.txt`, "b".repeat(500) + "\n");
   for (let i = 0; i < 120; i++) r.write(`new${i}.txt`, "n\n");
-  const d = turnDiff(r.d, base, 3000);
+  const d = turnChanges(r.d, base, 3000);
   assert.ok(d.length <= 3000, `capped at 3000 (got ${d.length})`);
   assert.match(d, /more files/);
   assert.match(d, /… 70 more/);

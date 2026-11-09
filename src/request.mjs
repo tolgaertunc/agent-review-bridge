@@ -68,8 +68,8 @@ function whereText(sections, { focus = [], lists, diffs, intro = "If you can't r
 }
 
 // The request for one turn that auto mode reviews on its own: what the user
-// asked, the agent's final message, the turn's own changes (pasted, as advisor
-// mode sends them), and for each tracked path what an approval covers, with
+// asked, the agent's final message, the turn's own changes (pasted), and for
+// each tracked path what an approval covers, with
 // its content recorded now. It has to fit one message: the file lists go
 // first, then the pasted changes (their command stays), then the user's and
 // the agent's words are cut further; past that it fails and says why. With no
