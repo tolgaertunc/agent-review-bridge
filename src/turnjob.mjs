@@ -21,7 +21,7 @@ try {
   // was: what changed, and the command that shows it
   const snapshots = !!(job.cwd && job.base && job.snap);
   const summary = snapshots ? snapshotSummary(job.cwd, job.base, job.snap) : null;
-  const command = summary ? snapshotCommand(job.cwd, job.base, job.snap) : null;
+  const command = summary ? (shell) => snapshotCommand(job.cwd, job.base, job.snap, shell) : null;
   // snapshots that can't be read any more (git may have pruned them after a long wait)
   result = turnRequest({ ...job, summary, command, gone: snapshots && summary == null, folder: job.cwd });
 } catch (e) {

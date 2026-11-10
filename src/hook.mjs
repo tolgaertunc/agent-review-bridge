@@ -27,7 +27,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { readState, activeLinks, writeOutbox, pendingFor, claudeWakeText, listenerFile, turnFile, DATA_DIR, REVIEWER_ROLE, bridgePrompt, advisorNote } from "./broker.mjs";
 import { baseline, fingerprint } from "./git.mjs";
-import { autoFor, AUTO_RULES, AUTO_RULES_SHORT, AUTO_RULES_EVERY, AUTO_RULES_EVERY_SHORT, AUTO_REMINDER, REMIND_AFTER, autoGuard, autoJoinWait, standingReviewer, GUARD_HEAD } from "./auto.mjs";
+import { autoFor, AUTO_RULES, AUTO_RULES_SHORT, AUTO_RULES_EVERY, AUTO_RULES_EVERY_SHORT, AUTO_REMINDER, REMIND_AFTER, autoGuard, autoJoinWait, standingReviewer, pairedIn, GUARD_HEAD } from "./auto.mjs";
 import { rulesBlock } from "./rules.mjs";
 
 const args = process.argv.slice(2);
@@ -125,7 +125,7 @@ if (event === "stop") {
       turnId: input.turn_id ?? input.prompt_id ?? null,
       lastMessage: input.last_assistant_message ?? "",
       cwd: cwd ?? null,
-      base: start && { ref: start.ref, untracked: start.untracked },
+      base: start && { ref: start.ref, untracked: start.untracked, ...(start.staged && { staged: start.staged }) },
       at: t0,
       more: true,
     });
@@ -143,7 +143,7 @@ if (event === "stop") {
         if (Date.now() - t0 > budget) break;
         ends[p] = fingerprint(p).hash ?? null;
       }
-      writeOutbox("turn_facts", { endpoint, at: t0, snap: end && { ref: end.ref, untracked: end.untracked }, ends });
+      writeOutbox("turn_facts", { endpoint, at: t0, snap: end && { ref: end.ref, untracked: end.untracked, ...(end.staged && { staged: end.staged }) }, ends });
       // the next turn starts where this one ended, even if no prompt hook runs
       // before it (the prompt hook replaces it when one does)
       if (end) fs.writeFileSync(turnFile(endpoint), JSON.stringify({ ...end, turnId: null, at: Date.now() }));
@@ -187,7 +187,7 @@ if (event === "stop") {
     else if (told !== key && chained !== key) {
       fs.writeFileSync(guardFile(endpoint), JSON.stringify({ key, at: Date.now() }));
       if (app === "openai") fs.writeFileSync(chainFile(endpoint), JSON.stringify({ key, at: Date.now() }));
-      const reason = joining && unreviewed.length ? [autoJoinWait(joining.id, joining.joinCode), unchecked.length && autoGuard([], unchecked)].filter(Boolean).join(" ") : autoGuard(named, unchecked);
+      const reason = joining && unreviewed.length ? [autoJoinWait(joining.id, joining.joinCode, app), unchecked.length && autoGuard([], unchecked)].filter(Boolean).join(" ") : autoGuard(named, unchecked);
       await answer({ decision: "block", reason });
       hookLog({ autoGuard: unreviewed, unchecked, ms: Date.now() - t0 });
       process.exit(0); // the turn goes on: it hasn't ended yet
@@ -323,7 +323,15 @@ if (event === "listen") {
     pendingFor(s, endpoint).length > 0 ||
     standingReviewer(s, endpoint) ||
     // every turn reviewed on its own: its review is posted after this Stop
-    !!autoFor(s, endpoint)?.everyTurn;
+    !!autoFor(s, endpoint)?.everyTurn ||
+    // a message it sent to the chat auto mode pairs it with (through the
+    // pairing, or on a review since closed) that can still be answered: no
+    // reply yet, not failed, under a day old, the two still paired. The
+    // answer wakes it, as a review's does.
+    (s?.messages ?? []).some(
+      (m) =>
+        m.kind === "message" && sameEndpoint(m.fromEndpoint, endpoint) && !m.failure && Date.now() - m.ts < 24 * 3600_000 && pairedIn(s, endpoint, m.toEndpoint) && !s.messages.some((r) => r.replyTo === m.id),
+    );
   if (!linked(readState())) process.exit(0);
   const file = listenerFile(endpoint);
   const me = { pid: process.pid, startedAt: Date.now(), beat: Date.now(), source: input.hook_event_name ?? null };

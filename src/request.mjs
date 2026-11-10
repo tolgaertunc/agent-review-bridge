@@ -6,7 +6,15 @@
 import path from "node:path";
 import { MAX_DIFF, MAX_TEXT, REVIEWER_ROLE } from "./common.mjs";
 import { AUTO_REVIEWER, EVERY_TURN_ROLE } from "./auto.mjs";
-import { pathInfo, usableBase, reviewSummary, pathDiff, fingerprint } from "./git.mjs";
+import { pathInfo, usableBase, reviewSummary, pathCommand, pathDiff, fingerprint, REVIEW_SHELLS } from "./git.mjs";
+
+// A command as the request shows it: one sh block, or on Windows one block
+// per shell the reviewer may run it in (labeled), from build(shell)
+export function commandBlocks(build, shells = REVIEW_SHELLS) {
+  if (shells.length === 1) return "```sh\n" + build(shells[0]) + "\n```";
+  const label = { posix: "In bash (Claude Code on Windows runs Git Bash):\n```sh\n", powershell: "In PowerShell (ChatGPT on Windows runs PowerShell):\n```powershell\n" };
+  return shells.map((sh) => label[sh] + build(sh) + "\n```").join("\n");
+}
 
 // what one review request may take of a message, leaving room for the
 // bridge's own header and footer and a round's heading
@@ -45,21 +53,62 @@ export function reviewRequest({ side, request, plan, paths, folder, includeDiff,
 // that shows them, between the snapshots of its start and its end. With no
 // tracked path, the turn's own folder is used (and recorded).
 export function turnRequest({ chat, turnId, prompt, fixTurn, heading, previous, lastMessage, summary, command, gone, tracked = {}, folder }) {
-  const known = Object.keys(tracked);
-  const asked =
-    prompt?.trim() || (fixTurn ? "(None: this turn answers your previous review's changes requested.)" : "(None: the app or a bridge message started this turn, not the user.)");
   return buildRequest({
-    title: `Automatic review of a turn of ${chat}${turnId ? ` (turn ${turnId})` : ""}, sent by the bridge: auto mode reviews every turn.`,
-    request: [heading, `User's message:\n${asked}`, `Agent's final message:\n${lastMessage?.trim() || "(no text)"}`].filter(Boolean).join("\n\n"),
+    ...turnIntro({ chat, turnId, prompt, fixTurn, heading, lastMessage }),
     previous,
     auto: { paths: tracked },
     roles: [EVERY_TURN_ROLE],
     turn: turnChanges({ summary, command, gone }),
-    list: known.length ? known : folder ? [path.resolve(folder)] : [],
+    list: turnPaths(tracked, folder),
     intro: "If you can't read a path, say so in your answer.",
     tooBig: (n) => `the review of this turn doesn't fit one message (${n} tracked paths)`,
   });
 }
+
+// The same turn when its review couldn't be put together (`why`: an error, a
+// timeout, too big): what was asked and answered, in full, without the
+// turn's changes and with each path named only, so the bridge runs no git
+// for it. Its approval approves no content (no paths recorded). Paths that
+// don't fit one message are counted, never dropped silently: the reviewer can
+// ask for them. (Refused only if what was asked and answered can't fit, which
+// their own caps rule out.)
+export function minimalTurnRequest({ chat, turnId, prompt, fixTurn, heading, previous, lastMessage, tracked = {}, folder, why }) {
+  const { title, request } = turnIntro({ chat, turnId, prompt, fixTurn, heading, lastMessage });
+  const list = turnPaths(tracked, folder);
+  const base = [title, request, REVIEWER_ROLE, EVERY_TURN_ROLE, earlier(previous), AUTO_REVIEWER, `This turn's own changes: not available (the bridge couldn't put them together: ${why}).`]
+    .filter(Boolean)
+    .join("\n\n");
+  if (!list.length) return base.length <= REQUEST_ROOM ? { text: base, reqPaths: [] } : { error: "even without its changes, the review doesn't fit one message" };
+  const intro =
+    "Where the changes are: the bridge couldn't list them, so read them yourself, read-only, in these paths (in a git repository, git status and git diff show them). " +
+    "Don't open secret files (.env*, keys, certificates, credentials). An approval of this review approves no content: the next review covers these paths again.";
+  const more = (n) => `- … and ${n} more tracked path${n === 1 ? "" : "s"} that don't fit one message: ask the requester for them (bridge_send) if you need them.`;
+  // as many paths as fit, with room kept for the count of the rest
+  let room = REQUEST_ROOM - base.length - 2 - intro.length - 1 - more(list.length).length - 1;
+  const shown = [];
+  for (const p of list) {
+    if (room < p.length + 3) break;
+    shown.push(`- ${p}`);
+    room -= p.length + 3;
+  }
+  if (room < 0) return { error: "even without its changes, the review doesn't fit one message" };
+  const where = [intro, ...shown, shown.length < list.length && more(list.length - shown.length)].filter(Boolean).join("\n");
+  return { text: `${base}\n\n${where}`, reqPaths: [] };
+}
+
+// How a turn's review begins: whose turn, what the user asked (or who
+// started it), and the agent's final message
+function turnIntro({ chat, turnId, prompt, fixTurn, heading, lastMessage }) {
+  const asked =
+    prompt?.trim() || (fixTurn ? "(None: this turn answers your previous review's changes requested.)" : "(None: the app or a bridge message started this turn, not the user.)");
+  return {
+    title: `Automatic review of a turn of ${chat}${turnId ? ` (turn ${turnId})` : ""}, sent by the bridge: auto mode reviews every turn.`,
+    request: [heading, `User's message:\n${asked}`, `Agent's final message:\n${lastMessage?.trim() || "(no text)"}`].filter(Boolean).join("\n\n"),
+  };
+}
+
+// the tracked paths, or with none the turn's own folder
+const turnPaths = (tracked, folder) => (Object.keys(tracked).length ? Object.keys(tracked) : folder ? [path.resolve(folder)] : []);
 
 // One request, whoever asks: the request, the reviewer's role, the earlier
 // answer of a round, the turn's own changes (auto mode's review of a turn),
@@ -84,20 +133,19 @@ function buildRequest({ title, request, previous, plan, auto, roles = [], turn, 
 }
 
 // A turn's own changes, from its start to its end: what changed, and the
-// command that shows it. Untracked files are kept by name only.
+// command that shows it (command(shell)). Untracked files are kept by name only.
 function turnChanges({ summary, command, gone }) {
   if (summary == null)
-    return `This turn's own changes: not available (${gone ? "its snapshots can't be read any more; git may have pruned them" : "no snapshot of its start or its end"}). The paths below show everything since the last approval.`;
+    return `This turn's own changes: not available (${gone ? "its snapshots couldn't be read (git may have pruned them, or git failed)" : "no snapshot of its start or its end"}). The paths below show everything since the last approval.`;
   if (!summary) return "This turn's own changes: none.";
   return (
     "This turn's own changes, from its start to its end (review these first; an approval covers everything under \"Where the changes are\"):\n" +
     "```text\n" +
     summary +
     "\n```\n" +
-    "Show them (untracked files aren't in it: read them directly, as they are now, not as the turn left them):\n" +
-    "```sh\n" +
-    command +
-    "\n```\n" +
+    "Show them (untracked files, and before a repository's first commit its staged files, aren't in it: read them directly, as they are now, not as the turn left them):\n" +
+    commandBlocks(command) +
+    "\n" +
     "If the command fails, say so in your answer and don't approve what you couldn't read."
   );
 }
@@ -176,7 +224,7 @@ export function describePath(p, { auto, includeDiff, diffRoom }) {
       head: `${info.path} (git: ${scope})`,
       list: "```text\n" + (summary.status || "(no uncommitted changes)") + (summary.stat ? `\n\n${summary.stat}` : "") + "\n```",
       how: "Show the changes (new files, marked ?? in the status, aren't in it: read them directly; run git status --short with the same paths to list them):",
-      command: "```sh\n" + summary.command + "\n```",
+      command: commandBlocks((sh) => pathCommand(info, base, sh)),
       diff: includeDiff && "The changes as text:\n```diff\n" + pathDiff(info, base, diffRoom) + "\n```",
     },
     reqPath: covers(info.head),

@@ -21,6 +21,16 @@ export const standingReviewer = (state, endpoint) =>
     return !!r && r.app === endpoint.app && r.id === endpoint.id;
   });
 
+// Two chats auto mode pairs: one's auto mode, on, keeps the other as its
+// reviewer. The pairing outlives each review (messages can go between them).
+export const pairedIn = (state, a, b) => {
+  const keeps = (x, y) => {
+    const r = x && y && reviewerOf(autoFor(state, x));
+    return !!r && r.app === y.app && r.id === y.id;
+  };
+  return keeps(a, b) || keeps(b, a);
+};
+
 // To the working agent in full when auto mode is turned on and whenever its
 // session starts again (a compaction may have summarised them away)
 export const AUTO_RULES =
@@ -79,9 +89,11 @@ export const AUTO_REMINDER =
 export const GUARD_HEAD = "[AGENT-REVIEW-BRIDGE] Auto mode";
 
 // From the Stop check while auto mode's first review waits for a chat to
-// join with its code: asking again would only make another code
-export const autoJoinWait = (linkId, code) =>
-  `${GUARD_HEAD}: review ${linkId} is waiting for a chat in the other app to join with its code ${code}. ` +
+// join with its code: asking again would only make another code. From
+// ChatGPT that is a Claude chat by default; from Claude a code is only asked
+// for to take any chat (reviewer='join').
+export const autoJoinWait = (linkId, code, app) =>
+  `${GUARD_HEAD}: review ${linkId} is waiting for ${app === "claude" ? "the chat that should review (either app)" : "a chat in the other app"} to join with its code ${code}. ` +
   "Remind the user to paste it there (\"join the agent-review-bridge link with code " + code + "\"), and don't ask for another review. " +
   "If you are waiting for the user's answer or have to stop for another reason, you can stop now.";
 

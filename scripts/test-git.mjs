@@ -6,8 +6,10 @@ import os from "node:os";
 import fs from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
-import { execFileSync, execSync } from "node:child_process";
-import { baseline, snapshotSummary, snapshotCommand, pathInfo, reviewSummary, fingerprint, usableBase } from "../src/git.mjs";
+import { execFileSync } from "node:child_process";
+import { baseline, snapshotSummary, snapshotCommand, pathInfo, reviewSummary, pathCommand, shellArg, fingerprint, usableBase } from "../src/git.mjs";
+import { commandBlocks } from "../src/request.mjs";
+import { runPosix, powershell, runPowershell } from "./reviewer-shell.mjs";
 
 // the fingerprint keeps a small cache in the bridge's data folder: a throwaway one here
 process.env.AGENT_REVIEW_BRIDGE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-gitdata-"));
@@ -27,7 +29,7 @@ function repo({ commit = true } = {}) {
 // a turn's own changes, from a snapshot at its start to one taken now (its
 // end): the summary the request carries, and what its command prints
 const turnSummary = (d, base) => snapshotSummary(d, base, baseline(d));
-const shown = (d, base, end) => execSync(snapshotCommand(d, base, end), { encoding: "utf8" });
+const shown = (d, base, end) => runPosix(snapshotCommand(d, base, end));
 
 // secrets: files and directories, never content nor name
 {
@@ -106,7 +108,7 @@ const shown = (d, base, end) => execSync(snapshotCommand(d, base, end), { encodi
   const file = pathInfo(path.join(r.d, "src", "app.js"));
   assert.equal(file.spec, "src/app.js");
   assert.equal(fs.realpathSync(file.top), fs.realpathSync(r.d));
-  const shown = execFileSync("sh", ["-c", reviewSummary(file, file.head).command], { encoding: "utf8" });
+  const shown = runPosix(reviewSummary(file, file.head).command);
   assert.match(shown, /^\+2$/m);
   assert.doesNotMatch(shown, /new\.js|TOPSECRET/);
   assert.equal(fs.statSync(path.join(r.d, ".git", "index")).mtimeMs, indexBefore, "the summary doesn't rewrite the index");
@@ -306,4 +308,166 @@ const shown = (d, base, end) => execSync(snapshotCommand(d, base, end), { encodi
   }
   for (const x of [r, clean, empty, m]) fs.rmSync(x.d, { recursive: true, force: true });
   console.log("git 8 a turn's own changes between snapshots: its command shows commits and staged files in it, untracked by hash, nothing after its end, no secrets, clean and commit-less repos; no snapshot in a conflicted merge or when git can't say what HEAD is");
+}
+
+// the reviewer's shell: every command quoted for the shell that runs it, a
+// repo path with a space, an apostrophe, $ or a backtick included; POSIX run
+// through bash, PowerShell checked by its text and run where it's installed
+{
+  assert.equal(shellArg("a b'c"), `'a b'\\''c'`);
+  assert.equal(shellArg("a b'c", "powershell"), "'a b''c'");
+  assert.equal(shellArg("O’Brien", "powershell"), "'O’’Brien'", "PowerShell takes the curly quote as a quote");
+  assert.equal(shellArg("O’Brien"), "'O’Brien'");
+  assert.equal(shellArg("$HOME `date`", "powershell"), "'$HOME `date`'", "$ and ` stay literal in single quotes");
+  assert.equal(commandBlocks((sh) => `cmd-${sh}`, ["posix"]), "```sh\ncmd-posix\n```");
+  assert.equal(
+    commandBlocks((sh) => `cmd-${sh}`, ["posix", "powershell"]),
+    "In bash (Claude Code on Windows runs Git Bash):\n```sh\ncmd-posix\n```\nIn PowerShell (ChatGPT on Windows runs PowerShell):\n```powershell\ncmd-powershell\n```",
+    "on Windows both, labeled",
+  );
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-quotes-"));
+  for (const name of ["with space and O'Brien", "O'Brien $HOME", "O'Brien `date`", "O’Brien"]) {
+    const d = path.join(parent, name);
+    fs.mkdirSync(d);
+    const g = (...a) => execFileSync("git", ["-C", d, "-c", "user.name=t", "-c", "user.email=t@t", ...a], { stdio: "ignore" });
+    g("init", "-q");
+    fs.writeFileSync(path.join(d, "a.js"), "1\n");
+    g("add", ".");
+    g("commit", "-qm", "init");
+    const base = baseline(d);
+    fs.writeFileSync(path.join(d, "a.js"), "2\n");
+    const end = baseline(d);
+    const info = pathInfo(d);
+    for (const [what, cmd] of [
+      ["the folder's command", (sh) => pathCommand(info, info.head, sh)],
+      ["the turn's command", (sh) => snapshotCommand(d, base, end, sh)],
+    ]) {
+      assert.match(runPosix(cmd("posix")), /^-1\n\+2$/m, `${name}: ${what} in bash`);
+      const ps = cmd("powershell");
+      assert.ok(ps.includes(shellArg(what === "the turn's command" ? d : info.top, "powershell")), `${name}: ${what}, the path quoted for PowerShell`);
+      assert.match(ps, / '--' /, "-- quoted for PowerShell");
+      if (powershell) assert.match(runPowershell(ps), /^-1\n\+2$/m, `${name}: ${what} in PowerShell`);
+    }
+  }
+  fs.rmSync(parent, { recursive: true, force: true });
+  console.log(`git 9 commands quoted per shell (space, apostrophe, $, backtick, curly apostrophe): bash runs them${powershell ? `, and ${powershell} too` : "; no PowerShell here, its form checked by text only"}; on Windows both forms, labeled`);
+}
+
+// git stash create runs on a copy of the index: a stat-dirty index isn't
+// written back, another git's index.lock doesn't stop the snapshot, a linked
+// worktree's own index is the one copied, and no copy is left behind
+{
+  const r = repo();
+  const index = path.join(r.d, ".git", "index");
+  const before = fs.readFileSync(index);
+  const later = new Date(Date.now() + 60_000);
+  fs.utimesSync(path.join(r.d, "a.js"), later, later); // stat-dirty, same content
+  assert.ok(baseline(r.d), "a snapshot");
+  r.write("a.js", "2\n");
+  const dirty = baseline(r.d);
+  assert.ok(dirty?.ref, "with changes too");
+  assert.ok(fs.readFileSync(index).equals(before), ".git/index never written");
+  fs.writeFileSync(`${index}.lock`, "");
+  try {
+    const locked = baseline(r.d);
+    const tree = (ref) => execFileSync("git", ["-C", r.d, "rev-parse", `${ref}^{tree}`], { encoding: "utf8" }).trim();
+    assert.ok(locked?.ref, "another git's lock doesn't stop it");
+    assert.equal(tree(locked.ref), tree(dirty.ref), "the same content (a new stash commit each time)");
+    assert.ok(fs.existsSync(`${index}.lock`), "nor is that lock touched");
+  } finally {
+    fs.rmSync(`${index}.lock`, { force: true });
+  }
+  const wtParent = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-wt-"));
+  const wt = path.join(wtParent, "side");
+  r.git("worktree", "add", "-q", "-b", "side", wt);
+  const wtIndex = execFileSync("git", ["-C", wt, "rev-parse", "--git-path", "index"], { encoding: "utf8" }).trim();
+  const wtBefore = fs.readFileSync(path.resolve(wt, wtIndex));
+  fs.writeFileSync(path.join(wt, "a.js"), "side\n");
+  const side = baseline(wt);
+  assert.ok(side?.ref && side.ref !== dirty.ref, "a linked worktree's own changes");
+  assert.match(runPosix(snapshotCommand(wt, { ref: pathInfo(wt).head }, side)), /^\+side$/m);
+  assert.ok(fs.readFileSync(path.resolve(wt, wtIndex)).equals(wtBefore), "its index never written either");
+  assert.deepEqual(fs.readdirSync(path.join(process.env.AGENT_REVIEW_BRIDGE_DIR, "tmp")), [], "no copy left behind");
+  r.git("worktree", "remove", "--force", wt);
+  fs.rmSync(r.d, { recursive: true, force: true });
+  fs.rmSync(wtParent, { recursive: true, force: true });
+  console.log("git 10 stash create on a copy of the index: the real one (a linked worktree's too) never written, another git's lock no obstacle, nothing left behind");
+}
+
+// before the first commit: staged files count as the turn's changes, and a
+// turn that makes the first commit says its diff includes what was staged before
+{
+  const r = repo({ commit: false });
+  r.write("x.js", "1\n");
+  const base = baseline(r.d);
+  r.write("s.js", "staged\n");
+  r.git("add", "s.js");
+  assert.match(turnSummary(r.d, base), /New staged files \(no commit yet\):\ns\.js/, "a turn that only staged a file isn't 'none'");
+  const before = baseline(r.d);
+  r.write("s.js", "staged, then edited\n");
+  assert.match(turnSummary(r.d, before), /Edited staged files \(no commit yet\):\ns\.js/);
+  const start = baseline(r.d);
+  r.git("add", ".");
+  r.git("commit", "-qm", "first");
+  const first = turnSummary(r.d, start);
+  assert.match(first, /This turn made the repository's first commit: the command shows that whole commit, including what was staged before the turn\./);
+  assert.match(first, /Staged before this turn \(so in that commit too\):\ns\.js/);
+  fs.rmSync(r.d, { recursive: true, force: true });
+  console.log("git 11 before the first commit: staged files are a turn's changes (new and edited); the first commit's turn says its diff includes what was staged before");
+}
+
+// a split index: the copy's shared part is read where it is, and neither the
+// index nor its shared part is written
+{
+  const r = repo();
+  r.git("config", "core.splitIndex", "true");
+  r.git("update-index", "--split-index");
+  const gitDir = path.join(r.d, ".git");
+  const files = () => Object.fromEntries(fs.readdirSync(gitDir).filter((f) => f === "index" || f.startsWith("sharedindex.")).map((f) => [f, fs.readFileSync(path.join(gitDir, f)).toString("base64")]));
+  const before = files();
+  assert.ok(Object.keys(before).some((f) => f.startsWith("sharedindex.")), "the index is split");
+  r.write("a.js", "2\n");
+  const snap = baseline(r.d);
+  assert.ok(snap?.ref, "a snapshot");
+  assert.match(runPosix(snapshotCommand(r.d, { ref: pathInfo(r.d).head }, snap)), /^\+2$/m);
+  assert.deepEqual(files(), before, "neither the index nor its shared part written");
+  assert.deepEqual(fs.readdirSync(path.join(process.env.AGENT_REVIEW_BRIDGE_DIR, "tmp")), [], "no copy left behind");
+  fs.rmSync(r.d, { recursive: true, force: true });
+  console.log("git 12 a split index: the snapshot reads it, writes neither part, leaves no copy");
+}
+
+// a file changed in the same second the index was written, with the same
+// size ("racily clean" in git's terms): still a change in the snapshot
+{
+  const r = repo();
+  const base = baseline(r.d);
+  r.write("a.js", "2\n"); // right after the commit, same size as "1\n"
+  // the snapshot a second or more later: a copy of the index with a time of
+  // its own would make git trust the file's unchanged-looking stat
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  const end = baseline(r.d);
+  assert.notEqual(end.ref, base.ref, "the change is in the snapshot");
+  assert.match(runPosix(snapshotCommand(r.d, base, end)), /^-1\n\+2$/m);
+  fs.rmSync(r.d, { recursive: true, force: true });
+  console.log("git 13 a change in the same second as the index, same size: in the snapshot");
+}
+
+// a tracked secret file changed in a turn: neither its name nor its content
+// in the snapshot's summary or in what its command shows
+{
+  const r = repo();
+  r.write("config/app_secret.yml", "token: OLD\n");
+  r.write(".env", "KEY=OLD\n");
+  r.git("add", "-f", ".");
+  r.git("commit", "-qm", "tracked secrets");
+  const base = baseline(r.d);
+  r.write("config/app_secret.yml", "token: TOPSECRET\n");
+  r.write(".env", "KEY=TOPSECRET\n");
+  r.write("a.js", "2\n");
+  const end = baseline(r.d);
+  const all = snapshotSummary(r.d, base, end) + runPosix(snapshotCommand(r.d, base, end));
+  assert.match(all, /a\.js/);
+  assert.doesNotMatch(all, /app_secret|\.env|TOPSECRET|OLD/);
+  fs.rmSync(r.d, { recursive: true, force: true });
+  console.log("git 14 tracked secret files changed in a turn: kept out of its summary and command");
 }

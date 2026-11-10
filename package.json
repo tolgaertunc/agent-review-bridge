@@ -2,7 +2,7 @@
   "name": "agent-review-bridge",
   "version": "0.1.0",
   "private": true,
-  "description": "Let Claude Code (Claude Desktop) and ChatGPT Desktop review each other: a chat in one app reviews the work of a chat in the other, once, at the moments that matter, or every turn.",
+  "description": "Let Claude Code (Claude Desktop) and ChatGPT Desktop review each other: a chat reviews the work of a chat in the other app (or another chat of the same app), once, at the moments that matter, or every turn.",
   "type": "module",
   "scripts": {
     "doctor": "node scripts/doctor.mjs",

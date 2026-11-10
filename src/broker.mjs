@@ -18,10 +18,11 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { dataDir, openUrl } from "./platform.mjs";
-import { autoKey, reviewerOf, standingReviewer } from "./auto.mjs";
+import { dataDir, openUrl, claudeSessionUrl, chatgptRunningAsync } from "./platform.mjs";
+import { autoKey, reviewerOf, standingReviewer, pairedIn } from "./auto.mjs";
 import { readConfig } from "./config.mjs";
 import { MAX_TEXT, REVIEWER_ROLE } from "./common.mjs";
+import { minimalTurnRequest } from "./request.mjs";
 
 export { MAX_TEXT, REVIEWER_ROLE };
 
@@ -35,7 +36,7 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.AGENT_REVIEW_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 21);
+export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 22);
 
 export const SIDES = ["claude", "openai"];
 // Claude Desktop's session ids, as claude://code/continue?session= accepts them
@@ -64,7 +65,8 @@ const PEER_BURST = { count: 60, windowMs: 10 * 60_000 };
 // deadline. Each read has its own time limit. (Tests scale it down.)
 const WATCH_SCALE = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_WATCH_SCALE) || 1;
 const WATCH = Object.fromEntries(
-  Object.entries({ first: 15_000, second: 60_000, every: 60_000, deadline: 6 * 3600_000, read: 15_000, stuck: 60_000, approval: 60_000, unheard: 10 * 60_000 }).map(([k, v]) => [
+  // (limits: how long ChatGPT's usage limits, once read, are taken as they were)
+  Object.entries({ first: 15_000, second: 60_000, every: 60_000, deadline: 6 * 3600_000, read: 15_000, stuck: 60_000, approval: 60_000, unheard: 10 * 60_000, limits: 30_000 }).map(([k, v]) => [
     k,
     Math.max(20, v * WATCH_SCALE),
   ]),
@@ -85,6 +87,9 @@ const turnWaits = () => Number(process.env.AGENT_REVIEW_BRIDGE_TEST_TURN_WAITS) 
 // (tests set a shorter unit)
 const retryUnit = () => Number(process.env.AGENT_REVIEW_BRIDGE_TEST_RETRY_MS) || WATCH.every;
 const backoff = (n) => Math.min(60, 2 ** Math.max(0, n - 1)) * retryUnit();
+// at most this many of a chat's turns wait for their review (set aside ones
+// included); the oldest waiting go first, their changes in the next review
+const MAX_WAITING = 10;
 // a failure that only means "not now"
 const UNAVAILABLE = /usage limit|usagelimit|rate.?limit|overload|capacity|too many requests|server.?error|unavailable|couldn't be handed|timed? ?out|network/i;
 
@@ -92,7 +97,7 @@ for (const d of [DATA_DIR, OUTBOX_DIR, LISTENERS_DIR, TURNS_DIR]) fs.mkdirSync(d
 
 const sameEndpoint = (a, b) => !!a && !!b && a.app === b.app && a.id === b.id;
 // an auto mode entry as tools show it: without the turns' own texts
-const autoView = ({ jobs, turn, facts, parked, ...e }) => ({ ...e, ...(e.everyTurn && { waiting: (jobs ?? []).length, ...(parked?.length && { setAside: parked.length }) }) });
+const autoView = ({ jobs, turn, facts, parked, told, ...e }) => ({ ...e, ...(e.everyTurn && { waiting: (jobs ?? []).length, ...(parked?.length && { setAside: parked.length }) }) });
 
 // a chat as the bridge names it to agents
 export const chatName = (e) => (e.app === "openai" ? `ChatGPT chat ${e.id}` : `Claude Code session ${e.id}`);
@@ -210,6 +215,11 @@ const FIX_DONE_NOTE = "Your reviewer approved the fix: the earlier [CHANGES REQU
 export const LATE_NOTE =
   "On an earlier turn, before your latest prompt. For information: act on it only if it still applies to what you are doing now.";
 
+// Heads one about a turn reviewed before auto mode stopped reviewing every
+// turn (switched to key moments)
+export const SWITCHED_NOTE =
+  "On a turn reviewed before auto mode stopped reviewing every turn. For information: act on it only if it still applies to what you are doing now; ask for reviews yourself from here on.";
+
 // ChatGPT may append its own memory citations to an answer; they aren't the
 // reviewer's words for the requester
 export const withoutCitations = (note) => (typeof note === "string" ? note.replace(/<oai-mem-citation>[\s\S]*?<\/oai-mem-citation>/g, "").trim() : note);
@@ -243,7 +253,8 @@ export function inlineText(m) {
     failed: `No answer is coming to ${m.about}: ${m.id}`,
     waiting: m.maybe ? `The answer to ${m.about} may wait for the user's approval: ${m.id}` : `The answer to ${m.about} waits for the user's approval: ${m.id}`,
   }[m.kind] ?? `Message ${m.id}`;
-  return [`${LABEL[m.from] ?? m.from.toUpperCase()}: ${title} (link ${m.linkId})`, m.text, `${AGENT_LINE} ${nextStep(m)}`].join("\n\n");
+  // a message through auto mode's pairing has no link
+  return [`${LABEL[m.from] ?? m.from.toUpperCase()}: ${title} (${m.linkId ? `link ${m.linkId}` : "auto mode"})`, m.text, `${AGENT_LINE} ${nextStep(m)}`].join("\n\n");
 }
 
 // What wakes a Claude session: the whole message too, plus where to read it
@@ -267,17 +278,22 @@ export function bridgePrompt(state, endpoint, prompt) {
   );
 }
 
-async function deliverToCodex(threadId, text, clientId) {
+// `wanted()`: still to be sent? Asked right before it is queued (a delivery
+// can take seconds to get there): a prompt called off meanwhile isn't sent.
+async function deliverToCodex(threadId, text, clientId, wanted) {
   if (process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX) {
     if (process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX === "fail") throw new Error("ChatGPT Desktop not reachable (test)");
     if (process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX === "slow") await new Promise((r) => setTimeout(r, 1500));
-    logEvent({ op: "fake-codex-deliver", threadId, text, clientId });
     let f = {};
     try {
       f = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "fake-codex.json"), "utf8"));
     } catch {
       // no fake settings
     }
+    // (deliverDelay: the app-server takes that long to come up)
+    if (f.deliverDelay) await new Promise((r) => setTimeout(r, f.deliverDelay));
+    if (wanted && !wanted()) throw new Error("not sent: called off before it was queued");
+    logEvent({ op: "fake-codex-deliver", threadId, text, clientId });
     if (f.deliverHang) await new Promise(() => {});
     if (f.deliverRejectAfter) {
       await new Promise((r) => setTimeout(r, f.deliverRejectAfter));
@@ -286,7 +302,7 @@ async function deliverToCodex(threadId, text, clientId) {
     return;
   }
   const { sendToThread } = await import("./codex.mjs");
-  await sendToThread(threadId, text, { clientId, deadlineMs: 60_000 });
+  await sendToThread(threadId, text, { clientId, deadlineMs: 60_000, wanted });
 }
 
 // The prompts whose fate the bridge follows: a review's request (its
@@ -371,15 +387,7 @@ class BrokerState {
       );
       changed = true;
     }
-    for (const m of this.s.messages) {
-      if (!advisorLeftover(this.s, m) || m.dropped) continue;
-      const reached = m.toEndpoint?.app === "openai" ? m.dispatch?.state === "sent" : !!m.readAt;
-      if (reached) continue;
-      if (m.toEndpoint?.app === "openai") m.dispatch = { ...m.dispatch, state: "dropped", at: now };
-      m.readAt ??= now;
-      m.dropped = "advisor mode removed";
-      changed = true;
-    }
+    for (const m of this.s.messages) if (advisorLeftover(this.s, m) && this.dropUndelivered(m, "advisor mode removed")) changed = true;
     // their status notes not yet shown (a delivery that failed, an advisor
     // not listening) no longer hold; the advisor's own notes still come
     const notes = this.s.notes.filter((n) => n.deliveredAt || !advisorNote(this.s, n));
@@ -389,6 +397,20 @@ class BrokerState {
     }
     if (changed) logEvent({ op: "advisor-retired" });
     return changed;
+  }
+
+  // A message not handed to its chat yet is never sent: one for a ChatGPT
+  // thread is taken out of delivery, one for a Claude session counts as read,
+  // so its listener never wakes it. One that reached its chat (handed to the
+  // thread, or read) can't be taken back. True if it was dropped.
+  dropUndelivered(m, why) {
+    const reached = m.toEndpoint?.app === "openai" ? m.dispatch?.state === "sent" : !!m.readAt;
+    if (reached || m.dropped) return false;
+    if (m.toEndpoint?.app === "openai") m.dispatch = { ...m.dispatch, state: "dropped", at: Date.now() };
+    m.readAt ??= Date.now();
+    m.dropped = why;
+    if (m.watch) m.watch.done = true;
+    return true;
   }
 
   // Bounded state: read messages and delivered notes go after a day, anything
@@ -414,6 +436,8 @@ class BrokerState {
 
   save() {
     this.prune();
+    // which version wrote it: an older one that knows this doesn't take it over
+    this.s.protocol = PROTOCOL;
     const tmp = STATE_FILE + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify(this.s, null, 2));
     fs.renameSync(tmp, STATE_FILE);
@@ -490,7 +514,8 @@ class BrokerState {
       // a late one from an earlier attempt can't undo what the thread confirmed
       const { attempt } = m.dispatch;
       const current = () => !this.retired && m.dispatch.attempt === attempt && m.dispatch.state === "sending";
-      deliverToCodex(m.toEndpoint.id, inlineText(m), m.dispatch.clientId).then(
+      // (called off meanwhile, as when auto mode is turned off: not queued at all)
+      deliverToCodex(m.toEndpoint.id, inlineText(m), m.dispatch.clientId, current).then(
         () => {
           if (!current()) return;
           m.dispatch = { ...m.dispatch, state: "sent", at: Date.now() };
@@ -569,7 +594,17 @@ class BrokerState {
     // once, as a note (it may only be busy with a long review)
     for (const m of this.s.messages) {
       const link = this.s.links[m.linkId];
-      if (!link?.everyTurn || !link.active || m.kind !== "review-request" || m.readAt || m.unheardTold || m.toEndpoint?.app !== "claude") continue;
+      if (!link?.everyTurn || !link.active || m.kind !== "review-request" || m.toEndpoint?.app !== "claude") continue;
+      // woken with it, then neither answered nor ended its turn (the user
+      // stopped that turn: no Stop runs) for as long as a ChatGPT reviewer
+      // gets: no answer is coming, it is sent again (the next turn's review
+      // waits for this one)
+      if (m.wokenAt && !m.answeredAt && !m.settledAt && now - m.wokenAt > WATCH.deadline) {
+        this.fail(m, `it was woken with it and gave no answer within ${Math.round(WATCH.deadline / 3600_000)} hours`);
+        changed = true;
+        continue;
+      }
+      if (m.readAt || m.unheardTold) continue;
       if (now - m.ts > WATCH.unheard && !listenerAlive(m.toEndpoint)) {
         m.unheardTold = now;
         const before = this.s.notes.length;
@@ -584,13 +619,20 @@ class BrokerState {
     for (const m of this.s.messages) {
       const w = m.watch;
       if (!w || w.done || !w.clientId) continue;
+      const reading = w.inFlight && now - w.inFlight < 2 * WATCH.read + 1000;
       if (this.settled(m)) {
         w.done = true;
         changed = true;
-      } else if (now - w.since > WATCH.deadline) {
-        this.fail(m, `no answer was confirmed within ${Math.round(WATCH.deadline / 3600_000)} hours`);
-        changed = true;
-      } else if (now >= w.next && !(w.inFlight && now - w.inFlight < 2 * WATCH.read + 1000)) {
+      } else if (now - Math.max(w.since, w.queuedAt ?? 0) > WATCH.deadline) {
+        // past the deadline, counted from when it was last seen still in the
+        // thread's queue: one more read decides, never the clock alone (a
+        // machine that slept, an owner that was down)
+        if (!reading) {
+          w.inFlight = now;
+          w.final = true;
+          this.readTurn(m);
+        }
+      } else if (now >= w.next && !reading) {
         w.inFlight = now;
         this.readTurn(m);
       }
@@ -612,6 +654,13 @@ class BrokerState {
     w.inFlight = null;
     w.checks++;
     w.next = Date.now() + (w.checks === 1 ? WATCH.second - WATCH.first : WATCH.every);
+    // the deadline's read: a request still waiting in the thread's queue goes
+    // on waiting (it is sent nowhere else); anything else not over by now
+    // gets no answer, unreadable included
+    const final = w.final;
+    w.final = false;
+    if (!error && r?.state === "queued") w.queuedAt = Date.now();
+    const pastDeadline = () => this.fail(m, `no answer was confirmed within ${Math.round(WATCH.deadline / 3600_000)} hours`);
     // a turn still running in the desktop app reads as "interrupted" from
     // another process; only a turn with an end time is over
     // a send whose outcome wasn't known: a trace of it confirms it, none
@@ -631,9 +680,12 @@ class BrokerState {
       } catch (e) {
         logEvent({ op: "approval-check", id: m.id, error: String(e.message || e) });
       }
-    if (error) logEvent({ op: "watch", id: m.id, error });
-    else if (!r.completedAt) {
-      // not over yet
+    if (error) {
+      logEvent({ op: "watch", id: m.id, error });
+      if (final) pastDeadline();
+    } else if (!r.completedAt) {
+      // not over yet: past the deadline, only a queued one waits on
+      if (final && r.state !== "queued") pastDeadline();
     } else if (r.state === "failed" || r.state === "interrupted") {
       const e = r.error;
       this.fail(m, `its turn ${r.state === "failed" ? "failed" : "was interrupted (someone may have stopped it in the app)"}${e?.message ? `: ${e.message}` : ""}${e?.codexErrorInfo && typeof e.codexErrorInfo === "string" ? ` (${e.codexErrorInfo})` : ""}`, {
@@ -701,8 +753,9 @@ class BrokerState {
       // unavailable for too long: set aside, kept, out of the way of later turns
       const parked = live && unavailable && tooLong;
       if (parked) (entry.parked ??= []).push(job);
+      if (again || parked) this.capWaiting(entry, to);
       delete link.turn; // the queued try has it now, or it isn't sent again
-      this.s.notes = this.s.notes.filter((n) => n.deliveredAt || n.key !== `${link.id}:waiting`);
+      this.dropWaitingNote(link.id);
       this.note(
         to,
         `${turnKey}:${again ? "again" : "left"}`,
@@ -717,8 +770,9 @@ class BrokerState {
       return;
     }
     // a plain message that got no reply, told to a chat in every-turn auto
-    // mode: a note too, not a wake
-    if (this.everyTurn(to)) {
+    // mode: a note too, not a wake (a review it asked for itself still wakes
+    // it, with how to ask again)
+    if (m.kind === "message" && this.everyTurn(to)) {
       this.note(to, `${m.id}:failed`, text);
       logEvent({ op: "failed", id: m.id, why, note: true });
       return;
@@ -742,7 +796,12 @@ class BrokerState {
   // with its next prompt (unless it is woken with a notice instead)
   health(m, ok, error, { note = true } = {}) {
     const link = this.s.links[m.linkId];
-    if (!link) return;
+    // a message through auto mode's pairing (no link): its sender is told
+    if (!link) {
+      if (!ok && note && m.channel)
+        this.note(m.fromEndpoint, `${m.id}:delivery`, `Couldn't hand message ${m.id} to the ChatGPT thread ${m.toEndpoint.id}: ${error}. Is ChatGPT Desktop installed and signed in?`);
+      return;
+    }
     link.health = { at: Date.now(), ok, ...(error && { error, message: m.id }) };
     if (ok || !note) return;
     const waiting = m.kind === "review-request" ? link.primary : link.advisor;
@@ -799,17 +858,26 @@ class BrokerState {
   }
 
   // ------------------------------------------------------------ auto mode
-  // Per chat: on/off, the reviewer it keeps using (a chat in the other app),
-  // and per path the content last approved and the commit to compare from. A
+  // Per chat: on/off, the reviewer it keeps using (a chat in either app), and
+  // per path the content last approved and the commit to compare from. A
   // path enters when auto mode is turned on (the chat's folder, as it is then)
   // or when a review names it.
 
-  op_auto_set({ endpoint, on, reviewer, model, effort, paths, everyTurn }) {
+  op_auto_set({ endpoint, on, reviewer, model, effort, paths, everyTurn, joinReviewer }) {
     if (!endpoint?.app || !endpoint?.id) throw new Error("this chat is unknown");
     const key = autoKey(endpoint);
     if (!on) {
-      // turns still waiting for their review go with it
+      // turns still waiting for their review go with it, and the reviews of
+      // its turns still open close: one not handed to the reviewer yet is
+      // never sent, and an answer to one that was is refused
       if (this.s.auto?.[key]) Object.assign(this.s.auto[key], { on: false, jobs: [], parked: [], turn: null });
+      for (const l of Object.values(this.s.links)) {
+        if (!l.active || !l.everyTurn || !sameEndpoint(l.primary, endpoint)) continue;
+        Object.assign(l, { active: false, closedAt: Date.now() });
+        delete l.turn;
+        delete l.request;
+        for (const m of this.s.messages) if (m.linkId === l.id && m.kind === "review-request") this.dropUndelivered(m, "auto mode turned off");
+      }
       return { on: false };
     }
     const prev = this.s.auto?.[key];
@@ -840,6 +908,9 @@ class BrokerState {
     }
     if (model !== undefined) entry.model = model;
     if (effort !== undefined) entry.effort = effort;
+    // its reviewer is the chat that joins with a code, in either app, instead
+    // of a ChatGPT chat the bridge makes (from Claude; from ChatGPT it always is)
+    if (joinReviewer !== undefined) entry.joinReviewer = !!joinReviewer;
     // paths named when turning it on start from their state at that moment
     for (const p of paths ?? []) entry.paths[p.path] ??= { approved: p.fp, base: p.head ?? null };
     this.s.auto = { ...(this.s.auto ?? {}), [key]: entry };
@@ -885,6 +956,7 @@ class BrokerState {
     if (!entry?.parked?.length) return;
     entry.jobs = [...entry.parked.map(({ waitUntil, ...j }) => ({ ...j, waits: 0 })), ...(entry.jobs ?? [])];
     entry.parked = [];
+    this.capWaiting(entry);
     setImmediate(() => this.runJobs());
   }
 
@@ -892,6 +964,15 @@ class BrokerState {
   everyTurn(endpoint) {
     const e = endpoint && this.s.auto?.[autoKey(endpoint)];
     return e?.on && e.everyTurn ? e : null;
+  }
+
+  // Why a chat's turn reviews wait (no reviewer, ChatGPT closed, its usage
+  // limit), told once per wait: again only after a review has gone out since,
+  // not with every prompt meanwhile
+  tellWaitOnce(entry, to, kind, text) {
+    if (entry.told?.[kind]) return;
+    (entry.told ??= {})[kind] = Date.now();
+    this.note(to, `auto:${autoKey(to)}:${kind}`, text);
   }
 
   // A note for a chat, with its next prompt and without waking it; one per
@@ -932,8 +1013,11 @@ class BrokerState {
       return null;
     }
     // a turn in which this chat answered a review was its work as a reviewer:
-    // not reviewed itself, so two chats reviewing each other can't go round
-    if (this.s.messages.some((m) => m.kind === "review-request" && sameEndpoint(m.toEndpoint, endpoint) && m.answeredAt >= since)) {
+    // not reviewed itself, so two chats reviewing each other can't go round.
+    // Not the fix turn of its own loop, though (woken with its own "changes
+    // requested" and the other chat's request together): that one is reviewed.
+    const fix = this.fixes(entry, at ?? Date.now(), entry.generation ?? 0);
+    if (!fix && this.s.messages.some((m) => m.kind === "review-request" && sameEndpoint(m.toEndpoint, endpoint) && m.answeredAt >= since)) {
       logEvent({ op: "turn_not_reviewed", endpoint, why: "answered a review" });
       return null;
     }
@@ -965,38 +1049,80 @@ class BrokerState {
     }
     (entry.jobs ??= []).push(job);
     logEvent({ op: "turn_queued", job: job.id, endpoint });
+    this.capWaiting(entry, endpoint);
     setImmediate(() => this.runJobs());
     return job;
   }
 
-  // Puts together and sends the turn reviews that wait, each chat's in
-  // order: after a turn ends and on every watch tick, so one held back (no
-  // reviewer yet, ChatGPT's usage limit) goes as soon as it can, without
-  // waiting for another turn. A job leaves the queue once its review is
-  // sent, once it turns out to need none, or once it can't be put together
-  // (said so).
-  async runJobs() {
-    if (this.jobsBusy || this.retired) return;
-    this.jobsBusy = true;
+  // At most MAX_WAITING of a chat's turns wait (set aside ones included),
+  // wherever one is put in line (a new turn, a retry, one set aside or taken
+  // back): the oldest waiting go, set aside ones first, never the first in
+  // line (it may be being sent); said once
+  capWaiting(entry, endpoint = entry.jobs?.[0]?.endpoint ?? entry.parked?.[0]?.endpoint) {
+    const over = (entry.jobs?.length ?? 0) + (entry.parked?.length ?? 0) - MAX_WAITING;
+    if (over <= 0) return;
+    const gone = [...(entry.parked ?? []).splice(0, over)];
+    gone.push(...(entry.jobs ?? []).splice(1, over - gone.length));
+    if (endpoint)
+      this.note(
+        endpoint,
+        `auto:${autoKey(endpoint)}:dropped`,
+        `More than ${MAX_WAITING} of your turns were waiting for their review, so the oldest waiting ones won't be reviewed on their own; the next review of the same folder covers their changes.`,
+      );
+    logEvent({ op: "turns_dropped", endpoint, jobs: gone.map((j) => j.id) });
+  }
+
+  // Puts together and sends the turn reviews that wait: each chat's in order,
+  // chats side by side (one slow chat doesn't hold up the others). After a
+  // turn ends, after an answer and on every watch tick, so one held back (no
+  // reviewer yet, ChatGPT's usage limit, ChatGPT closed, a review still out)
+  // goes as soon as it can, without waiting for another turn. A job leaves
+  // the queue once its review is sent, once it turns out to need none, or
+  // once it can't be sent at all (said so).
+  runJobs() {
+    if (this.retired) return;
+    this.jobsBusy ??= new Set();
+    for (const [key, entry] of Object.entries(this.s.auto ?? {})) {
+      if (!entry?.on || !entry.everyTurn || !entry.jobs?.length || this.jobsBusy.has(key)) continue;
+      this.jobsBusy.add(key);
+      this.runChat(key, entry).finally(() => this.jobsBusy.delete(key));
+    }
+  }
+
+  async runChat(key, entry) {
     const notes = this.s.notes.length;
     try {
-      for (const [key, entry] of Object.entries(this.s.auto ?? {})) {
-        while (!this.retired && entry.on && entry.everyTurn && entry.jobs?.length) {
-          const job = entry.jobs[0];
-          const done = await this.runJob(key, entry, job);
-          if (this.retired || entry.jobs?.[0] !== job || !done) break;
-          entry.jobs.shift();
-          this.save();
-          this.dispatch(); // a review for a ChatGPT reviewer goes now, not with the next op
-        }
+      while (!this.retired && entry.on && entry.everyTurn && entry.jobs?.length) {
+        const job = entry.jobs[0];
+        const done = await this.runJob(key, entry, job);
+        if (this.retired || entry.jobs?.[0] !== job || !done) break;
+        entry.jobs.shift();
+        this.save();
+        this.dispatch(); // a review for a ChatGPT reviewer goes now, not with the next op
       }
       // what a held-back job told its chat is on disk for the hooks
       if (!this.retired && this.s.notes.length !== notes) this.save();
     } catch (e) {
-      logEvent({ op: "turn_jobs", error: String(e.message || e) });
-    } finally {
-      this.jobsBusy = false;
+      logEvent({ op: "turn_jobs", key, error: String(e.message || e) });
     }
+  }
+
+  // ChatGPT's usage limits, read once for all chats a while (each read
+  // starts an app-server); null when they can't be read
+  chatgptLimits() {
+    if (!this.limitsRead || Date.now() - this.limitsRead.at > WATCH.limits)
+      this.limitsRead = {
+        at: Date.now(),
+        p: import("./codex.mjs").then(({ readLimits }) => readLimits()).catch(() => null),
+      };
+    return this.limitsRead.p;
+  }
+
+  // Is ChatGPT Desktop running? Checked at most every few seconds (a check
+  // spawns a process; on Windows a slow one); null when it can't be told
+  chatgptOpen() {
+    if (!this.openRead || Date.now() - this.openRead.at > Math.min(15_000, WATCH.limits)) this.openRead = { at: Date.now(), p: chatgptRunningAsync().catch(() => null) };
+    return this.openRead.p;
   }
 
   // From the Stop hook, after its turn_end: the snapshot of the turn's end and
@@ -1031,36 +1157,63 @@ class BrokerState {
     }
     const reviewer = reviewerOf(entry);
     if (!reviewer) {
-      this.note(
+      // how to get one: the code still waiting for it, else a new one
+      const code = Object.values(this.s.links).find((l) => l.active && l.autoReviewer && !l.advisor && l.joinCode && sameEndpoint(l.primary, to) && l.autoSince === since)?.joinCode;
+      this.tellWaitOnce(
+        entry,
         to,
-        `auto:${key}:no-reviewer`,
-        "Auto mode reviews every turn, but it has no reviewer yet, so the reviews of your turns wait for one" +
-          (to.app === "openai" ? ": the Claude Code chat that joins with auto mode's code becomes it." : "."),
+        code ? `no-reviewer:${code}` : "no-reviewer",
+        "Auto mode reviews every turn, but it has no reviewer yet, so the reviews of your turns wait for one: " +
+          (code
+            ? `the chat that joins with code ${code} becomes it (the user pastes "join the agent-review-bridge link with code ${code}" there).`
+            : "call bridge_auto with on and every_turn again; it makes a new reviewer chat, or gives a join code for one."),
       );
       return false;
     }
     if (job.waitUntil && Date.now() < job.waitUntil) return false;
     if (job.factsDue && Date.now() < job.factsDue) return false;
-    if (reviewer.app === "openai") {
-      let limits = null;
-      try {
-        const { readLimits } = await import("./codex.mjs");
-        limits = await readLimits();
-      } catch {
-        // unknown limits don't hold it back
+    // ChatGPT closed: delivering would open it, so the review waits unless
+    // the user said to open closed apps (a Claude reviewer that isn't
+    // listening isn't opened either: it gets the request once it's open)
+    if (reviewer.app === "openai" && readConfig().openClosedApps !== "always" && (await this.chatgptOpen()) === false) {
+      if (!this.liveJob(key, entry, job, since, reviewer)) return false;
+      this.tellWaitOnce(entry, to, "closed", "The reviews of your turns wait: ChatGPT Desktop is closed. They are sent once it's open (or tell the bridge to always open closed apps).");
+      return false;
+    }
+    // one review of this chat's turns out to its reviewer at a time: the next
+    // waits for its answer, so that reviewer's queue never holds more than one
+    // of them (one still out to a reviewer it no longer has doesn't count).
+    // Held a while: said once per review (a Claude reviewer that hasn't read
+    // it yet isn't listening: that has a note of its own; one that read it
+    // and stopped is told here)
+    const out = Object.values(this.s.links).find((l) => l.active && l.everyTurn && !l.bind && sameEndpoint(l.primary, to) && sameEndpoint(l.advisor, reviewer));
+    if (out) {
+      const asked = this.s.messages.find((m) => m.linkId === out.id && m.kind === "review-request");
+      if (!out.heldTold && Date.now() - out.createdAt > WATCH.unheard && (reviewer.app !== "claude" || asked?.readAt)) {
+        out.heldTold = Date.now();
+        this.note(
+          to,
+          `auto:${key}:held:${out.id}`,
+          `The reviews of your turns wait: your reviewer hasn't answered review ${out.id} yet (sent ${new Date(out.createdAt).toLocaleString()}), and they go to it one at a time.`,
+        );
       }
+      return false;
+    }
+    if (reviewer.app === "openai") {
+      // unknown limits don't hold it back
+      const limits = await this.chatgptLimits();
       if (!this.liveJob(key, entry, job, since, reviewer)) return false;
       if (limits?.blocked) {
         job.waitUntil = limits.resetsAt ?? Date.now() + 5 * WATCH.every;
         const until = limits.resetsAt ? ` until ${new Date(limits.resetsAt).toLocaleString()}` : "";
-        this.note(to, `auto:${key}:limit`, `The reviews of your turns wait: ChatGPT's usage limit is reached${until}. They are sent once it opens again.`);
+        this.tellWaitOnce(entry, to, "limit", `The reviews of your turns wait: ChatGPT's usage limit is reached${until}. They are sent once it opens again.`);
         this.save();
         return false;
       }
     } else if (!listenerAlive(reviewer) && readConfig().openClosedApps === "always" && this.s.hosts?.[reviewer.id] && !process.env.AGENT_REVIEW_BRIDGE_FAKE_OPEN) {
       // the user said to open closed apps: Claude Desktop opens the session
       try {
-        openUrl(`claude://code/continue?session=${this.s.hosts[reviewer.id]}`);
+        openUrl(claudeSessionUrl(this.s.hosts[reviewer.id]));
       } catch {
         // it gets the request when it is opened
       }
@@ -1069,10 +1222,11 @@ class BrokerState {
     // that one was already continued, by hand: then this one starts afresh);
     // a review sent again after its reviewer couldn't answer keeps its round
     const failed = job.retry ? this.s.links[job.retry] : null;
-    const answered = !failed && entry.chain && entry.chain.generation === job.generation ? this.s.links[entry.chain.linkId] : null;
+    // (only a turn that ended after the "changes requested" reached the chat)
+    const answered = !failed && this.fixes(entry, job.endAt ?? job.at, job.generation) ? this.s.links[entry.chain.linkId] : null;
     const prev = answered && !answered.continuedBy ? answered : null;
     const round = failed ? (failed.round ?? 1) : prev ? (prev.round ?? 1) + 1 : 1;
-    const built = await buildTurn({
+    const turn = {
       chat: chatName(to),
       turnId: job.turnId,
       prompt: job.prompt,
@@ -1088,19 +1242,34 @@ class BrokerState {
       base: job.base,
       snap: job.snap,
       tracked: entry.paths ?? {},
-    });
+    };
+    let built = await buildTurn(turn);
     if (stoppedHere()) return true;
     if (!this.liveJob(key, entry, job, since, reviewer)) return false;
+    // the fix turn's job is done with here, whatever comes of it: its loop is
+    // continued once, and a later turn isn't headed as this fix
+    if (prev && entry.chain?.linkId === prev.id) entry.chain = null;
     if (built.error) {
-      this.note(to, `auto:${key}:build:${job.id}`, `The review of one of your turns couldn't be put together (${built.error}), so it wasn't sent. The next review of the same folder covers its changes.`);
-      logEvent({ op: "turn_build_failed", job: job.id, error: built.error });
-      return true;
+      // it couldn't be put together (an error, a timeout, too big): the turn
+      // still goes, without its changes, unless even that doesn't fit
+      const minimal = minimalTurnRequest({ ...turn, folder: job.cwd, why: built.error });
+      if (minimal.error) {
+        const which = job.turnId ? `turn ${job.turnId}` : `the turn that ended at ${new Date(job.endAt ?? job.at).toLocaleString()}`;
+        this.note(
+          to,
+          `auto:${key}:unsent:${job.id}`,
+          `The review of ${which} couldn't be sent: ${built.error}, and even without its changes it doesn't fit one message. Ask for that review yourself, in parts (bridge_review with fewer paths).`,
+        );
+        logEvent({ op: "turn_unsent", job: job.id, error: built.error });
+        return true;
+      }
+      logEvent({ op: "turn_build_failed", job: job.id, error: built.error, minimal: true });
+      built = minimal;
     }
     if (!failed && this.coveredByOwn(job)) {
       logEvent({ op: "turn_covered", job: job.id });
       return true;
     }
-    if (prev && entry.chain?.linkId === prev.id) entry.chain = null; // continued once
     const id = "L" + ++this.s.linkSeq;
     const link = {
       id,
@@ -1127,6 +1296,7 @@ class BrokerState {
     this.s.links[id] = link;
     this.registerPaths(to, built.reqPaths);
     logEvent({ op: "turn_review", id, job: job.id, round });
+    delete entry.told; // a review went out: a later wait is told afresh
     this.sendReviewRequest(link);
     return true;
   }
@@ -1171,19 +1341,27 @@ class BrokerState {
     Object.assign(link, { active: false, closedAt: Date.now(), decision });
     delete link.turn; // answered: it won't be sent again
     // a note that the answer waited for an approval: not after the answer
-    this.s.notes = this.s.notes.filter((n) => n.deliveredAt || n.key !== `${link.id}:waiting`);
+    this.dropWaitingNote(link.id);
+    // the next turn's review can go now (one is out at a time)
+    setImmediate(() => this.runJobs());
     // the request that only bound the reviewer: its answer is only that
     if (link.bind) return { delivered: "none", text };
     if (decision === "approved") this.approvePaths(link);
     const entry = this.s.auto?.[autoKey(link.primary)];
     const key = autoKey(link.primary);
-    if (!entry?.on || !entry.everyTurn || link.autoSince !== entry.since) return { delivered: "none", text };
+    // an approval without nits is one line, so every turn's outcome is seen
+    const plain = decision === "approved" && !nits.length;
+    const said = (full, when = "") => (plain ? `Your reviewer approved the turn in review ${link.id}${when}.` : full);
+    // auto mode no longer reviews every turn (switched to key moments; turned
+    // off, its reviews were closed): the answer still comes, with the next
+    // prompt, nothing dropped
+    if (!entry?.on || !entry.everyTurn || link.autoSince !== entry.since) {
+      this.note(link.primary, `auto:${key}:answer:${link.id}`, said(`${SWITCHED_NOTE}\n\n${text}`, ", from before auto mode stopped reviewing every turn"), "review");
+      return { delivered: "next prompt", text };
+    }
     // auto mode's reviewer answers again: turns set aside while it was away
     // go now (not for an answer from a reviewer it no longer has)
     if (sameEndpoint(link.advisor, reviewerOf(entry))) this.unpark(entry);
-    // an approval without nits is one line, so every turn's outcome is seen
-    const plain = decision === "approved" && !nits.length;
-    const said = (full, earlier = false) => (plain ? `Your reviewer approved the turn in review ${link.id}${earlier ? ", from before your latest prompt" : ""}.` : full);
     // the loop stopped at its cap: answers still coming in about this
     // generation's turns neither wake the chat nor start the loop again
     const generation = entry.generation ?? 0;
@@ -1197,7 +1375,7 @@ class BrokerState {
     const fixApproved = decision === "approved" && !!link.roundOf && this.s.links[link.roundOf]?.decision === "changes_requested";
     const endsLoop = fixApproved && !!entry.lastRejected && link.roundOf === entry.lastRejected;
     if ((link.generation ?? 0) !== generation) {
-      const late = fixApproved ? `${LATE_NOTE}\n\n${FIX_DONE_NOTE}\n\n${text}` : said(`${LATE_NOTE}\n\n${text}`, true);
+      const late = fixApproved ? `${LATE_NOTE}\n\n${FIX_DONE_NOTE}\n\n${text}` : said(`${LATE_NOTE}\n\n${text}`, ", from before your latest prompt");
       this.note(link.primary, `auto:${key}:answer:${link.id}`, late, "review");
       return { delivered: "next prompt", stale: true, text };
     }
@@ -1212,8 +1390,25 @@ class BrokerState {
       const stop = `${entry.rounds} rounds in a row without approval.\n\n${text}`;
       return { delivered: "now", text, stopped: true, ...this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "stop", linkId: link.id, text: stop }) };
     }
-    Object.assign(entry, { chain: { linkId: link.id, generation: link.generation }, lastRejected: link.id });
-    return { delivered: "now", text, ...this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "review-result", linkId: link.id, text, decision, everyTurn: true }) };
+    const result = this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "review-result", linkId: link.id, text, decision, everyTurn: true });
+    // the loop waits for the turn that answers it: one that ends after this
+    // result reached the chat (see fixes)
+    Object.assign(entry, { chain: { linkId: link.id, generation: link.generation, msg: result.id, at: Date.now() }, lastRejected: link.id });
+    return { delivered: "now", text, ...result };
+  }
+
+  // Is a turn of this generation that ended at `endAt` the fix of its loop:
+  // it ended after the "changes requested" reached the chat (a Claude session
+  // woken with it, a ChatGPT chat running it as its prompt). A turn that
+  // ended before isn't (it waited in the queue while that review was out, or
+  // the chat was busy reviewing for another), nor is any while it hasn't
+  // reached the chat. (A result no longer kept: from when it was sent.)
+  fixes(entry, endAt, generation) {
+    const c = entry.chain;
+    if (!c || c.generation !== generation) return false;
+    const result = c.msg && this.s.messages.find((x) => x.id === c.msg);
+    const reached = result ? (result.wokenAt ?? result.promptMatched ?? null) : (c.at ?? 0);
+    return reached != null && endAt > reached;
   }
 
   // which auto mode session a review belongs to, if any
@@ -1261,8 +1456,12 @@ class BrokerState {
   // One review: one request, one answer, then the link closes (a later round
   // is a link of its own). The reviewer (`advisor`) is bound now (a chat the
   // bridge knows or created) or later via code.
-  op_link_create({ primary, advisor, name, request, plan, noGate, reqPaths, autoReviewer, everyTurn }) {
+  op_link_create({ primary, advisor, name, request, plan, noGate, reqPaths, autoReviewer, everyTurn, mode }) {
     if (!primary?.app || !primary?.id) throw new Error("primary endpoint unknown (caller identity missing)");
+    // the shapes of advisor mode (bridge_link: a mode, no request), refused
+    // rather than taken for a review with nothing to send
+    if (mode !== undefined && mode !== "review") throw new Error(`there is no "${mode}" link any more (advisor mode was removed): restart this app to load the update`);
+    if (typeof request !== "string" || !request.trim()) throw new Error("a review needs its request");
     const id = "L" + ++this.s.linkSeq;
     const link = { id, mode: "review", name: name ?? null, active: true, createdAt: Date.now(), primary, advisor: advisor ?? null, advisories: [], round: 1 };
     if (!advisor) link.joinCode = crypto.randomBytes(3).toString("hex");
@@ -1289,10 +1488,9 @@ class BrokerState {
   op_link_join({ code, endpoint }) {
     const link = Object.values(this.s.links).find((l) => l.active && l.joinCode && l.joinCode === code);
     if (!link) throw new Error("no open link with that join code");
+    // any chat but the requester itself, in either app (auto mode's reviewer
+    // too: a second Claude Code chat can review a Claude Code chat)
     if (sameEndpoint(link.primary, endpoint)) throw new Error("a chat can't review itself");
-    // auto mode's reviewer works in the other app; the code stays valid for it
-    if (link.autoReviewer && endpoint.app === link.primary.app)
-      throw new Error(`this code is for auto mode's reviewer, a chat in the other app: paste it into a ${link.primary.app === "openai" ? "Claude Code" : "ChatGPT"} chat`);
     link.advisor = endpoint;
     delete link.joinCode;
     // the requester's auto mode keeps this chat as its reviewer: only for the
@@ -1429,14 +1627,16 @@ class BrokerState {
   // Fallback, so the fix-loop cap holds even if an app update changes the
   // text a little (line endings, spacing, a cut): the delivery's own first
   // line and the fixed agent-message line.
-  fromBridge(endpoint, prompt) {
+  // (`at`: when the prompt hook ran, kept as when the chat had it: the
+  // owner may take in that hook's record later, with the turn's Stop)
+  fromBridge(endpoint, prompt, at) {
     const text = prompt.trim();
     const pending = this.s.messages.filter((m) => m.dispatch && !m.promptMatched && sameEndpoint(m.toEndpoint, endpoint));
     const norm = (s) => s.replace(/\s+/g, " ").trim();
     const m =
       pending.find((m) => inlineText(m).trim() === text) ??
       pending.find((m) => norm(text).startsWith(norm(inlineText(m).split("\n")[0])) && text.includes(AGENT_LINE));
-    if (m) m.promptMatched = Date.now();
+    if (m) m.promptMatched = at ?? Date.now();
     return !!m;
   }
 
@@ -1457,7 +1657,7 @@ class BrokerState {
     const entry = this.everyTurn(endpoint);
     if (!entry || typeof prompt !== "string") return { skipped: "off" };
     const notice = HOST_NOTICE.test(prompt);
-    const bridged = !notice && this.fromBridge(endpoint, prompt);
+    const bridged = !notice && this.fromBridge(endpoint, prompt, at);
     // the hook knows the Stop check's own words (user: false); the bridge's
     // deliveries and the app's notices are told here
     const sameTurn = this.everyTurnPrompt(entry, { turnId, prompt, own: notice || bridged || user === false, at });
@@ -1530,7 +1730,15 @@ class BrokerState {
 
   op_turn_ok({ endpoint, at }) {
     if (!endpoint?.id || !at) return { skipped: true };
-    for (const m of this.s.messages) if (sameEndpoint(m.toEndpoint, endpoint) && m.wokenAt && m.wokenAt <= at && !m.settledAt) m.settledAt = at;
+    for (const m of this.s.messages) {
+      if (!sameEndpoint(m.toEndpoint, endpoint) || !m.wokenAt || m.wokenAt > at || m.settledAt) continue;
+      m.settledAt = at;
+      // a Claude reviewer's turn that ended without answering the review of
+      // a turn: no answer is coming from it, as when a ChatGPT reviewer's turn
+      // completes without one; it is sent again (the next turn's review waits
+      // for this one's answer, so it mustn't stay open for good)
+      if (m.kind === "review-request" && !m.answeredAt && this.s.links[m.linkId]?.everyTurn) this.fail(m, "the reviewer's turn ended without an answer");
+    }
     const ep = this.endpointState(endpoint);
     ep.lastOkAt = Math.max(ep.lastOkAt ?? 0, at);
     if (ep.lastFailure && ep.lastFailure.at < at) delete ep.lastFailure;
@@ -1557,25 +1765,38 @@ class BrokerState {
     const asked = what && String(what).replace(/^Claude needs your permission to use /, "").slice(0, 200);
     const tool = asked ? ` (${asked})` : "";
     for (const m of this.s.messages) {
-      const link = this.s.links[m.linkId];
       if (!watched(m) || !sameEndpoint(m.toEndpoint, endpoint)) continue;
       if (!m.wokenAt || m.wokenAt > at || m.settledAt || m.approvalToldAt || this.settled(m)) continue;
-      if (!link?.active) continue; // closed: no answer can come back on it
+      if (!this.openFor(m)) continue; // closed: no answer can come back on it
       const to = m.kind === "review-request" ? this.s.links[m.linkId]?.primary : m.fromEndpoint;
       if (!to) continue;
       m.approvalToldAt = at;
-      const text = `The Claude Code session ${endpoint.id} is waiting for the user to approve a tool in Claude Desktop${tool}. Its answer to ${m.id} comes after that.`;
-      if (link.everyTurn) this.note(to, `${m.linkId}:waiting`, text);
-      else this.post({ from: "bridge", toEndpoint: to, kind: "waiting", linkId: m.linkId, text, about: m.id });
+      this.tellWaiting(m, to, `The Claude Code session ${endpoint.id} is waiting for the user to approve a tool in Claude Desktop${tool}. Its answer to ${m.id} comes after that.`);
       logEvent({ op: "waiting", id: m.id });
     }
     return { ok: true };
+  }
+
+  // Whoever waits on m is told it waits for an approval: with the next
+  // prompt for auto mode's review of a turn (a wake would start a turn that
+  // is reviewed again), else by a notice that wakes it
+  // (a plain message to a chat in every-turn mode: a note too, as fail() does)
+  tellWaiting(m, to, text, extra = {}) {
+    if (this.s.links[m.linkId]?.everyTurn) this.note(to, `${m.linkId}:waiting`, text);
+    else if (m.kind === "message" && this.everyTurn(to)) this.note(to, `${m.id}:waiting`, text);
+    else this.post({ from: "bridge", toEndpoint: to, kind: "waiting", linkId: m.linkId, text, about: m.id, ...extra });
+  }
+
+  // that notice no longer holds: the answer is here, or the review failed
+  dropWaitingNote(linkId) {
+    this.s.notes = this.s.notes.filter((n) => n.deliveredAt || n.key !== `${linkId}:waiting`);
   }
 
   // The answer to `id` is here: a notice that it waits for an approval, not
   // delivered yet, would only contradict it
   answered(id) {
     for (const w of this.s.messages) if (w.kind === "waiting" && w.about === id && !w.readAt) w.readAt = Date.now();
+    this.dropWaitingNote(id); // the note form, for a plain message (keyed by its id)
   }
 
   // A ChatGPT reviewer asked to run a command outside its sandbox and has no
@@ -1583,9 +1804,8 @@ class BrokerState {
   // once, as a possibility: its rollout records the request, never the decision.
   async checkApproval(m) {
     if (m.to !== "openai" || m.approvalToldAt || this.settled(m)) return;
-    const link = this.s.links[m.linkId];
-    const to = m.kind === "review-request" ? link?.primary : m.fromEndpoint;
-    if (!to || !link?.active) return;
+    const to = m.kind === "review-request" ? this.s.links[m.linkId]?.primary : m.fromEndpoint;
+    if (!to || !this.openFor(m)) return;
     const w = m.watch;
     const { rolloutOf, pendingEscalation } = await import("./codex.mjs");
     // looked for on every check until found (it may not exist yet)
@@ -1596,8 +1816,7 @@ class BrokerState {
     m.approvalToldAt = Date.now();
     const why = p.justification ? ` (${p.justification})` : "";
     const text = `The ChatGPT chat ${m.toEndpoint.id} asked to run a command outside its sandbox more than a minute ago and has no result yet${why}: it may be waiting for the user's approval in ChatGPT Desktop, or the command may still be running. Its answer to ${m.id} comes after that.`;
-    if (link.everyTurn) this.note(to, `${m.linkId}:waiting`, text);
-    else this.post({ from: "bridge", toEndpoint: to, kind: "waiting", linkId: m.linkId, text, about: m.id, maybe: true });
+    this.tellWaiting(m, to, text, { maybe: true });
     logEvent({ op: "waiting", id: m.id, maybe: true });
   }
 
@@ -1613,28 +1832,68 @@ class BrokerState {
     return { id: msg.id };
   }
 
+  // The reviewer this chat's auto mode keeps, while it is on
+  autoReviewerOf(endpoint) {
+    const e = endpoint && this.s.auto?.[autoKey(endpoint)];
+    return e?.on ? reviewerOf(e) : null;
+  }
+
+  // The chats whose auto mode, on, keeps this chat as its reviewer
+  reviewedBy(endpoint) {
+    return Object.entries(this.s.auto ?? {})
+      .filter(([, e]) => e?.on && sameEndpoint(reviewerOf(e), endpoint))
+      .map(([key]) => ({ app: key.slice(0, key.indexOf(":")), id: key.slice(key.indexOf(":") + 1) }));
+  }
+
+  // Two chats auto mode pairs (see pairedIn)
+  paired(a, b) {
+    return pairedIn(this.s, a, b);
+  }
+
+  // Can m still be answered: its link is open, or, a message between two
+  // chats auto mode pairs (through the pairing, or on a review since
+  // closed), the two are still paired
+  openFor(m) {
+    if (this.s.links[m.linkId]?.active) return true;
+    return m.kind === "message" && this.paired(m.fromEndpoint, m.toEndpoint);
+  }
+
   // Who bridge_send reaches: the chat on the other end of this chat's most
   // recent active link, or of the link named (the one checked before sending).
-  // A reply (replyTo) goes to the sender of that message, on its own link.
-  sendTarget(endpoint, linkId, replyTo) {
+  // With no open review, auto mode's pairing: the chat's own reviewer, else
+  // the one chat whose auto mode it reviews. A reply (replyTo) goes to the
+  // sender of that message, on its own link, or through the pairing once that
+  // link closed.
+  // (`channel`: the pairing was the target checked before sending, so a link
+  // opened meanwhile doesn't take its place)
+  sendTarget(endpoint, linkId, replyTo, channel = false) {
     const mine = (l) => l.active && l.advisor && (sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint));
     if (replyTo) {
       const orig = this.s.messages.find((m) => m.id === replyTo && sameEndpoint(m.toEndpoint, endpoint));
       if (!orig) throw new Error(`no message ${replyTo} for this chat to reply to`);
       const link = this.s.links[orig.linkId];
-      if (!(link && mine(link))) throw new Error(`${replyTo} belongs to a link that is no longer open`);
-      if (linkId && linkId !== link.id) throw new Error(`${replyTo} belongs to ${link.id}, not ${linkId}; try again`);
-      return { link, to: orig.fromEndpoint ?? (sameEndpoint(link.primary, endpoint) ? link.advisor : link.primary) };
+      const to = orig.fromEndpoint ?? (link && (sameEndpoint(link.primary, endpoint) ? link.advisor : link.primary));
+      if (link && mine(link)) {
+        if (linkId && linkId !== link.id) throw new Error(`${replyTo} belongs to ${link.id}, not ${linkId}; try again`);
+        return { link, to };
+      }
+      if (!linkId && this.paired(endpoint, to)) return { link: null, to };
+      throw new Error(`${replyTo} belongs to a link that is no longer open`);
     }
-    const link = linkId ? this.s.links[linkId] : Object.values(this.s.links).filter(mine).at(-1);
+    const link = channel ? null : linkId ? this.s.links[linkId] : Object.values(this.s.links).filter(mine).at(-1);
     if (linkId && !(link && mine(link))) throw new Error(`link ${linkId} is no longer open for this chat; try again`);
-    if (!link) throw new Error("this chat has no active link: a message goes to the other chat of an open review (bridge_review), until it's answered");
-    return { link, to: sameEndpoint(link.primary, endpoint) ? link.advisor : link.primary };
+    if (link) return { link, to: sameEndpoint(link.primary, endpoint) ? link.advisor : link.primary };
+    const own = this.autoReviewerOf(endpoint);
+    if (own) return { link: null, to: own };
+    const reviewed = this.reviewedBy(endpoint);
+    if (reviewed.length === 1) return { link: null, to: reviewed[0] };
+    if (reviewed.length > 1) throw new Error("this chat reviews for several chats in auto mode: answer one of their messages with reply_to");
+    throw new Error("this chat has no active link: a message goes to the other chat of an open review (bridge_review), until it's answered, or to auto mode's reviewer and back");
   }
 
   op_send_target({ endpoint, replyTo }) {
     const { link, to } = this.sendTarget(endpoint, undefined, replyTo);
-    return { to, linkId: link.id };
+    return { to, linkId: link?.id ?? null };
   }
 
   // A chat the bridge itself created to review: it stays one after
@@ -1670,22 +1929,26 @@ class BrokerState {
   }
 
   // Free-form message (bridge_send) to the chat on the other end of this
-  // chat's most recent active link, so it is delivered and wakes it like any
-  // other link message. A reply (replyTo) goes to whoever sent that message,
-  // on its link, so a chat in several links can't answer the wrong one.
-  // Guarded against two agents chatting in a loop.
-  op_send({ endpoint, text, linkId, replyTo }) {
+  // chat's most recent active link, or of its auto mode pairing (see
+  // sendTarget), so it is delivered and wakes it like any other message. A
+  // reply (replyTo) goes to whoever sent that message, so a chat in several
+  // links can't answer the wrong one. Guarded against two agents chatting in
+  // a loop.
+  op_send({ endpoint, text, linkId, replyTo, channel, to: checked }) {
     if (typeof text !== "string" || !text.trim()) throw new Error("empty message");
     if (text.length > MAX_TEXT) throw new Error(`message too long (${text.length} > ${MAX_TEXT})`);
-    const { link, to } = this.sendTarget(endpoint, linkId, replyTo);
+    const { link, to } = this.sendTarget(endpoint, linkId, replyTo, !!channel);
+    // through the pairing: to the chat checked before sending, or to none
+    if (!link && checked && !sameEndpoint(to, checked)) throw new Error("auto mode's pairing changed while this message was being sent, so nothing was sent; try again");
     const recent = this.s.messages.filter((m) => m.kind === "message" && sameEndpoint(m.fromEndpoint, endpoint) && Date.now() - m.ts < PEER_BURST.windowMs).length;
     if (recent >= PEER_BURST.count) throw new Error(`more than ${PEER_BURST.count} messages in 10 minutes; looks like a loop, wait a bit`);
-    const r = this.post({ from: endpoint.app, toEndpoint: to, kind: "message", linkId: link.id, text });
-    Object.assign(this.s.messages.at(-1), { fromEndpoint: endpoint }, replyTo && { replyTo });
+    const r = this.post({ from: endpoint.app, toEndpoint: to, kind: "message", linkId: link?.id ?? null, text });
+    // no link: it goes through auto mode's pairing (channel)
+    Object.assign(this.s.messages.at(-1), { fromEndpoint: endpoint }, replyTo && { replyTo }, !link && { channel: true });
     if (replyTo) this.answered(replyTo);
     // the chat it goes to was last seen failing: say so
     const failure = this.s.endpoints?.[autoKey(to)]?.lastFailure;
-    return { ...r, to, linkId: link.id, ...(failure && { lastFailure: failure }) };
+    return { ...r, to, linkId: link?.id ?? null, ...(failure && { lastFailure: failure }) };
   }
 
   // Unread messages, or one by id, read or not (e.g. a wake that looked cut
@@ -1731,9 +1994,18 @@ class BrokerState {
 let owner = null; // BrokerState when this process owns the port
 const TOKEN = token();
 
+// the protocol of a newer version that last wrote the state, when this
+// process found it so (then it takes no ownership, and says so)
+let newerState = null;
+
 function listen() {
   return new Promise((resolve) => {
     const state = new BrokerState();
+    // state a newer version wrote: this older code doesn't take it over
+    // (nothing ingested, dispatched or saved), whatever its records and
+    // outbox files mean there now
+    newerState = (state.s.protocol ?? 0) > PROTOCOL ? state.s.protocol : null;
+    if (newerState) return resolve(null);
     const srv = http.createServer((req, res) => {
       if (req.method !== "POST" || req.url !== "/rpc" || req.headers["x-bridge-token"] !== TOKEN) {
         res.writeHead(403).end();
@@ -1749,7 +2021,17 @@ function listen() {
           if ((protocol ?? 0) > PROTOCOL) {
             stepDown = true;
             out = { ok: false, stale: true, error: `broker owner runs protocol ${PROTOCOL}, client ${protocol}; stepping down` };
-          } else out = { ok: true, result: state.handle(op, args || {}) };
+          } else if ((protocol ?? 0) < PROTOCOL && op !== "ping")
+            // a server from before an update (its app wasn't restarted): its
+            // operations may mean something else now, so none is run. A ping
+            // is answered (it changes nothing): the doctor probes with
+            // protocol 0, and an old server's keep-alive then sees an owner
+            // and doesn't try to take over.
+            out = {
+              ok: false,
+              error: `This app runs an older version of agent-review-bridge (protocol ${protocol ?? 0}) than the one running now (${PROTOCOL}), so nothing was done. Quit the app fully and open it again to load the update.`,
+            };
+          else out = { ok: true, result: state.handle(op, args || {}) };
         } catch (e) {
           out = { ok: false, error: String(e.message || e) };
         }
@@ -1840,6 +2122,11 @@ export async function call(op, args = {}) {
       if (!owner) await new Promise((r) => setTimeout(r, 100));
     }
     if (owner) return owner.handle(op, args);
+    if (newerState)
+      throw new Error(
+        `The bridge's state was last written by a newer version of agent-review-bridge (protocol ${newerState}) than this app runs (${PROTOCOL}), so nothing was done. ` +
+          `Quit the app fully and open it again to load the update. (If you went back to an older version on purpose, remove ${STATE_FILE} to start over; open reviews are lost.)`,
+      );
     return post(op, args);
   }
 }
