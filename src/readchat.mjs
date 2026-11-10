@@ -275,7 +275,7 @@ export const MOVED =
   "[AGENT-REVIEW-BRIDGE] Where the last page stopped has moved or changed in that chat, so the next page can't be found exactly. Read it again without a cursor to start from the newest.";
 
 export const READER_BLOCKED =
-  "[AGENT-REVIEW-BRIDGE] This chat reviews or advises for another chat, so it can't read the user's other chats. If the user wants that, they can set \"readChatsInReviewers\": \"allow\" in the bridge's config.json.";
+  "[AGENT-REVIEW-BRIDGE] This chat reviews for another chat, so it can't read the user's other chats. If the user wants that, they can set \"readChatsInReviewers\": \"allow\" in the bridge's config.json.";
 
 // -------------------------------------------------------------- finding
 

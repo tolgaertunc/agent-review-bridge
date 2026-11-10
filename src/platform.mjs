@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 
 export const IS_WIN = process.platform === "win32";
 export const IS_MAC = process.platform === "darwin";
@@ -120,25 +120,42 @@ function codexEntrypoint(dir) {
 // executable, not by name alone: the bundled codex CLI and app-server don't
 // count.
 export function chatgptRunning() {
-  const fake = process.env.AGENT_REVIEW_BRIDGE_FAKE_CHATGPT_RUNNING;
-  if (fake !== undefined) return fake === "1" ? true : fake === "0" ? false : null;
+  const fake = fakeRunning();
+  if (fake !== undefined) return fake;
+  if (!RUNNING) return null; // not detected on Linux
   try {
-    if (IS_WIN) {
-      // a background (window-less) app counts; the bundled CLI doesn't
-      const out = execFileSync("powershell.exe", ["-NoProfile", "-Command", "@(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object { $_.Path -notmatch '\\\\OpenAI\\\\Codex\\\\bin\\\\' }).Count"], {
-        encoding: "utf8",
-        timeout: 10_000,
-      });
-      return Number(out.trim()) > 0;
-    }
-    if (IS_MAC) {
-      const out = execFileSync("ps", ["-axo", "command="], { encoding: "utf8", timeout: 10_000 });
-      return /\/(ChatGPT|Codex)\.app\/Contents\/MacOS\/(ChatGPT|Codex)(\s|$)/m.test(out);
-    }
-    return null; // not detected on Linux
+    return RUNNING.running(execFileSync(RUNNING.cmd, RUNNING.args, RUNNING.opts));
   } catch {
     return null;
   }
+}
+
+// The same, without blocking its caller (the broker's own loop: on Windows
+// the check takes a while)
+export function chatgptRunningAsync() {
+  const fake = fakeRunning();
+  if (fake !== undefined) return Promise.resolve(fake);
+  if (!RUNNING) return Promise.resolve(null);
+  return new Promise((resolve) => execFile(RUNNING.cmd, RUNNING.args, RUNNING.opts, (err, out) => resolve(err ? null : RUNNING.running(out))));
+}
+
+// How each OS tells: the command, and what its output means. On Windows a
+// background (window-less) app counts; the bundled CLI doesn't.
+const RUNNING = IS_WIN
+  ? {
+      cmd: "powershell.exe",
+      args: ["-NoProfile", "-Command", "@(Get-Process -Name ChatGPT,Codex -ErrorAction SilentlyContinue | Where-Object { $_.Path -notmatch '\\\\OpenAI\\\\Codex\\\\bin\\\\' }).Count"],
+      running: (out) => Number(out.trim()) > 0,
+    }
+  : IS_MAC
+    ? { cmd: "ps", args: ["-axo", "command="], running: (out) => /\/(ChatGPT|Codex)\.app\/Contents\/MacOS\/(ChatGPT|Codex)(\s|$)/m.test(out) }
+    : null;
+if (RUNNING) RUNNING.opts = { encoding: "utf8", timeout: 10_000, windowsHide: true, maxBuffer: 16 * 1024 * 1024 };
+
+// tests: AGENT_REVIEW_BRIDGE_FAKE_CHATGPT_RUNNING=1 running, =0 closed, other: unknown
+function fakeRunning() {
+  const fake = process.env.AGENT_REVIEW_BRIDGE_FAKE_CHATGPT_RUNNING;
+  return fake === undefined ? undefined : fake === "1" ? true : fake === "0" ? false : null;
 }
 
 // Start ChatGPT Desktop in the background (its own delivery then wakes the
@@ -155,6 +172,9 @@ function fakeOpen() {
   if (fake === "fail") throw new Error("can't open (test)");
   return fake === "1";
 }
+
+// What opens a Claude Code session in Claude Desktop, by Desktop's own id for it
+export const claudeSessionUrl = (hostId) => `claude://code/continue?session=${hostId}`;
 
 // Hand a URL (codex://…) to the OS protocol handler
 export function openUrl(url) {

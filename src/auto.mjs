@@ -21,6 +21,16 @@ export const standingReviewer = (state, endpoint) =>
     return !!r && r.app === endpoint.app && r.id === endpoint.id;
   });
 
+// Two chats auto mode pairs: one's auto mode, on, keeps the other as its
+// reviewer. The pairing outlives each review (messages can go between them).
+export const pairedIn = (state, a, b) => {
+  const keeps = (x, y) => {
+    const r = x && y && reviewerOf(autoFor(state, x));
+    return !!r && r.app === y.app && r.id === y.id;
+  };
+  return keeps(a, b) || keeps(b, a);
+};
+
 // To the working agent in full when auto mode is turned on and whenever its
 // session starts again (a compaction may have summarised them away)
 export const AUTO_RULES =
@@ -46,6 +56,26 @@ export const AUTO_RULES_SHORT =
   "on an uncertainty a short look doesn't resolve, before push, deleting data or migrations (the user's permission is still needed), and before saying the work is done. " +
   "Name every path you changed in `paths`. Pass own_initiative=true only for a plan you chose to consult on; not if the user asked for that review or you're not sure.";
 
+// The same, when auto mode reviews every turn on its own (the setting
+// "autoReviews": "every-turn", or bridge_auto's every_turn): the agent doesn't
+// ask for code reviews; the bridge sends each turn
+export const AUTO_RULES_EVERY =
+  "[AGENT-REVIEW-BRIDGE] Auto mode is on, reviewing every turn: when one of your turns ends, the bridge sends it to your reviewer chat on its own " +
+  "(what the user asked, your final message, the turn's changes). Don't ask for code reviews yourself. " +
+  "A review that requests changes comes back as a new turn: fix what holds up; if a finding is wrong, say why instead of complying. Your next turn is reviewed again. " +
+  "Approvals come with your next prompt, in one line or in full with minor points, and so do notes from the bridge. " +
+  "Before settling a direction you may still ask for a plan review (bridge_review with kind plan). " +
+  "The reviewer's approval doesn't replace the user's permission for anything hard to undo (push, deleting data, migrations).";
+
+export const AUTO_RULES_EVERY_SHORT =
+  "[AGENT-REVIEW-BRIDGE] Auto mode is on, reviewing every turn: each of your turns goes to your reviewer on its own, so don't ask for code reviews yourself; " +
+  "a plan review before settling a direction is still yours to ask for. The user's permission is still needed before push, deleting data or migrations.";
+
+// What a reviewer is told with every turn auto mode sends it
+export const EVERY_TURN_ROLE =
+  "This is auto mode's review of one turn: each turn of that chat comes here as a request of its own, sent by the bridge, not asked for by the agent. " +
+  "Answer each once. An approval covers the content listed under \"Where the changes are\", as it was when this request was made.";
+
 // Added to review requests while the requester is in auto mode
 export const AUTO_REVIEWER =
   "Auto mode: judge the work against its goal and what was agreed, and say if the direction, plan or scope looks wrong or goes beyond it. " +
@@ -57,6 +87,15 @@ export const AUTO_REMINDER =
 // How the Stop check's words begin. ChatGPT goes on with a turn a Stop hook
 // stopped by giving it those words as a new prompt: that prompt isn't the user's.
 export const GUARD_HEAD = "[AGENT-REVIEW-BRIDGE] Auto mode";
+
+// From the Stop check while auto mode's first review waits for a chat to
+// join with its code: asking again would only make another code. From
+// ChatGPT that is a Claude chat by default; from Claude a code is only asked
+// for to take any chat (reviewer='join').
+export const autoJoinWait = (linkId, code, app) =>
+  `${GUARD_HEAD}: review ${linkId} is waiting for ${app === "claude" ? "the chat that should review (either app)" : "a chat in the other app"} to join with its code ${code}. ` +
+  "Remind the user to paste it there (\"join the agent-review-bridge link with code " + code + "\"), and don't ask for another review. " +
+  "If you are waiting for the user's answer or have to stop for another reason, you can stop now.";
 
 // From the Stop check, once for the same unreviewed changes in auto mode
 export const autoGuard = (unreviewed, unchecked = []) =>

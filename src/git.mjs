@@ -1,8 +1,9 @@
 // What changed in the working tree during a turn, for review requests.
-// Read-only: `git stash create` writes a commit object for the current tree
-// but touches no ref, index or file. Paths that tend to hold secrets never
-// leave the machine, neither content nor name (the diff goes to the other
-// vendor's chat).
+// Read-only for the user's repository: `git stash create` writes commit
+// objects for the current tree, and runs on a copy of the index (it would
+// refresh and lock the real one), so no ref, index or work tree file is
+// touched. Paths that tend to hold secrets never leave the machine, neither
+// content nor name (the diff goes to the other vendor's chat).
 
 import fs from "node:fs";
 import path from "node:path";
@@ -17,16 +18,47 @@ export const EXCLUDES = [...SECRET_FILES.map((p) => `:(glob,exclude)**/${p}`), .
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const MAX_LIST = 50;
 
-function git(cwd, args, input) {
-  // --no-optional-locks: status and diff don't refresh (write) the index
-  return execFileSync("git", ["--no-optional-locks", "-C", cwd, "-c", "core.quotepath=off", ...args], {
+function git(cwd, args, input, { env, ownIndex = false } = {}) {
+  // --no-optional-locks: status and diff don't refresh (write) the index;
+  // left out only for a command run on the bridge's own copy of it
+  return execFileSync("git", [...(ownIndex ? [] : ["--no-optional-locks"]), "-C", cwd, "-c", "core.quotepath=off", ...args], {
     encoding: "utf8",
     input,
     timeout: 3000,
     maxBuffer: 16 * 1024 * 1024,
     stdio: [input === undefined ? "ignore" : "pipe", "pipe", "ignore"],
     windowsHide: true,
+    ...(env && { env: { ...process.env, ...env } }),
   });
+}
+
+// `git stash create` refreshes the index it reads (writes a stat-dirty one
+// back) under its lock, and fails (exit 1, nothing said) when a file's stat
+// changed but not its content: run on a copy (the work tree's own, linked
+// worktrees included), refreshed first, so .git/index is never written,
+// another git holding its lock doesn't stop it, and a touched file is no
+// change. A split index's shared part is still read from the git dir; the
+// copy is written whole. No index file: no snapshot, not a guess.
+function stashCreate(cwd) {
+  const index = path.resolve(cwd, git(cwd, ["rev-parse", "--git-path", "index"]).trim());
+  const dir = path.join(dataDir(), "tmp");
+  fs.mkdirSync(dir, { recursive: true });
+  const copy = path.join(dir, `index-${process.pid}-${crypto.randomBytes(4).toString("hex")}`);
+  const own = { env: { GIT_INDEX_FILE: copy }, ownIndex: true };
+  try {
+    fs.copyFileSync(index, copy);
+    // the copy keeps the index's own time: git tells a file changed within
+    // the same second as the index was written ("racily clean") by it
+    const st = fs.statSync(index);
+    fs.utimesSync(copy, st.atime, st.mtime);
+    git(cwd, ["-c", "core.splitIndex=false", "update-index", "-q", "--refresh"], undefined, own);
+    return git(cwd, ["-c", "core.splitIndex=false", "stash", "create"], undefined, own).trim();
+  } finally {
+    // the copy, its lock, and what git writes beside it (stash create's own
+    // temporary index, left if a time limit killed git)
+    const name = path.basename(copy);
+    for (const f of fs.readdirSync(dir)) if (f.startsWith(name)) fs.rmSync(path.join(dir, f), { force: true });
+  }
 }
 
 function inWorkTree(cwd) {
@@ -54,57 +86,105 @@ function hashes(cwd, files) {
   return Object.fromEntries(files.map((f, i) => [f, out[i]]));
 }
 
-// Snapshot at turn start, or null when cwd isn't a git work tree
+// Snapshot of the work tree (a turn's start or end), or null when cwd isn't
+// a git work tree or git can't take one: a git failure (a merge with
+// conflicts, a timeout) is no snapshot, never a guess
 export function baseline(cwd) {
   if (!inWorkTree(cwd)) return null;
   try {
-    let ref = "";
-    try {
-      ref = git(cwd, ["stash", "create"]).trim();
-    } catch {
-      // fails in a repo without commits
-    }
+    const head = commitOf(cwd);
+    // a commit of the tracked changes, empty when there are none (HEAD is
+    // the snapshot then); before the first commit there's nothing to stash
+    const ref = head === EMPTY_TREE ? head : stashCreate(cwd) || head;
     const files = untracked(cwd).slice(0, 500);
-    return { cwd, ref: ref || headOrEmpty(cwd), untracked: hashes(cwd, files) };
+    // before the first commit, the staged files too (by their content now),
+    // or a turn that only staged a file would show no change
+    const staged = head === EMPTY_TREE ? cached(cwd).filter((f) => fs.existsSync(path.join(cwd, f))).slice(0, 500) : [];
+    return { cwd, ref, untracked: hashes(cwd, files), ...(staged.length && { staged: hashes(cwd, staged) }) };
   } catch {
     return null;
+  }
+}
+
+const cached = (cwd) => git(cwd, ["ls-files", "--cached", "--", ".", ...EXCLUDES]).split("\n").filter(Boolean);
+
+// HEAD's commit, or the empty tree before the first commit (git says HEAD
+// doesn't resolve: exit 1); throws when git can't tell
+function commitOf(cwd) {
+  try {
+    return git(cwd, ["rev-parse", "--verify", "-q", "HEAD"]).trim();
+  } catch (e) {
+    if (e.status === 1) return EMPTY_TREE;
+    throw e;
   }
 }
 
 const capList = (title, items) =>
   items.length ? `${title}:\n${items.slice(0, MAX_LIST).join("\n")}${items.length > MAX_LIST ? `\n… ${items.length - MAX_LIST} more` : ""}` : null;
 
-// Diff of the working tree against a baseline (or HEAD without one); the
-// whole result, summary included, stays within maxChars
-export function turnDiff(cwd, base, maxChars) {
-  if (!inWorkTree(cwd)) return null;
+// A turn's own changes between two snapshots (baseline() at its start and at
+// its end), as a summary: the stat (a long one cut to its first lines plus the
+// summary line) and the untracked files that are new or edited, compared by
+// the hashes each snapshot kept. The command below shows the changes
+// themselves. "" when nothing changed; null when a snapshot is missing or
+// can't be read (git may have pruned it).
+export function snapshotSummary(cwd, base, snap) {
+  if (!base?.ref || !snap?.ref || !inWorkTree(cwd)) return null;
   try {
-    const ref = base?.ref ?? headOrEmpty(cwd);
-    const statLines = git(cwd, ["diff", "--stat", ref, "--", ".", ...EXCLUDES]).trimEnd().split("\n").filter(Boolean);
-    const before = base?.untracked ?? {};
-    const now = untracked(cwd);
-    const added = now.filter((f) => !(f in before));
-    const known = now.filter((f) => f in before);
-    const nowHashes = hashes(cwd, known);
-    const edited = known.filter((f) => nowHashes[f] !== before[f]);
-    if (!statLines.length && !added.length && !edited.length) return base ? "(no changes)" : null;
-    // a long stat is cut to its first lines plus the summary line
+    // files compared by the hashes each snapshot kept: new, and edited
+    const changes = (key) => {
+      const before = base[key] ?? {};
+      const after = snap[key] ?? {};
+      return [Object.keys(after).filter((f) => !(f in before)), Object.keys(after).filter((f) => f in before && after[f] !== before[f])];
+    };
+    const [added, edited] = changes("untracked");
+    const [newStaged, editedStaged] = changes("staged");
+    const statLines = git(cwd, ["diff", "--stat", base.ref, snap.ref, "--", ".", ...EXCLUDES]).trimEnd().split("\n").filter(Boolean);
     const stat = statLines.length > MAX_LIST + 1 ? [...statLines.slice(0, MAX_LIST), `… ${statLines.length - MAX_LIST - 1} more files`, statLines.at(-1)] : statLines;
-    const head = [
-      base ? null : "(no turn baseline: uncommitted changes against HEAD)",
+    // the repository's first commit came in this turn: its diff is that whole
+    // commit, files staged in earlier turns included
+    const first = base.ref === EMPTY_TREE && snap.ref !== EMPTY_TREE;
+    return [
       stat.join("\n"),
+      first && "This turn made the repository's first commit: the command shows that whole commit, including what was staged before the turn.",
+      first && capList("Staged before this turn (so in that commit too)", Object.keys(base.staged ?? {})),
       capList("New untracked files", added),
       capList("Edited untracked files (content not tracked by git)", edited),
+      capList("New staged files (no commit yet)", newStaged),
+      capList("Edited staged files (no commit yet)", editedStaged),
     ]
       .filter(Boolean)
       .join("\n\n");
-    let patch = git(cwd, ["diff", ref, "--", ".", ...EXCLUDES]);
-    const room = maxChars - head.length - 40;
-    if (patch.length > room) patch = room > 0 ? patch.slice(0, room) + "\n… (diff truncated)" : "";
-    return `${head}\n\n${patch}`.trim().slice(0, maxChars);
   } catch {
     return null;
   }
+}
+
+// ------------------------------------------------- commands for the reviewer
+// The reviewer runs the commands a request gives in its own shell. On
+// Windows that is Git Bash for Claude Code and PowerShell for ChatGPT, and
+// the request doesn't know which app will answer (a join code's reviewer):
+// every command is given for both. Elsewhere, one POSIX shell.
+export const REVIEW_SHELLS = process.platform === "win32" ? ["posix", "powershell"] : ["posix"];
+
+// One value quoted for that shell: POSIX ('…', ' as '\'') or PowerShell
+// ('…', each single quote doubled, the Unicode ones too, which PowerShell
+// takes as quotes; $ and ` stay literal inside)
+export function shellArg(a, shell = "posix") {
+  if (shell === "powershell") return `'${String(a).replace(/['‘’‚‛]/g, (c) => c + c)}'`;
+  return `'${String(a).replace(/'/g, `'\\''`)}'`;
+}
+
+// A command from fixed words (as they are) and values ({ q }: quoted). In
+// PowerShell `--` is quoted too, so it reaches git as it is in any version.
+function shellCommand(parts, shell) {
+  return parts.map((p) => (typeof p !== "string" ? shellArg(p.q, shell) : shell === "powershell" && p === "--" ? "'--'" : p)).join(" ");
+}
+
+// The command that shows a turn's own changes between its two snapshots
+// (secret paths left out)
+export function snapshotCommand(cwd, base, snap, shell = "posix") {
+  return shellCommand(["git", "-C", { q: cwd }, "diff", "--no-ext-diff", "--no-textconv", base.ref, snap.ref, "--", ".", ...EXCLUDES.map((q) => ({ q }))], shell);
 }
 
 // ------------------------------------------------------- paths for review
@@ -171,9 +251,12 @@ export function reviewSummary(info, base) {
   };
   const status = cap(git(info.top, ["status", "--short", "--untracked-files=all", "--", ...spec]), "changed or new files");
   const stat = cap(git(info.top, ["diff", "--stat", base, "--", ...spec]), "lines of the stat");
-  const q = (a) => `'${a.replace(/'/g, `'\\''`)}'`;
-  const command = ["git", "-C", q(info.top), "diff", "--no-ext-diff", "--no-textconv", base, "--", ...spec.map(q)].join(" ");
-  return { status, stat, command };
+  return { status, stat, command: pathCommand(info, base) };
+}
+
+// The command that shows the changes under one git path, for that shell
+export function pathCommand(info, base, shell = "posix") {
+  return shellCommand(["git", "-C", { q: info.top }, "diff", "--no-ext-diff", "--no-textconv", base, "--", ...[info.spec, ...EXCLUDES].map((q) => ({ q }))], shell);
 }
 
 // The changes under one git path as text, for a reviewer that can't read
