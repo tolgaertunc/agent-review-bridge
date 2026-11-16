@@ -68,7 +68,7 @@ if (!endpoint || !["claude", "openai"].includes(app)) process.exit(0);
 const t0 = Date.now();
 
 // what the end-of-turn check last told this chat about, so the same changes
-// stop a turn only once (a new user prompt clears it)
+// stop a turn only once, across the user's prompts too
 const guardFile = (endpoint) => turnFile(endpoint).replace(/\.json$/, ".auto-guard.json");
 // ChatGPT goes on with a turn the check stopped, with the check's words as a
 // new prompt. What it was stopped for in the turn it is going on with: the
@@ -241,8 +241,7 @@ if (event === "stopfail") {
 if (event === "prompt") {
   const state = readState();
   const auto = autoFor(state, endpoint);
-  // auto mode counts the user's turns for its reminder; a new prompt means
-  // unreviewed changes may stop the next turn's end again. Only a prompt the
+  // auto mode counts the user's turns for its reminder. Only a prompt the
   // user wrote: not the app's own notice, one of the bridge's deliveries (a
   // ChatGPT chat runs them as prompts), or the Stop check's own words, which
   // ChatGPT goes on with as a new prompt.
@@ -250,7 +249,6 @@ if (event === "prompt") {
   const user = !!input.prompt && fromUser(input.prompt);
   if (auto && user) {
     writeOutbox("auto_prompt", { endpoint, turnId: input.turn_id ?? input.prompt_id ?? null, prompt: input.prompt });
-    fs.rmSync(guardFile(endpoint), { force: true });
     fs.rmSync(chainFile(endpoint), { force: true });
   }
   const everyTurn = !!auto?.everyTurn;

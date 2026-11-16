@@ -683,6 +683,15 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
     for (const t of ["u2", "u3", "u4", "u5"]) await ctx("more", t);
     await until(() => state().auto[`claude:${A.id}`].turns === 5);
     assert.match(await ctx("and more", "u6"), /you haven't consulted the reviewer for a few turns/);
+    // the user's prompts don't make the same changes stop the turn again; new changes do
+    fs.writeFileSync(path.join(work, "a.js"), "5\n");
+    assert.equal((await stop())?.decision, "block", "new changes stop the turn");
+    await ctx("next", "u7");
+    assert.equal(await stop(), null, "the same changes after the user's prompt: not again");
+    await ctx("and next", "u8");
+    assert.equal(await stop(), null, "nor after a second one");
+    fs.writeFileSync(path.join(work, "a.js"), "6\n");
+    assert.equal((await stop())?.decision, "block", "changed content stops it again");
     // a file that can't be reached is said so, not taken as deleted
     fs.mkdirSync(path.join(work, "sub"));
     fs.writeFileSync(path.join(work, "sub", "f.js"), "f\n");
@@ -828,7 +837,7 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   const stopOut = async () => (await runHook("claude", "stop", { session_id: D.id })).out;
   assert.match(JSON.parse(await stopOut()).reason, /agent-review-bridge-temp-\w+/, "still there and unreviewed: named");
   fs.rmSync(temp, { recursive: true, force: true });
-  await runHook("claude", "prompt", { session_id: D.id, prompt: "next" }); // a new prompt clears what was told
+  await runHook("claude", "prompt", { session_id: D.id, prompt: "next" }); // the user's next turn
   assert.equal(await stopOut(), "", "never approved and gone: nothing left to review");
   await call("auto_set", { endpoint: D, on: false });
   fs.rmSync(plan, { recursive: true, force: true });
@@ -896,10 +905,13 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
     assert.equal(await stop(), null, "a delivery doesn't make it stop the same changes again");
     await sleep(300);
     assert.equal(state().auto[key].turns, 0, "neither counts as a user turn");
-    // the user's own prompt: a new start
+    // the user's own prompts count as turns, but don't make the same changes stop the turn again
     await prompt("go on", "u1");
     await until(() => state().auto[key].turns === 1);
-    assert.equal((await stop())?.decision, "block", "after the user's prompt the same changes stop the turn again");
+    assert.equal(await stop(), null, "after the user's prompt the same changes don't stop the turn again");
+    await prompt("and on", "u2");
+    await until(() => state().auto[key].turns === 2);
+    assert.equal(await stop(), null, "nor after a second one");
     // a review waiting for someone to join with its code doesn't hold the check back
     const unjoined = await call("link_create", { primary: W, request: "waiting for a code" });
     fs.writeFileSync(path.join(work, "a.js"), "6\n");
