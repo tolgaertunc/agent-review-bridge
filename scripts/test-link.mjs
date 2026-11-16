@@ -239,7 +239,13 @@ console.log(`8 after unlink the listener exits at once (${r.ms} ms)`);
     `const id=(await b.call("receive",{side:"claude",endpoint:P})).messages[0].id;await b.call("advise",{endpoint:P,requestId:id,decision:"approved"});console.log("ready");setInterval(()=>{},1000);`], { env: env3 });
   await new Promise((r) => owner.stdout.once("data", r));
   const st3 = () => JSON.parse(fs.readFileSync(path.join(dir3, "state.json"), "utf8"));
-  assert.ok(st3().messages.length < 10, `week-old messages pruned (left ${st3().messages.length})`);
+  // a review request still waiting for its answer on an open link is kept,
+  // whatever its age (the reviews of a chat's turns wait for it)
+  const s3 = st3();
+  const waiting = (m) => m.kind === "review-request" && !m.answeredAt && s3.links[m.linkId]?.active;
+  const left = s3.messages.filter((m) => !waiting(m));
+  assert.ok(left.length < 10, `week-old messages pruned (left ${left.length})`);
+  assert.ok(s3.messages.some(waiting), "week-old review requests still waiting on open links are kept");
   const run3 = (event, input) =>
     new Promise((resolve) => {
       const p = spawn(process.execPath, [hook, "--app", "claude", "--event", event], { env: env3 });
@@ -1385,15 +1391,16 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   }
 }
 
-// 42. auto mode's pairing as a channel, outside any review: a Claude chat
-// that sent its reviewer a message listens for the answer and is woken by
-// it, as by a review's; once answered, nothing keeps it listening
+// 42. auto mode's pairing as a channel, outside any review: a Claude chat in
+// auto mode (at key moments too) listens between turns, so the answer to
+// what it asked its reviewer wakes it, as a review's does, and so does a
+// message the reviewer starts on its own; with auto mode off it doesn't
+// listen, also when that happens while it listens; a newer listener of the
+// same chat takes over
 {
   const P = { app: "claude", id: "claude-channel-asks" };
   const R = { app: "openai", id: "gpt-channel-answers" };
   await call("auto_set", { endpoint: P, on: true, reviewer: R });
-  const idle = await runHook("claude", "listen", { session_id: P.id });
-  assert.equal(idle.code, 0, "nothing to listen for yet: it exits at once");
   const ask = await call("send", { endpoint: P, text: "Why the trim?", channel: true });
   const listening = runHook("claude", "listen", { session_id: P.id }, { killAfter: 15000 });
   await sleep(1200);
@@ -1402,49 +1409,56 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   assert.equal(woke.code, 2, "the answer wakes it");
   assert.match(woke.err, /CODEX: Message m\d+ \(auto mode\)\n\nTabs broke the parser\./);
   await until(() => state().messages.find((m) => m.replyTo === ask.id)?.readAt);
-  const after = await runHook("claude", "listen", { session_id: P.id });
-  assert.equal(after.code, 0, "answered: it doesn't keep listening");
+  const idle = runHook("claude", "listen", { session_id: P.id }, { killAfter: 15000 });
+  await sleep(1200);
+  await call("send", { endpoint: R, text: "One more thing: the CSV test.", channel: true, to: P });
+  const woke2 = await idle;
+  assert.equal(woke2.code, 2, "a message the reviewer starts on its own wakes the idle chat");
+  assert.match(woke2.err, /One more thing: the CSV test\./);
   await call("auto_set", { endpoint: P, on: false });
-  // what keeps it listening has to go on holding: no answer yet, not failed,
-  // under a day old (as time goes on, too), the two still paired. Handcrafted
-  // state: the hook reads only state.json.
-  const listenOn = (over, ms) => {
+  const off = await runHook("claude", "listen", { session_id: P.id });
+  assert.equal(off.code, 0, "auto mode off: it doesn't listen");
+  // handcrafted state (the hook reads only state.json), changed while it listens
+  const listenOn = (over, ms, later) => {
     const d = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-chanlisten-"));
-    const now = Date.now();
-    const s = {
-      seq: 9, links: {}, notes: [], linkSeq: 0, endpoints: {},
-      auto: { [`claude:${P.id}`]: { on: true, reviewer: R, paths: {}, since: 1 }, ...over.auto },
-      messages: [{ id: "m1", from: "claude", to: "openai", toEndpoint: R, fromEndpoint: P, kind: "message", linkId: null, channel: true, text: "Why?", ts: now, readAt: now, ...over.message }],
-    };
-    fs.writeFileSync(path.join(d, "state.json"), JSON.stringify(s));
-    return new Promise((resolve) => {
-      const t0 = Date.now();
+    const s = (o) => ({ seq: 9, links: {}, notes: [], linkSeq: 0, endpoints: {}, messages: [], auto: { [`claude:${P.id}`]: { on: true, reviewer: R, paths: {}, since: 1 }, ...o.auto } });
+    fs.writeFileSync(path.join(d, "state.json"), JSON.stringify(s(over)));
+    if (later) setTimeout(() => fs.writeFileSync(path.join(d, "state.json"), JSON.stringify(s(later))), 1500);
+    const start = () => {
       const p = spawn(process.execPath, [hook, "--app", "claude", "--event", "listen"], { env: { ...process.env, AGENT_REVIEW_BRIDGE_DIR: d } });
-      const timer = setTimeout(() => p.kill(), ms);
-      p.on("close", (code) => {
-        clearTimeout(timer);
-        fs.rmSync(d, { recursive: true, force: true });
-        resolve({ code, ms: Date.now() - t0 });
-      });
       p.stdin.end(JSON.stringify({ hook_event_name: "Stop", session_id: P.id }));
-    });
+      return p;
+    };
+    const ended = (p, t0) =>
+      new Promise((resolve) => {
+        const timer = setTimeout(() => p.kill(), ms);
+        p.on("close", (code) => {
+          clearTimeout(timer);
+          resolve({ code, ms: Date.now() - t0 });
+        });
+      });
+    return { d, start, ended, done: () => fs.rmSync(d, { recursive: true, force: true }) };
   };
-  const waits = await listenOn({}, 2500);
-  assert.notEqual(waits.code, 0, "unanswered: it listens until it's stopped");
-  for (const [why, over] of [
-    ["auto mode off", { auto: { [`claude:${P.id}`]: { on: false, reviewer: R, paths: {} } } }],
-    ["another reviewer", { auto: { [`claude:${P.id}`]: { on: true, reviewer: { app: "openai", id: "gpt-someone-else" }, paths: {} } } }],
-    ["no answer coming", { message: { failure: { at: Date.now(), why: "its turn failed" } } }],
-    ["over a day old", { message: { ts: Date.now() - 25 * 3600_000 } }],
-  ]) {
-    const r = await listenOn(over, 10_000);
-    assert.equal(r.code, 0, why);
-    assert.ok(r.ms < 2500, `${why}: at once (${r.ms} ms)`);
-  }
-  const ages = await listenOn({ message: { ts: Date.now() - 24 * 3600_000 + 2500 } }, 15_000);
-  assert.equal(ages.code, 0, "a day passes while it listens: it stops");
-  assert.ok(ages.ms >= 2000 && ages.ms < 10_000, `when the day is up (${ages.ms} ms)`);
-  console.log("42 auto mode's channel: a Claude chat that asked its reviewer listens for the answer, is woken by it, then stops listening; also once auto mode is off, the reviewer changed, the message failed or a day passed (while it listens too)");
+  const on = listenOn({}, 2500);
+  const waits = await on.ended(on.start(), Date.now());
+  on.done();
+  assert.notEqual(waits.code, 0, "auto mode on, nothing pending: it listens until it's stopped");
+  const turnedOff = listenOn({}, 10_000, { auto: { [`claude:${P.id}`]: { on: false, reviewer: R, paths: {} } } });
+  const stops = await turnedOff.ended(turnedOff.start(), Date.now());
+  turnedOff.done();
+  assert.equal(stops.code, 0, "auto mode turned off while it listens: it stops");
+  assert.ok(stops.ms >= 1000 && stops.ms < 6000, `soon after (${stops.ms} ms)`);
+  const two = listenOn({}, 10_000);
+  const t0 = Date.now();
+  const first = two.ended(two.start(), t0);
+  await sleep(1500);
+  const second = two.start();
+  const replaced = await first;
+  second.kill();
+  two.done();
+  assert.equal(replaced.code, 0, "a newer listener of the same chat takes over: the older one stops");
+  assert.ok(replaced.ms < 8000, `at once (${replaced.ms} ms)`);
+  console.log("42 auto mode's channel: a Claude chat in auto mode listens between turns, woken by its reviewer's answer and by a message the reviewer starts; off, it doesn't (also while it listens); a newer listener takes over");
 }
 
 

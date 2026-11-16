@@ -18,13 +18,40 @@ export const EXCLUDES = [...SECRET_FILES.map((p) => `:(glob,exclude)**/${p}`), .
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const MAX_LIST = 50;
 
+// A time budget for what a hook with a time limit reads: each git call gets
+// at most what's left of it (and at most 3 s), and a path's files are hashed
+// only while some is left. Out of time, it throws, and what was being read is
+// unknown. (A single large file's read can't be cut midway.)
+let budgetEnd = Infinity;
+export function withinBudget(end, fn) {
+  const prev = budgetEnd;
+  budgetEnd = end;
+  try {
+    return fn();
+  } finally {
+    budgetEnd = prev;
+  }
+}
+const outOfTime = () => {
+  if (Date.now() >= budgetEnd) throw new Error("out of time");
+};
+// (tests: AGENT_REVIEW_BRIDGE_TEST_GIT_DELAY makes each git call that slow)
+const SLEEP = new Int32Array(new SharedArrayBuffer(4));
+function slowGit() {
+  const ms = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_GIT_DELAY) || 0;
+  if (ms) Atomics.wait(SLEEP, 0, 0, Math.max(0, Math.min(ms, budgetEnd - Date.now())));
+}
+
 function git(cwd, args, input, { env, ownIndex = false } = {}) {
+  outOfTime();
+  slowGit();
+  outOfTime();
   // --no-optional-locks: status and diff don't refresh (write) the index;
   // left out only for a command run on the bridge's own copy of it
   return execFileSync("git", [...(ownIndex ? [] : ["--no-optional-locks"]), "-C", cwd, "-c", "core.quotepath=off", ...args], {
     encoding: "utf8",
     input,
-    timeout: 3000,
+    timeout: Math.max(1, Math.min(3000, budgetEnd - Date.now())),
     maxBuffer: 16 * 1024 * 1024,
     stdio: [input === undefined ? "ignore" : "pipe", "pipe", "ignore"],
     windowsHide: true,
@@ -43,7 +70,23 @@ function stashCreate(cwd) {
   const index = path.resolve(cwd, git(cwd, ["rev-parse", "--git-path", "index"]).trim());
   const dir = path.join(dataDir(), "tmp");
   fs.mkdirSync(dir, { recursive: true });
-  const copy = path.join(dir, `index-${process.pid}-${crypto.randomBytes(4).toString("hex")}`);
+  // copies a hook left when its time limit killed it (no finally runs then)
+  // don't pile up: those made over ten minutes ago go. When one was made is
+  // in its name (and in the names of what git writes beside it): its file
+  // time is the index's own, which can be hours old for a copy in use now.
+  // An older version's copies (no time in the name) go by their status
+  // change time, which the copy's own time setting moved to when it was made.
+  // One that can't be removed (in use) stays; the snapshot goes on.
+  for (const f of fs.readdirSync(dir)) {
+    if (!f.startsWith("index-")) continue;
+    try {
+      const made = Number(/^index-\d+-(\d{13})-/.exec(f)?.[1]) || (/^index-\d+-[0-9a-f]{8}(\.|$)/.test(f) ? fs.statSync(path.join(dir, f)).ctimeMs : 0);
+      if (made && Date.now() - made > 10 * 60_000) fs.rmSync(path.join(dir, f), { force: true });
+    } catch {
+      // gone meanwhile, or in use
+    }
+  }
+  const copy = path.join(dir, `index-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString("hex")}`);
   const own = { env: { GIT_INDEX_FILE: copy }, ownIndex: true };
   try {
     fs.copyFileSync(index, copy);
@@ -311,6 +354,7 @@ function plainFiles(info) {
   if (!fs.lstatSync(info.root).isDirectory()) return isSecretPath(path.basename(info.path)) ? [] : [[path.basename(info.path), info.path]];
   const out = [];
   const walk = (dir) => {
+    outOfTime(); // (many folders take time too)
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
       if (e.name === ".git" || e.name === "node_modules") continue;
       const full = path.join(dir, e.name);
@@ -340,7 +384,23 @@ function hashFiles(root, files, fresh) {
   }
   const next = {};
   const lines = [];
+  const keep = (entries) => {
+    try {
+      const f = cacheFile(root);
+      fs.mkdirSync(path.dirname(f), { recursive: true });
+      fs.writeFileSync(`${f}.${process.pid}.tmp`, JSON.stringify(entries));
+      fs.renameSync(`${f}.${process.pid}.tmp`, f);
+    } catch {
+      // the cache is only a speed-up
+    }
+  };
   for (const [rel, full] of files.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    // out of time: what was hashed so far is kept, so the next check of a
+    // big folder goes further (its result is still unknown now)
+    if (budgetEnd !== Infinity && Date.now() >= budgetEnd) {
+      keep({ ...cache, ...next });
+      outOfTime();
+    }
     let st;
     try {
       st = fs.lstatSync(full);
@@ -368,13 +428,6 @@ function hashFiles(root, files, fresh) {
     next[rel] = [stamp, entry];
     lines.push(`${rel}\0${entry}`);
   }
-  try {
-    const f = cacheFile(root);
-    fs.mkdirSync(path.dirname(f), { recursive: true });
-    fs.writeFileSync(`${f}.${process.pid}.tmp`, JSON.stringify(next));
-    fs.renameSync(`${f}.${process.pid}.tmp`, f);
-  } catch {
-    // the cache is only a speed-up
-  }
+  keep(next);
   return crypto.createHash("sha256").update(lines.join("\n")).digest("hex");
 }

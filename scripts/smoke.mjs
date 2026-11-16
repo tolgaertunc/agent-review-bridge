@@ -544,13 +544,46 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   await call(cw, "bridge_auto", { on: false });
   // the reviewer chat can't be made: auto mode stays as it was before the call, said so
   const cf = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-make-fails", CLAUDE_PROJECT_DIR: repo, AGENT_REVIEW_BRIDGE_FAKE_CODEX: "fail" });
-  assert.match(textOf(await call(cf, "bridge_auto", { on: true, every_turn: true })), /^Couldn't make the reviewer chat in ChatGPT \(ChatGPT Desktop not reachable \(test\)\)\. Auto mode is off: try again/);
+  assert.match(textOf(await call(cf, "bridge_auto", { on: true, every_turn: true })), /^Nothing changed: couldn't make the reviewer chat in ChatGPT \(ChatGPT Desktop not reachable \(test\)\)\. Auto mode is still off: try again/);
   assert.equal(JSON.parse(textOf(await call(cf, "bridge_status"))).auto?.on ?? false, false, "off, as before");
   await call(cf, "bridge_auto", { on: true }); // on at key moments: nothing made yet
-  assert.match(textOf(await call(cf, "bridge_auto", { on: true, every_turn: true })), /Auto mode stays on, and the reviews of your turns wait for a reviewer: call this again/);
-  assert.equal(JSON.parse(textOf(await call(cf, "bridge_status"))).auto.on, true, "on, as before");
+  assert.match(textOf(await call(cf, "bridge_auto", { on: true, every_turn: true })), /^Nothing changed: .*Auto mode stays as it was\./);
+  let cfAuto = JSON.parse(textOf(await call(cf, "bridge_status"))).auto;
+  assert.equal(cfAuto.on, true, "on, as before");
+  assert.equal(!!cfAuto.everyTurn, false, "still at key moments");
+  // with a reviewer, every turn: a new reviewer that can't be made keeps the old one
+  await call(cf, "bridge_auto", { on: true, every_turn: true, thread_id: "gpt-kept" });
+  assert.match(textOf(await call(cf, "bridge_auto", { on: true, new_reviewer: true })), /^Nothing changed: couldn't make the reviewer chat/);
+  cfAuto = JSON.parse(textOf(await call(cf, "bridge_status"))).auto;
+  assert.deepEqual([cfAuto.reviewer, !!cfAuto.everyTurn], [{ app: "openai", id: "gpt-kept" }, true], "the reviewer and the mode as they were");
   await call(cf, "bridge_auto", { on: false });
   await cf.close();
+  // a setting that changes while the reviewer chat is being made is left as
+  // that change made it: from no entry, an entry that's off, and one that's on
+  const cs = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-slow-make", CLAUDE_PROJECT_DIR: repo });
+  const csAuto = async () => JSON.parse(textOf(await call(cs, "bridge_status"))).auto;
+  for (const start of ["none", "off", "on"]) {
+    if (start === "off") await call(cs, "bridge_auto", { on: false });
+    if (start === "on") await call(cs, "bridge_auto", { on: true });
+    const madeBefore = made().length;
+    fs.writeFileSync(path.join(dir, "fake-thread-delay"), "800");
+    const slow = call(cs, "bridge_auto", { on: true, every_turn: true });
+    await sleep(300);
+    await call(cs, "bridge_auto", { on: false });
+    assert.match(textOf(await slow), /^Nothing changed: auto mode's setting changed while its reviewer chat was being made/, `${start}: refused`);
+    assert.equal((await csAuto())?.on ?? false, false, `${start}: still off`);
+    assert.equal(made().length, madeBefore + 1, `${start}: the chat was made, and isn't used`);
+  }
+  await call(cs, "bridge_auto", { on: true });
+  fs.writeFileSync(path.join(dir, "fake-thread-delay"), "800");
+  const slowMake = call(cs, "bridge_auto", { on: true, every_turn: true });
+  await sleep(300);
+  await call(cs, "bridge_auto", { on: true, thread_id: "gpt-picked-meanwhile" });
+  assert.match(textOf(await slowMake), /^Nothing changed: auto mode's setting changed/);
+  const picked = await csAuto();
+  assert.deepEqual([picked.on, picked.reviewer, !!picked.everyTurn], [true, { app: "openai", id: "gpt-picked-meanwhile" }, false], "the reviewer picked meanwhile stays");
+  await call(cs, "bridge_auto", { on: false });
+  await cs.close();
   fs.rmSync(path.join(dir, "listeners", "claude-claude-same-reviewer.json"), { force: true });
   await cr.close();
   await cw.close();
@@ -566,13 +599,75 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
     await call(openai, "bridge_advise", { request_id: q.match(/request (m\d+)/)[1], decision: "approved" }, asGpt(Rv));
     assert.deepEqual(JSON.parse(textOf(await call(openai, "bridge_status", {}, meta))).auto.reviewer, { app: "openai", id: Rv });
     if (!every) {
-      assert.match(textOf(await call(openai, "bridge_review", { request: "Goal: trim fields. Step: GPT again." }, meta)), new RegExp(`sent to auto mode's reviewer, the ChatGPT chat ${Rv}\\.`));
+      // a ChatGPT reviewer, joined or made, is used as from Claude: its thread
+      assert.match(textOf(await call(openai, "bridge_review", { request: "Goal: trim fields. Step: GPT again." }, meta)), new RegExp(`sent to ChatGPT thread ${Rv}\\. [\\s\\S]*Auto mode keeps using this reviewer chat\\.`));
       await deliveredTo(Rv, /GPT again/);
       await call(openai, "bridge_unlink", {}, meta);
     }
     await call(openai, "bridge_auto", { on: false }, meta);
   }
   console.log("5e5 same-app reviewers by code: Claude → Claude (asked for, key moments and every turn, no ChatGPT chat made), ChatGPT → ChatGPT (with the code it gives); another reviewer stays the agent's to ask; join and thread_id refused together");
+}
+
+// 5e7. what Claude can have for a ChatGPT reviewer, ChatGPT can too: one the
+// bridge makes (model and effort), an existing one (thread_id), and auto
+// mode's reviewer made that way (on the first review, or at once for every
+// turn), never the chat itself; the default stays the chat that joins
+{
+  const made = () => JSON.parse(fs.readFileSync(path.join(dir, "fake-threads.json"), "utf8"));
+  const W = "gpt-parity-worker";
+  const meta = { ...asGpt(W), "x-codex-turn-metadata": { cwd: repo } };
+  const n0 = made().length;
+  const one = (await call(openai, "bridge_review", { reviewer: "openai", model: "gpt-6-astra", effort: "high", request: "Goal: parity. Step: one-off." }, meta)).structuredContent;
+  assert.equal(made().length, n0 + 1, "a ChatGPT chat made for it");
+  assert.deepEqual([made().at(-1).model, made().at(-1).effort, one.threadId], ["gpt-6-astra", "high", made().at(-1).threadId]);
+  await deliveredTo(one.threadId, /parity\. Step: one-off/);
+  const existing = (await call(openai, "bridge_review", { reviewer: "openai", thread_id: "gpt-parity-existing", request: "Goal: parity. Step: existing." }, meta)).structuredContent;
+  assert.equal(existing.threadId, "gpt-parity-existing");
+  await deliveredTo("gpt-parity-existing", /parity\. Step: existing/);
+  assert.match(textOf(await call(openai, "bridge_review", { thread_id: W, request: "Mine." }, meta)), /^Nothing was sent: thread_id names this chat itself/);
+  await call(openai, "bridge_unlink", {}, meta);
+  // auto mode at key moments with a ChatGPT reviewer the bridge makes
+  const n1 = made().length;
+  await call(openai, "bridge_auto", { on: true, reviewer: "openai", model: "gpt-6.1-sol" }, meta);
+  const first = (await call(openai, "bridge_review", { request: "Goal: parity. Step: auto first." }, meta)).structuredContent;
+  assert.deepEqual([made().length, made().at(-1).model], [n1 + 1, "gpt-6.1-sol"], "auto mode's chat made on the first review");
+  assert.deepEqual(JSON.parse(textOf(await call(openai, "bridge_status", {}, meta))).auto.reviewer, { app: "openai", id: first.threadId });
+  const second = (await call(openai, "bridge_review", { request: "Goal: parity. Step: auto next." }, meta)).structuredContent;
+  assert.deepEqual([second.threadId, made().length], [first.threadId, n1 + 1], "the next review goes to the same chat");
+  await call(openai, "bridge_unlink", {}, meta);
+  await call(openai, "bridge_auto", { on: false }, meta);
+  // every turn: made at once
+  const n2 = made().length;
+  assert.match(textOf(await call(openai, "bridge_auto", { on: true, every_turn: true, reviewer: "openai" }, meta)), /with ChatGPT chat gpt-new-\d+ as the reviewer/);
+  assert.equal(made().length, n2 + 1);
+  assert.match(textOf(await call(openai, "bridge_auto", { on: true, thread_id: W }, meta)), /^Nothing changed: thread_id names this chat itself/);
+  await call(openai, "bridge_auto", { on: false }, meta);
+  // the default from ChatGPT is still the chat that joins with a code, and a
+  // model or a name alone doesn't change that (only reviewer 'openai' or
+  // thread_id ask for another)
+  await call(openai, "bridge_auto", { on: true }, meta);
+  const byCode = (await call(openai, "bridge_review", { request: "Goal: parity. Step: default." }, meta)).structuredContent;
+  assert.match(byCode.joinCode ?? "", /^[0-9a-f]{6}$/);
+  const named = (await call(openai, "bridge_review", { request: "Goal: parity. Step: named.", name: "Mine", model: "gpt-6-astra" }, meta)).structuredContent;
+  assert.match(named.joinCode ?? "", /^[0-9a-f]{6}$/, "a model and a name alone: still a code");
+  assert.equal(made().length, n2 + 1, "no chat made");
+  // the chat that joins stays the reviewer: a model alone still goes to it;
+  // reviewer 'join' while there is one gets a code of its own
+  const cj = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-parity-reviewer", CLAUDE_PROJECT_DIR: repo });
+  await call(cj, "bridge_link_join", { code: named.joinCode });
+  fs.writeFileSync(path.join(dir, "listeners", "claude-claude-parity-reviewer.json"), JSON.stringify({ pid: process.pid, startedAt: Date.now(), beat: Date.now() }));
+  assert.deepEqual(JSON.parse(textOf(await call(openai, "bridge_status", {}, meta))).auto.reviewer, { app: "claude", id: "claude-parity-reviewer" });
+  assert.match(textOf(await call(openai, "bridge_review", { request: "Goal: parity. Step: a model alone.", model: "gpt-6-astra" }, meta)), /sent to auto mode's reviewer, the Claude Code session claude-parity-reviewer\./);
+  const own = (await call(openai, "bridge_review", { request: "Goal: parity. Step: one of its own.", reviewer: "join" }, meta)).structuredContent;
+  assert.match(own.joinCode ?? "", /^[0-9a-f]{6}$/, "a join asked for: a code of its own");
+  assert.deepEqual(JSON.parse(textOf(await call(openai, "bridge_status", {}, meta))).auto.reviewer, { app: "claude", id: "claude-parity-reviewer" }, "auto mode's reviewer stays");
+  assert.equal(made().length, n2 + 1, "still no chat made");
+  fs.rmSync(path.join(dir, "listeners", "claude-claude-parity-reviewer.json"), { force: true });
+  await call(openai, "bridge_unlink", {}, meta);
+  await call(openai, "bridge_auto", { on: false }, meta);
+  await cj.close();
+  console.log("5e7 ChatGPT can have the bridge make a ChatGPT reviewer too (one-off with model and effort, an existing thread, auto mode's at key moments or every turn), never itself; the default stays a join");
 }
 
 // 5e6. a channel to auto mode's reviewer, outside any review: from the
@@ -594,8 +689,16 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   // a message of its own while the working chat isn't listening: it waits for that chat's next turn, nothing is opened
   fs.rmSync(path.join(dir, "listeners", "claude-claude-channel-worker.json"), { force: true });
   const own = textOf(await call(openai, "bridge_send", { text: "One more thing: the CSV test." }, asGpt(Rv)));
-  assert.match(own, /to claude chat claude-channel-worker \(auto mode\)\. [\s\S]*That chat isn't listening right now: it gets the message when its next turn ends, or once it's open in Claude Desktop\./);
+  assert.match(own, /to claude chat claude-channel-worker \(auto mode\)\. [\s\S]*That chat isn't listening right now \(it's in the middle of a turn, or not open in Claude Desktop\): it gets the message when that turn ends, or once it's open again\./);
   await receiveUntil(cw, undefined, /the CSV test/);
+  // told to always open closed apps, but the bridge doesn't know how to open
+  // this one (no Desktop id): sent all the same, and it waits, as under "ask"
+  const cfgFile = path.join(env.AGENT_REVIEW_BRIDGE_CONFIG_DIR, "config.json");
+  fs.writeFileSync(cfgFile, JSON.stringify({ openClosedApps: "always" }));
+  const always = textOf(await call(openai, "bridge_send", { text: "And the TSV test." }, asGpt(Rv)));
+  fs.rmSync(cfgFile, { force: true });
+  assert.match(always, /^Sent m\d+ to claude chat claude-channel-worker \(auto mode\)\. [\s\S]*That chat isn't listening right now/);
+  await receiveUntil(cw, undefined, /the TSV test/);
   fs.writeFileSync(path.join(dir, "listeners", "claude-claude-channel-worker.json"), JSON.stringify({ pid: process.pid, startedAt: Date.now(), beat: Date.now() }));
   // reviewing two chats: it has to say which
   const cw2 = await connect("claude", { CLAUDE_CODE_SESSION_ID: "claude-channel-worker-2", CLAUDE_PROJECT_DIR: repo });

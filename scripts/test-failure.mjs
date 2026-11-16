@@ -33,14 +33,18 @@ async function until(fn, ms = 4000) {
   }
 }
 const hook = path.resolve(import.meta.dirname, "../src/hook.mjs");
-function runHook(app, event, input) {
+function runHook(app, event, input, { killAfter } = {}) {
   return new Promise((resolve) => {
     const p = spawn(process.execPath, [hook, "--app", app, "--event", event], { env: process.env });
     let out = "";
     let err = "";
+    const timer = killAfter && setTimeout(() => p.kill(), killAfter);
     p.stdout.on("data", (d) => (out += d));
     p.stderr.on("data", (d) => (err += d));
-    p.on("close", (code) => resolve({ code, out, err }));
+    p.on("close", (code) => {
+      if (timer) clearTimeout(timer);
+      resolve({ code, out, err });
+    });
     p.stdin.end(JSON.stringify({ hook_event_name: event, cwd: ".", ...input }));
   });
 }
@@ -253,27 +257,34 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
 }
 
 // 7. plain messages to Claude: one handled by a turn that ended normally is
-// settled; one whose turn failed gets a notice, and its link stays open
+// settled; one whose turn failed gets a notice, and its link stays open. A
+// one-off review whose reviewer's turn ended without an answer is told, as a
+// ChatGPT reviewer's is
 {
   const { id } = await call("link_create", { primary: gptPrimary, advisor: CLAUDE2, request: "Another review." });
   await runHook("claude", "listen", { session_id: CLAUDE2.id });
   await runHook("claude", "stop", { session_id: CLAUDE2.id });
   await until(() => state().messages.find((x) => x.id === reqOf(id).id).settledAt);
   assert.equal(state().endpoints["claude:claude-fail-2"].lastFailure, undefined, "a normal end clears the failure");
-  const sent = await call("send", { endpoint: gptPrimary, text: "Any thoughts on the cache?", linkId: id });
+  const unanswered = await until(() => failedFor(reqOf(id).id)[0]);
+  assert.deepEqual(unanswered.toEndpoint, gptPrimary);
+  assert.match(unanswered.text, /can't answer m\d+: the reviewer's turn ended without an answer\. No review result was received\./);
+  assert.equal(state().links[id].active, false, "that review closed");
+  // plain messages to Claude ride on a link where it asks
+  const { id: id2 } = await call("link_create", { primary: CLAUDE2, advisor: GPT, request: "Keep this open." });
+  const sent = await call("send", { endpoint: GPT, text: "Any thoughts on the cache?", linkId: id2 });
   await runHook("claude", "listen", { session_id: CLAUDE2.id });
   await until(() => state().messages.find((x) => x.id === sent.id).wokenAt);
   await runHook("claude", "stopfail", { session_id: CLAUDE2.id, error: "overloaded" });
   const n = await until(() => failedFor(sent.id)[0]);
   assert.match(n.text, /No reply was received/);
-  assert.equal(failedFor(reqOf(id).id).length, 0, "the settled review request isn't failed");
-  assert.equal(state().links[id].active, true, "a plain message's failure leaves the link alone");
+  assert.equal(state().links[id2].active, true, "a plain message's failure leaves the link alone");
   // a sender is warned about a chat last seen failing
-  const again = await call("send", { endpoint: gptPrimary, text: "Still there?", linkId: id });
+  const again = await call("send", { endpoint: GPT, text: "Still there?", linkId: id2 });
   assert.equal(again.lastFailure.error, "overloaded");
-  assert.equal((await call("status", { endpoint: gptPrimary })).lastFailures["claude:claude-fail-2"].error, "overloaded");
-  await call("link_close", { linkId: id });
-  console.log("7 a Claude plain message whose turn failed is told, a handled one isn't; the link stays; senders are warned");
+  assert.equal((await call("status", { endpoint: GPT })).lastFailures["claude:claude-fail-2"].error, "overloaded");
+  await call("link_close", { linkId: id2 });
+  console.log("7 a Claude reviewer's turn that ends without an answer fails a one-off review, told; a Claude plain message whose turn failed is told; the link stays; senders are warned");
 }
 
 // 8. event times decide, not arrival order: a late success doesn't clear a
@@ -1097,6 +1108,9 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
     await runHook("claude", "prompt", { session_id: C2.id, cwd: work, prompt: `Turn ${n}.`, prompt_id: `p${n}` });
     await sleep(700);
     fs.writeFileSync(f, reviewed);
+    // the agent's own review mustn't fail for this test's short deadline
+    // before coverage is judged (a slow machine takes longer to get there)
+    process.env.AGENT_REVIEW_BRIDGE_TEST_DEADLINE_MS = "600000";
     const own = await call("link_create", { primary: C2, advisor: G2, request: "mine", reqPaths: [{ path: tracked, fp: fingerprint(tracked, { fresh: true }).hash, head: null }] });
     fs.writeFileSync(f, ended);
     process.env.AGENT_REVIEW_BRIDGE_TEST_TURNJOB = "delay:1200";
@@ -1112,6 +1126,7 @@ const gptPrimary = { app: "openai", id: "gpt-asker" };
       assert.ok(ownLink.active || ["approved", "changes_requested"].includes(ownLink.decision), `turn ${n}: the agent's own review was eligible`);
     } finally {
       delete process.env.AGENT_REVIEW_BRIDGE_TEST_TURNJOB;
+      delete process.env.AGENT_REVIEW_BRIDGE_TEST_DEADLINE_MS;
     }
     await call("link_close", { linkId: own.id });
     return reviewsOfTurn(`Turn ${n}.`).length;
@@ -1547,8 +1562,8 @@ async function ownerOver(stateObj, fakeObj, ms = 1500) {
   const out = await new Promise((resolve, reject) =>
     execFile(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, AGENT_REVIEW_BRIDGE_TEST_PROTOCOL: "20" }, encoding: "utf8", timeout: 20_000 }, (e, o) => (e ? reject(e) : resolve(o))),
   );
-  assert.match(out, /^ping \{"pid":\d+,"protocol":22\}$/m, "a ping is answered");
-  assert.match(out, /older version of agent-review-bridge \(protocol 20\) than the one running now \(22\), so nothing was done\. Quit the app fully and open it again/);
+  assert.match(out, /^ping \{"pid":\d+,"protocol":23\}$/m, "a ping is answered");
+  assert.match(out, /older version of agent-review-bridge \(protocol 20\) than the one running now \(23\), so nothing was done\. Quit the app fully and open it again/);
   console.log("29 a server from before an update is refused, with a restart instruction");
 }
 
@@ -1819,6 +1834,693 @@ async function ownerOver(stateObj, fakeObj, ms = 1500) {
   await call("advise", { endpoint: R, requestId: fix.id, decision: "approved" });
   await call("auto_set", { endpoint: W, on: false });
   console.log("39 a late owner takes in the fix turn's prompt and Stop together: still the fix, as the next round, though it also answered a peer");
+}
+
+// 40-44: what Tolga's second review of PR #25 asked for.
+// an owner of its own over a state file and outbox files (a takeover), with
+// the state written normally
+async function ownerWith({ state: stateObj, pending, outbox = {}, prepare, env: extraEnv = {} }, ms, then = "") {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-takeover-"));
+  try {
+    if (stateObj) fs.writeFileSync(path.join(d, "state.json"), JSON.stringify(stateObj));
+    if (pending) fs.writeFileSync(path.join(d, "state.json.pending"), JSON.stringify(pending));
+    prepare?.(d);
+    fs.mkdirSync(path.join(d, "outbox"));
+    for (const [name, body] of Object.entries(outbox)) fs.writeFileSync(path.join(d, "outbox", name), body);
+    // (no deadline within the time it runs: a review it sends isn't sent again)
+    const env = { ...process.env, AGENT_REVIEW_BRIDGE_DIR: d, AGENT_REVIEW_BRIDGE_PORT: "7481", AGENT_REVIEW_BRIDGE_TEST_DEADLINE_MS: "600000" };
+    delete env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL;
+    delete env.AGENT_REVIEW_BRIDGE_TEST_PENDING_FAIL;
+    Object.assign(env, extraEnv);
+    const script = `const b = await import(${JSON.stringify(brokerUrl)}); await b.call("status"); await new Promise((r) => setTimeout(r, ${ms})); ${then} process.exit(0);`;
+    const out = execFileSync(process.execPath, ["--input-type=module", "-e", script], { env, encoding: "utf8" });
+    const events = fs.existsSync(path.join(d, "events.jsonl")) ? fs.readFileSync(path.join(d, "events.jsonl"), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
+    const read = (f) => (fs.existsSync(path.join(d, f)) ? JSON.parse(fs.readFileSync(path.join(d, f), "utf8")) : null);
+    const pendingNow = fs.existsSync(path.join(d, "state.json.pending")) && fs.statSync(path.join(d, "state.json.pending")).isFile() ? read("state.json.pending") : null;
+    return { state: read("state.json"), pending: pendingNow, events, outbox: fs.readdirSync(path.join(d, "outbox")), files: fs.readdirSync(d), out };
+  } finally {
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+}
+
+// 40. a review request still waiting on an open link is kept, whatever its
+// age; a turn's review whose request is gone (an older version dropped it by
+// age) doesn't hold the next ones for good
+{
+  const W = { app: "openai", id: "gpt-pruned" };
+  const R = { app: "claude", id: "claude-pruned" };
+  await everyOn(W, R);
+  await end2(W, "Waits on a closed reviewer.");
+  const first = await until(() => reviewsTo2(R)[0], 10000);
+  await end2(W, "The next turn.");
+  await until(() => (state().auto[`openai:${W.id}`].jobs ?? []).some((j) => j.lastMessage === "The next turn."), 10000);
+  const aged = state();
+  aged.messages.find((m) => m.id === first.id).ts = Date.now() - 8 * 24 * 3600_000;
+  const kept = await ownerOver(aged, null, 4000);
+  assert.ok(kept.state.messages.some((m) => m.id === first.id), "a week-old request on an open link is kept");
+  assert.equal(kept.state.messages.filter((m) => m.kind === "review-request" && m.toEndpoint.id === R.id).length, 1, "the next turn still waits behind it");
+  const lost = state();
+  lost.messages = lost.messages.filter((m) => m.id !== first.id);
+  const after = await ownerOver(lost, null, 6000);
+  assert.equal(after.state.links[first.linkId].active, false, "the review whose request is gone is closed");
+  assert.ok(after.state.notes.some((n) => n.to.id === W.id && /can no longer be answered/.test(n.text)), "the chat is told");
+  assert.ok(after.state.messages.some((m) => m.kind === "review-request" && m.toEndpoint.id === R.id && /The next turn\./.test(m.text)), "the next turn's review goes");
+  await call("auto_set", { endpoint: W, on: false });
+  console.log("40 a waiting review request is kept past a week; one whose request is gone is closed, said, and the next turn's review goes");
+}
+
+// 41. a state.json that can't be replaced (Windows refuses while another
+// process has it open): tried again for about a second; then the state is
+// kept exactly as it is beside it (state.json.pending), which a new owner
+// takes (the later saveSeq, whatever the clock), while nothing is sent and
+// the hooks act on nothing until state.json is written; with neither
+// writable, nothing an app asks for is taken on, and the outbox waits
+{
+  process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_RETRY_MS = "1";
+  const pendingFile = path.join(dir, "state.json.pending");
+  const pendingNow = () => (fs.existsSync(pendingFile) ? JSON.parse(fs.readFileSync(pendingFile, "utf8")) : null);
+  const outbox = () => fs.readdirSync(path.join(dir, "outbox")).filter((f) => f.endsWith(".json"));
+  const recover = async () => {
+    delete process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL;
+    delete process.env.AGENT_REVIEW_BRIDGE_TEST_PENDING_FAIL;
+    await until(() => !fs.existsSync(pendingFile) && outbox().length === 0, 15000);
+  };
+  const X = { app: "claude", id: "claude-save" };
+  const rev = state().autoRev?.[`claude:${X.id}`] ?? 0;
+  process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL = "5";
+  await call("auto_set", { endpoint: X, on: false });
+  assert.equal(state().autoRev[`claude:${X.id}`], rev + 1, "a few refusals: saved within the retries");
+  assert.equal(pendingNow(), null);
+
+  // state.json refused, the image beside it kept: what an app was told stands
+  const W = { app: "claude", id: "claude-save-worker" };
+  const G = { app: "openai", id: "gpt-save-reviewer" };
+  const P = { app: "openai", id: "gpt-save-asker" };
+  await everyOn(W, G);
+  const sends = () => delivered2().filter((e) => e.threadId === G.id).length;
+  const sent0 = sends();
+  process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL = "always";
+  const coded = await call("link_create", { primary: P, request: "Join me later." });
+  assert.match(coded.joinCode, /^[0-9a-f]{6}$/, "answered");
+  assert.ok(!state().links[coded.id] && pendingNow()?.links?.[coded.id], "kept beside state.json, not in it");
+  await end2(W, "Saved later.");
+  await until(() => outbox().length === 0, 8000);
+  await sleep(1000);
+  assert.equal(sends(), sent0, "nothing sent before state.json is written");
+  assert.ok(fs.readFileSync(path.join(dir, "events.jsonl"), "utf8").includes('"kept":"pending"'), "logged");
+  // the owner lost now: a new one takes the later image; the code it
+  // answered joins there, and the turn's review goes once
+  const R = { app: "claude", id: "claude-save-joiner" };
+  const taken = await ownerWith({ state: state(), pending: pendingNow() }, 6000, `console.log(JSON.stringify(await b.call("link_join", { code: ${JSON.stringify(coded.joinCode)}, endpoint: ${JSON.stringify(R)} })));`);
+  assert.match(taken.out, new RegExp(`"${coded.id}"`), "the code it was given joins on the new owner");
+  assert.equal(taken.events.filter((e) => e.op === "fake-codex-deliver" && e.threadId === G.id).length, 1, "the turn's review sent once by the new owner");
+  assert.equal(taken.pending, null, "its state.json written, the image beside it gone");
+  // this owner, once state.json can be written: kept, then sent once
+  await recover();
+  assert.ok(state().links[coded.id], "in state.json now");
+  await until(() => sends() === sent0 + 1, 10000);
+  await sleep(800);
+  assert.equal(sends(), sent0 + 1, "sent once");
+  await call("link_close", { linkId: coded.id });
+
+  // which image counts: the later saveSeq, in the same millisecond and with a
+  // clock set back too; one state.json has caught up with goes
+  const base = state();
+  const img = (marker, saveSeq, savedAt) => ({ ...base, marker, saveSeq, savedAt });
+  for (const [why, main, pend, wins] of [
+    ["the same millisecond, the image beside it later", img("main", 10, 5000), img("pending", 11, 5000), "pending"],
+    ["a recovered save, lost before its cleanup", img("main", 12, 5000), img("pending", 11, 5000), "main"],
+    ["a clock set back", img("main", 10, 9000), img("pending", 11, 1000), "pending"],
+  ]) {
+    const o = await ownerWith({ state: main, pending: pend }, 300);
+    assert.equal(o.state.marker, wins, why);
+    assert.equal(o.pending, null, `${why}: the image beside state.json gone`);
+  }
+  // one that's there but can't be read when an owner takes over: never taken
+  // for gone (moved aside, kept, said), and the hooks don't wait on it
+  const unread = await ownerWith({ state: img("main", 10, 5000), prepare: (d) => fs.mkdirSync(path.join(d, "state.json.pending")) }, 300);
+  assert.ok(!unread.files.includes("state.json.pending"), "not left where the hooks would wait on it");
+  assert.ok(unread.files.some((f) => /^state\.json\.pending\.unread-\d+$/.test(f)), "kept aside");
+  assert.ok(unread.events.some((e) => e.op === "pending-unreadable" && e.kept), "said");
+  // ... one that can't be moved aside at first either, while state.json stays
+  // refused: nothing is kept (a change is refused, or said may be lost), and
+  // the move is tried again on later ticks; once it's moved aside, the state
+  // is kept beside state.json again, and what's to send waits for state.json
+  const U1 = { app: "openai", id: "gpt-unread-first" };
+  const U2 = { app: "openai", id: "gpt-unread-second" };
+  const later = await ownerWith(
+    { state: img("main", 10, 5000), prepare: (d) => fs.mkdirSync(path.join(d, "state.json.pending")), env: { AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL: "always", AGENT_REVIEW_BRIDGE_TEST_RM_PENDING_FAIL: "1000" } },
+    300,
+    `const fs = await import("node:fs"); const d = process.env.AGENT_REVIEW_BRIDGE_DIR; const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+     const image = () => { try { return JSON.parse(fs.readFileSync(d + "/state.json.pending", "utf8")); } catch { return null; } };
+     const sent = () => fs.readFileSync(d + "/events.jsonl", "utf8").split("\\n").filter((l) => l.includes('"fake-codex-deliver"') && l.includes("gpt-unread-")).length;
+     let first = "answered"; try { await b.call("link_create", { primary: ${JSON.stringify(X)}, advisor: ${JSON.stringify(U1)}, request: "Asked while nothing could be kept." }); } catch (e) { first = e.message; }
+     await wait(2500);
+     const stillThere = fs.statSync(d + "/state.json.pending").isDirectory();
+     delete process.env.AGENT_REVIEW_BRIDGE_TEST_RM_PENDING_FAIL;
+     await wait(2500);
+     const afterTick = { files: fs.readdirSync(d), kept: !!image() };
+     const second = await b.call("link_create", { primary: ${JSON.stringify(X)}, advisor: ${JSON.stringify(U2)}, request: "Asked once it could be kept again." });
+     await wait(1500);
+     const keptSecond = !!image()?.links?.[second.id];
+     const sentBefore = sent();
+     delete process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL;
+     await wait(3000);
+     console.log(JSON.stringify({ first, stillThere, afterTick, keptSecond, sentBefore }));`,
+  );
+  const lr = JSON.parse(later.out.trim().split("\n").pop());
+  assert.match(lr.first, /nothing was done|may be lost/, "nothing could be kept");
+  assert.ok(lr.stillThere, "never written over while it can't be moved");
+  assert.ok(lr.afterTick.files.some((f) => /^state\.json\.pending\.unread-\d+$/.test(f)), "moved aside on a later tick, with state.json still refused");
+  assert.ok(lr.afterTick.kept, "then the state is kept beside state.json again");
+  assert.ok(lr.keptSecond, "a later change is kept there too");
+  assert.equal(lr.sentBefore, 0, "nothing sent before state.json is written");
+  assert.ok(later.files.some((f) => /^state\.json\.pending\.unread-\d+$/.test(f)) && !later.files.includes("state.json.pending"), "kept aside; the image beside state.json gone once it's written");
+  const savedAt = later.events.findIndex((e) => e.op === "saved-again");
+  const ours = (e) => e.op === "fake-codex-deliver" && [U1.id, U2.id].includes(e.threadId);
+  const sentAt = later.events.map((e, i) => (ours(e) ? i : -1)).filter((i) => i >= 0);
+  const sentTo = (id) => later.events.filter((e) => ours(e) && e.threadId === id).length;
+  assert.equal(sentTo(U2.id), 1, "sent once state.json is written");
+  assert.equal(sentTo(U1.id), /may be lost/.test(lr.first) ? 1 : 0, "the first change too, once, only if it was taken on");
+  assert.ok(savedAt >= 0 && sentAt.every((i) => i > savedAt), "sent after state.json was written, not before");
+  // ... and one removed by hand before it could be moved: nothing is left to
+  // keep, so the state is kept beside state.json again
+  const gone = await ownerWith(
+    { state: img("main", 10, 5000), prepare: (d) => fs.mkdirSync(path.join(d, "state.json.pending")), env: { AGENT_REVIEW_BRIDGE_TEST_RM_PENDING_FAIL: "1000" } },
+    300,
+    `const fs = await import("node:fs"); fs.rmSync(process.env.AGENT_REVIEW_BRIDGE_DIR + "/state.json.pending", { recursive: true });
+     delete process.env.AGENT_REVIEW_BRIDGE_TEST_RM_PENDING_FAIL; process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL = "always";
+     console.log(JSON.stringify(await b.call("link_create", { primary: ${JSON.stringify(X)}, request: "Kept after all." })));`,
+  );
+  assert.ok(gone.pending?.links?.[JSON.parse(gone.out.trim().split("\n").pop()).id], "kept beside state.json");
+  // a file that can't be read for now when an owner takes over (in use, or
+  // no access) may hold the latest state: nothing is taken on, sent or
+  // watched from an older one until it can be read; then the newer image
+  // counts, and what waited (the outbox) goes
+  const newerImg = { ...img("pending", 20, 5000), notes: [...(base.notes ?? []), { id: "n-busy", to: { app: "claude", id: "claude-busy" }, text: "Only in the newer image.", at: Date.now() }] };
+  const busy = await ownerWith(
+    { state: img("main", 10, 5000), pending: newerImg, outbox: { "1-busy.json": JSON.stringify({ op: "notes_ack", args: { ids: ["n-busy"] } }) }, env: { AGENT_REVIEW_BRIDGE_TEST_READ_FAIL: "state.json.pending" } },
+    300,
+    `const fs = await import("node:fs"); const d = process.env.AGENT_REVIEW_BRIDGE_DIR; const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+     const during = { status: (await b.call("status")).stateUnread ?? null, files: fs.readdirSync(d), marker: JSON.parse(fs.readFileSync(d + "/state.json", "utf8")).marker };
+     try { await b.call("link_create", { primary: ${JSON.stringify(X)}, request: "While it can't be read." }); during.change = "taken"; } catch (e) { during.change = e.message; }
+     try { during.read = (await b.call("read_chat_allowed", { endpoint: { app: "openai", id: "gpt-reviewer-only-in-newer" } })).allowed; } catch (e) { during.read = e.message; }
+     await wait(1500);
+     during.outbox = fs.readdirSync(d + "/outbox");
+     delete process.env.AGENT_REVIEW_BRIDGE_TEST_READ_FAIL;
+     await wait(2500);
+     const after = { status: (await b.call("status")).stateUnread ?? null, change: (await b.call("link_create", { primary: ${JSON.stringify(X)}, request: "Once it's read." })).id };
+     console.log(JSON.stringify({ during, after }));`,
+  );
+  const br = JSON.parse(busy.out.trim().split("\n").pop());
+  assert.equal(br.during.status?.file, "state.json.pending", "bridge_status says which can't be read");
+  assert.match(br.during.change, /can't read its saved state/, "nothing taken on from the older state");
+  assert.match(String(br.during.read), /can't read its saved state/, "nor whether a chat may be read decided from it");
+  assert.equal(br.during.marker, "main", "state.json not written from the older state");
+  assert.ok(br.during.files.includes("state.json.pending") && !br.during.files.some((f) => /unread/.test(f)), "the image in use isn't moved aside");
+  assert.deepEqual(br.during.outbox, ["1-busy.json"], "the outbox waits");
+  assert.equal(br.after.status, null, "read once it can be");
+  assert.equal(busy.state.marker, "pending", "the newer image counts, written to state.json");
+  assert.ok(busy.state.notes.find((n) => n.id === "n-busy")?.deliveredAt, "then the outbox goes, on the newer state");
+  assert.equal(busy.pending, null, "the image beside state.json gone");
+  assert.ok(busy.state.links[br.after.change], "changes taken on again");
+  assert.ok(busy.events.some((e) => e.op === "state-unread") && busy.events.some((e) => e.op === "state-read"), "said");
+  // ... state.json itself: nothing from an empty state either
+  const mainBusy = await ownerWith(
+    { state: img("main", 10, 5000), env: { AGENT_REVIEW_BRIDGE_TEST_READ_FAIL: "state.json" } },
+    300,
+    `let change; try { await b.call("link_create", { primary: ${JSON.stringify(X)}, request: "While state.json can't be read." }); change = "taken"; } catch (e) { change = e.message; }
+     delete process.env.AGENT_REVIEW_BRIDGE_TEST_READ_FAIL;
+     await new Promise((r) => setTimeout(r, 2500));
+     console.log(JSON.stringify({ change, after: (await b.call("link_create", { primary: ${JSON.stringify(X)}, request: "Once it's read." })).id }));`,
+  );
+  const mb = JSON.parse(mainBusy.out.trim().split("\n").pop());
+  assert.match(mb.change, /can't read its saved state/);
+  assert.equal(mainBusy.state.marker, "main", "state.json kept: nothing written from an empty state");
+  assert.ok(mainBusy.state.links[mb.after] && Object.keys(base.links).filter((id) => base.links[id].active).every((id) => mainBusy.state.links[id]), "its links all there, and the change made once it's read");
+  // ... and one a newer version wrote, found once it can be read: not taken
+  // over and nothing of it touched (the files and the outbox as they were,
+  // nothing sent), and said as when a process starts on it
+  for (const files of [
+    { state: img("main", 10, 5000), pending: { ...img("pending", 20, 5000), protocol: base.protocol + 1 } },
+    { state: { ...img("main", 10, 5000), protocol: base.protocol + 1 } },
+  ]) {
+    const name = files.pending ? "state.json.pending" : "state.json";
+    const o = await ownerWith(
+      { ...files, outbox: { "1-newer.json": JSON.stringify({ op: "notes_ack", args: { ids: [] } }) }, env: { AGENT_REVIEW_BRIDGE_TEST_READ_FAIL: name } },
+      300,
+      `delete process.env.AGENT_REVIEW_BRIDGE_TEST_READ_FAIL;
+       await new Promise((r) => setTimeout(r, 2500));
+       let after; try { await b.call("status"); after = "answered"; } catch (e) { after = e.message; }
+       console.log(JSON.stringify({ after }));`,
+    );
+    const after = JSON.parse(o.out.trim().split("\n").pop()).after;
+    assert.match(after, new RegExp(`newer version of agent-review-bridge \\(protocol ${base.protocol + 1}\\)`), `${name}: said`);
+    assert.deepEqual(o.state, files.state, `${name}: state.json as it was`);
+    assert.deepEqual(o.pending, files.pending ?? null, `${name}: the image beside it as it was`);
+    assert.deepEqual(o.outbox, ["1-newer.json"], `${name}: the outbox as it was`);
+    assert.ok(o.events.some((e) => e.op === "state-newer") && o.events.some((e) => e.op === "broker-step-down"), `${name}: not taken over`);
+    assert.ok(!o.events.some((e) => ["fake-codex-deliver", "saved-again", "save-failed", "pending-unreadable", "outbox-error"].includes(e.op)), `${name}: nothing sent or written`);
+  }
+  // a second process that starts while this owner holds the port reads,
+  // loses the port and is served: it touches neither file
+  process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL = "always";
+  await call("auto_set", { endpoint: X, on: false });
+  const mainBefore = fs.readFileSync(path.join(dir, "state.json"), "utf8");
+  const seqBefore = pendingNow().saveSeq;
+  await new Promise((resolve, reject) =>
+    execFile(process.execPath, ["--input-type=module", "-e", `const b = await import(${JSON.stringify(brokerUrl)}); await b.call("ping"); process.exit(0);`], { env: process.env, timeout: 20_000 }, (e) => (e ? reject(e) : resolve())),
+  );
+  assert.equal(fs.readFileSync(path.join(dir, "state.json"), "utf8"), mainBefore, "state.json untouched");
+  assert.ok(pendingNow()?.saveSeq >= seqBefore, "the newer image beside it still there");
+  await recover();
+
+  // the change saved, its delivery's own save refused: nothing sent, the
+  // delivery record as it was; sent once state.json is written
+  const D = { app: "openai", id: "gpt-save-dispatch" };
+  const sendsD = () => delivered2().filter((e) => e.threadId === D.id).length;
+  process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL = "after:1:always";
+  const dl = await call("link_create", { primary: X, advisor: D, request: "Deliver after the save." });
+  await sleep(800);
+  assert.equal(sendsD(), 0, "nothing sent while its delivery's save is refused");
+  await recover();
+  await until(() => sendsD() === 1, 8000);
+  await sleep(500);
+  assert.equal(sendsD(), 1, "sent once");
+  assert.equal(state().messages.find((m) => m.linkId === dl.id).dispatch.attempt, 1, "its first delivery record was put back: this is still its first attempt");
+  await call("link_close", { linkId: dl.id });
+
+  // the hooks act on nothing they'd read from a state.json that may be
+  // behind: a request taken back meanwhile doesn't wake its Claude reviewer,
+  // and the key-moments Stop check stays quiet; once state.json is written,
+  // what is still to deliver wakes it once, and the check is back
+  const RV = { app: "claude", id: "claude-save-listener" };
+  const A = await call("link_create", { primary: P, advisor: RV, request: "Taken back." });
+  await call("link_create", { primary: P, advisor: RV, request: "Still wanted." });
+  const K = { app: "claude", id: "claude-save-check" };
+  const kdir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-savecheck-"));
+  fs.writeFileSync(path.join(kdir, "a.txt"), "changed");
+  await call("auto_set", { endpoint: K, on: true, reviewer: G, paths: [{ path: kdir, fp: "approved-before", head: null }] });
+  process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL = "always";
+  await call("link_close", { linkId: A.id });
+  assert.ok(fs.existsSync(pendingFile));
+  process.env.AGENT_REVIEW_BRIDGE_TEST_BEAT_MS = "200";
+  const poll = await runHook("claude", "listen", { session_id: RV.id }, { killAfter: 2500 });
+  delete process.env.AGENT_REVIEW_BRIDGE_TEST_BEAT_MS;
+  assert.notEqual(poll.code, 2, "no wake from a state.json that may be behind");
+  const beat = JSON.parse(fs.readFileSync(path.join(dir, "listeners", `claude-${RV.id}.json`), "utf8"));
+  assert.ok(beat.beat - beat.startedAt >= 1000, `still said it was alive while it waited (${beat.beat - beat.startedAt} ms)`);
+  const quiet = await runHook("claude", "stop", { session_id: K.id, cwd: kdir });
+  assert.doesNotMatch(quiet.out, /"decision":"block"/, "no Stop check either");
+  // state.json written again, the image beside it not removable at first,
+  // and nothing else changes: it goes on a later tick, and the listener,
+  // which waited all along, then wakes once with what is still to deliver
+  const listening = runHook("claude", "listen", { session_id: RV.id }, { killAfter: 15000 });
+  await sleep(1200);
+  process.env.AGENT_REVIEW_BRIDGE_TEST_RM_PENDING_FAIL = "1";
+  await recover();
+  const woke = await listening;
+  delete process.env.AGENT_REVIEW_BRIDGE_TEST_RM_PENDING_FAIL;
+  assert.equal(woke.code, 2);
+  assert.match(woke.err, /Still wanted\./);
+  assert.doesNotMatch(woke.err, /Taken back\./, "the request taken back isn't woken");
+  assert.match((await runHook("claude", "stop", { session_id: K.id, cwd: kdir })).out, /"decision":"block"/, "the Stop check is back");
+  await call("auto_set", { endpoint: K, on: false });
+  fs.rmSync(kdir, { recursive: true, force: true });
+
+  // a key-moments chat while state.json may be behind (another chat's change
+  // put the image beside it): auto mode's words are held, never the
+  // every-turn ones; the user's rules still go; back once it's written
+  const KM = { app: "claude", id: "claude-save-key-moments" };
+  const cfg = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-cfg-"));
+  fs.writeFileSync(path.join(cfg, "rules.md"), "Never commit without asking me.\n");
+  const cfgBefore = process.env.AGENT_REVIEW_BRIDGE_CONFIG_DIR;
+  process.env.AGENT_REVIEW_BRIDGE_CONFIG_DIR = cfg;
+  await call("auto_set", { endpoint: KM, on: true, reviewer: G, paths: [{ path: work2, fp: null, head: null }] });
+  const promptOf = async () => (await runHook("claude", "prompt", { session_id: KM.id, cwd: work2, prompt: "Next step.", prompt_id: `km-${Date.now()}` })).out;
+  process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL = "always";
+  await call("auto_set", { endpoint: X, on: false });
+  assert.ok(fs.existsSync(pendingFile));
+  const held = await promptOf();
+  assert.doesNotMatch(held, /reviewing every turn/, "never the every-turn words");
+  assert.doesNotMatch(held, /Auto mode is on: get the reviewer's approval/, "auto mode's words held");
+  assert.match(held, /Never commit without asking me\./, "the user's rules still go");
+  const startOf = async () => (await runHook("claude", "start", { session_id: KM.id, source: "resume" })).out;
+  assert.doesNotMatch(await startOf(), /Auto mode is on/, "nor at a session's start");
+  // a chat whose auto mode only the image beside state.json has: its
+  // listener doesn't take the older state.json's "not linked" for good
+  const NW = { app: "claude", id: "claude-save-new-chat" };
+  const NR = { app: "openai", id: "gpt-save-new-reviewer" };
+  await call("auto_set", { endpoint: NW, on: true, reviewer: NR, paths: [{ path: work2, fp: null, head: null }] });
+  assert.ok(!state().auto?.[`claude:${NW.id}`]?.on, "only beside state.json");
+  const newListener = runHook("claude", "listen", { session_id: NW.id }, { killAfter: 15000 });
+  await sleep(1200);
+  await recover();
+  assert.match(await promptOf(), /Auto mode is on: get the reviewer's approval/, "back once state.json is written");
+  assert.match(await startOf(), /Auto mode is on/, "at a session's start too");
+  await call("send", { endpoint: NR, text: "Hello, new chat.", channel: true, to: NW });
+  const wokeNew = await newListener;
+  assert.equal(wokeNew.code, 2, "it listened all along: woken once state.json is written, without a new turn");
+  assert.match(wokeNew.err, /Hello, new chat\./);
+  await call("auto_set", { endpoint: NW, on: false });
+  await call("auto_set", { endpoint: KM, on: false });
+  if (cfgBefore === undefined) delete process.env.AGENT_REVIEW_BRIDGE_CONFIG_DIR;
+  else process.env.AGENT_REVIEW_BRIDGE_CONFIG_DIR = cfgBefore;
+  fs.rmSync(cfg, { recursive: true, force: true });
+
+  // every turn turned on (from nothing, or from key moments) while only the
+  // image beside state.json has it: the hooks write the turn down all the
+  // same, and it's reviewed once state.json is written; turned off that way,
+  // the broker leaves the turn alone
+  const reviewsOf = (text) => delivered2().filter((e) => e.threadId === G.id && e.text.includes(text)).length;
+  const turn = async (who, text) => {
+    await runHook("claude", "prompt", { session_id: who.id, cwd: work2, prompt: `Ask ${text}`, prompt_id: text });
+    await runHook("claude", "stop", { session_id: who.id, cwd: work2, prompt_id: text, last_assistant_message: text });
+    await until(() => outbox().length === 0, 8000);
+  };
+  const E1 = { app: "claude", id: "claude-save-every-new" };
+  const E2 = { app: "claude", id: "claude-save-every-switch" };
+  const E3 = { app: "claude", id: "claude-save-every-off" };
+  await call("auto_set", { endpoint: E2, on: true, reviewer: G, paths: [{ path: work2, fp: null, head: null }] });
+  await everyOn(E3, G);
+  process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL = "always";
+  await everyOn(E1, G);
+  await call("auto_set", { endpoint: E2, on: true, everyTurn: true });
+  await call("auto_set", { endpoint: E3, on: false });
+  assert.ok(!state().auto?.[`claude:${E1.id}`]?.on && !state().auto[`claude:${E2.id}`].everyTurn && state().auto[`claude:${E3.id}`].on, "state.json behind on all three");
+  await turn(E1, "Turned on behind.");
+  await turn(E2, "Switched behind.");
+  await turn(E3, "Turned off behind.");
+  await recover();
+  await until(() => reviewsOf("Turned on behind.") === 1 && reviewsOf("Switched behind.") === 1, 15000);
+  await sleep(1500);
+  assert.deepEqual([reviewsOf("Turned on behind."), reviewsOf("Switched behind."), reviewsOf("Turned off behind.")], [1, 1, 0], "each reviewed once; the one turned off not at all");
+  for (const e of [E1, E2]) await call("auto_set", { endpoint: e, on: false });
+
+  // neither writable, and the first thing asked is a receive: it's undone and
+  // refused, so what it took stays unread, here and in state.json (neither
+  // lost nor handed over twice): a listener started meanwhile hands it over
+  // once, and a receive afterwards doesn't again
+  const Q = { app: "claude", id: "claude-save-receive" };
+  const lq = await call("link_create", { primary: P, advisor: Q, request: "Read me once." });
+  process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL = "always";
+  process.env.AGENT_REVIEW_BRIDGE_TEST_PENDING_FAIL = "always";
+  await assert.rejects(call("receive", { side: "claude", endpoint: Q }), /nothing was done/, "refused: nothing it took is handed over");
+  assert.ok(!fs.existsSync(pendingFile) && !reqOf(lq.id).readAt, "unread in state.json, with nothing beside it");
+  const heard = await runHook("claude", "listen", { session_id: Q.id }, { killAfter: 8000 });
+  assert.equal(heard.code, 2, "a listener started meanwhile wakes it");
+  assert.match(heard.err, /Read me once\./);
+  await recover();
+  await until(() => reqOf(lq.id)?.readAt, 8000);
+  assert.ok(!(await call("receive", { side: "claude", endpoint: Q })).messages.some((x) => x.linkId === lq.id), "not handed over a second time");
+  await call("link_close", { linkId: lq.id });
+  // ... and without a listener: undone here too, so a receive once it can be
+  // kept hands it over (never marked read without being handed over)
+  const Q2 = { app: "claude", id: "claude-save-receive-later" };
+  const lq2 = await call("link_create", { primary: P, advisor: Q2, request: "Read me later." });
+  process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL = "always";
+  process.env.AGENT_REVIEW_BRIDGE_TEST_PENDING_FAIL = "always";
+  const seq2 = state().saveSeq;
+  await assert.rejects(call("receive", { side: "claude", endpoint: Q2 }), /nothing was done/);
+  await recover();
+  await until(() => state().saveSeq > seq2, 8000);
+  assert.ok(!reqOf(lq2.id).readAt, "still unread once state.json is written");
+  assert.ok((await call("receive", { side: "claude", endpoint: Q2 })).messages.some((x) => x.linkId === lq2.id && /Read me later\./.test(x.text)), "handed over now");
+  await call("link_close", { linkId: lq2.id });
+
+  // neither writable: the change an app asked for whose own save failed is
+  // said may be lost; the next ones aren't taken on at all; the outbox waits
+  // (501 files too: none applied twice); then each once
+  const Z = { app: "claude", id: "claude-save-z" };
+  const Y = { app: "claude", id: "claude-save-many" };
+  const l = await call("link_create", { primary: P, advisor: Y, request: "Woken many times." });
+  const m = reqOf(l.id);
+  const revZ = (await call("status", { endpoint: Z })).autoRev;
+  process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL = "always";
+  process.env.AGENT_REVIEW_BRIDGE_TEST_PENDING_FAIL = "always";
+  await assert.rejects(call("auto_set", { endpoint: Z, on: false }), /couldn't save it .* may be lost if the bridge stops/);
+  await assert.rejects(call("auto_set", { endpoint: Z, on: false }), /nothing was done/);
+  await assert.rejects(call("receive", { side: "claude", endpoint: Y }), /nothing was done/);
+  assert.equal((await call("status", { endpoint: Z })).autoRev, revZ + 1, "the first applied once, the refused ones not at all");
+  for (let i = 0; i < 501; i++) fs.writeFileSync(path.join(dir, "outbox", `zz-${String(i).padStart(4, "0")}.json`), JSON.stringify({ op: "wake_ack", args: { ids: [m.id], at: Date.now() } }));
+  await sleep(1000);
+  assert.equal(outbox().length, 501, "none removed while nothing can be kept");
+  await recover();
+  assert.equal(state().messages.find((x) => x.id === m.id).wakes, 501, "each applied once");
+  assert.equal(state().autoRev[`claude:${Z.id}`], revZ + 1, "kept once");
+  delete process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_RETRY_MS;
+  await call("link_close", { linkId: l.id });
+  await call("auto_set", { endpoint: W, on: false });
+  console.log("41 a state.json that can't be replaced: kept beside it (taken by a new owner, join codes and all; the later saveSeq wins; a losing process touches nothing), nothing sent and no hook acting on it until state.json is written; neither writable: nothing taken on (a receive undone), the outbox waits, then each once; a file that can't be read when an owner takes over is waited for (a newer version's, found then, not taken over), a damaged one moved aside");
+}
+
+// 42. a Claude reviewer woken with a review that its turn didn't answer, the
+// end of that turn taken in first: told all the same; woken and never ended
+// (stopped by the user): told past the deadline, for a one-off review too
+{
+  const P = { app: "openai", id: "gpt-order-asker" };
+  const R = { app: "claude", id: "claude-order-reviewer" };
+  const a = await call("link_create", { primary: P, advisor: R, request: "First." });
+  const ma = reqOf(a.id);
+  const t = Date.now();
+  await call("turn_ok", { endpoint: R, at: t });
+  await call("wake_ack", { ids: [ma.id], at: t - 100 });
+  const fa = await until(() => failedFor(ma.id)[0]);
+  assert.match(fa.text, /the reviewer's turn ended without an answer/);
+  assert.equal(state().links[a.id].active, false);
+  const b = await call("link_create", { primary: P, advisor: R, request: "Second." });
+  const mb = reqOf(b.id);
+  await call("wake_ack", { ids: [mb.id], at: Date.now() });
+  const fb = await until(() => failedFor(mb.id)[0], 10000);
+  assert.match(fb.text, /woken with it and gave no answer within/);
+  console.log("42 a Claude reviewer's turn end taken in before its wake still fails the unanswered review; woken and never ended, a one-off review fails past the deadline");
+}
+
+// 43. bridge_unlink takes back what it closed: a request not handed over yet
+// is never sent; the reviewer leaving a turn's review puts that turn back in
+// line as it was, and the chat hears it has no reviewer; the working chat
+// stopping its own turn's review cancels it
+{
+  const W = { app: "openai", id: "gpt-unlink-worker" };
+  const R = { app: "claude", id: "claude-unlink-reviewer" };
+  const key = `openai:${W.id}`;
+  await everyOn(W, R);
+  await end2(W, "Left by its reviewer.");
+  const first = await until(() => reviewsTo2(R)[0], 10000);
+  const tries = state().links[first.linkId].turn?.tries;
+  await call("link_close", { endpoint: R });
+  const dropped = state().messages.find((x) => x.id === first.id);
+  assert.ok(dropped.dropped && dropped.readAt, "not read yet: never sent (its listener won't wake it)");
+  const requeued = await until(() => state().auto[key].jobs?.find((j) => j.retry === first.linkId));
+  assert.equal(requeued.tries, tries, "back in line as it was: no try used up");
+  assert.equal(requeued.lastMessage, "Left by its reviewer.");
+  assert.equal(state().auto[key].reviewer, null, "no reviewer now");
+  await until(() => notesFor2(W).some((n) => /has no reviewer yet/.test(n.text)));
+  await everyOn(W, R);
+  const second = await until(() => reviewsTo2(R).find((x) => x.id !== first.id), 10000);
+  await call("link_close", { endpoint: W });
+  assert.ok(state().messages.find((x) => x.id === second.id).dropped, "taken back");
+  await sleep(300);
+  assert.equal((state().auto[key].jobs ?? []).length, 0, "the working chat's own unlink cancels its turn's review");
+  await call("auto_set", { endpoint: W, on: false });
+  // a ChatGPT reviewer that leaves after its request reached it: that can't
+  // be taken back (its answer is refused), and the turn goes back in line
+  const W2 = { app: "claude", id: "claude-unlink-worker" };
+  const G2 = { app: "openai", id: "gpt-unlink-reviewer" };
+  await everyOn(W2, G2);
+  await end2(W2, "Left by a ChatGPT reviewer.");
+  const sent = await until(() => reviewsTo2(G2).find((m) => m.dispatch?.state === "sent"), 10000);
+  await call("link_close", { endpoint: G2 });
+  assert.ok(!state().messages.find((x) => x.id === sent.id).dropped, "it had reached its chat: not taken back");
+  await until(() => state().auto[`claude:${W2.id}`].jobs?.some((j) => j.retry === sent.linkId));
+  await assert.rejects(call("advise", { endpoint: G2, requestId: sent.id, decision: "approved" }), /belongs to a closed link/, "its answer refused");
+  await call("auto_set", { endpoint: W2, on: false });
+  console.log("43 unlink takes back what it closed; the reviewer leaving puts the turn back in line as it was, told; the working chat's own unlink cancels");
+}
+
+// 44. a turn's review held behind one still out doesn't look whether ChatGPT
+// is open (nor say it's closed); once it can go, a closed ChatGPT is looked
+// at again later each time, sooner again after a new turn
+{
+  const W = { app: "claude", id: "claude-closed-order" };
+  const G = { app: "openai", id: "gpt-closed-order" };
+  await everyOn(W, G);
+  await end2(W, "First, while open.");
+  const first = await until(() => reviewsTo2(G)[0], 10000);
+  const waits = () =>
+    fs
+      .readFileSync(path.join(dir, "events.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .map((x) => JSON.parse(x))
+      .filter((e) => e.op === "turn_wait_closed");
+  const waits0 = waits().length;
+  process.env.AGENT_REVIEW_BRIDGE_FAKE_CHATGPT_RUNNING = "0";
+  try {
+    await end2(W, "Second, held.");
+    await sleep(1000);
+    assert.ok(!notesFor2(W).some((n) => /ChatGPT Desktop is closed/.test(n.text)), "held behind the review out: no look, no 'closed' note");
+    assert.equal(waits().length, waits0);
+    await call("advise", { endpoint: G, requestId: first.id, decision: "approved" });
+    await until(() => notesFor2(W).some((n) => /ChatGPT Desktop is closed/.test(n.text)), 8000);
+    await until(() => waits().length >= waits0 + 4, 8000);
+    const grown = waits().slice(waits0).map((e) => e.ms);
+    assert.ok(grown.every((ms, i) => i === 0 || ms >= grown[i - 1]) && grown.at(-1) > grown[0], `looked at again later each time (${grown.join(", ")})`);
+    const mark = waits().length;
+    await end2(W, "Third, a new turn.");
+    await until(() => waits().slice(mark).some((e) => e.ms === grown[0]), 8000);
+  } finally {
+    process.env.AGENT_REVIEW_BRIDGE_FAKE_CHATGPT_RUNNING = "1";
+  }
+  await until(() => reviewsTo2(G).some((m) => /Second, held\./.test(m.text)), 10000);
+  await call("auto_set", { endpoint: W, on: false });
+  console.log("44 a review held behind one out doesn't look at ChatGPT; a closed ChatGPT is looked at later each time, sooner after a new turn");
+}
+
+// 45. the Stop hook reads the work tree within one budget: slow git doesn't
+// take it past its time limit; what isn't read in time is unknown, and the
+// turn is queued and its facts written all the same
+{
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-budget-"));
+  execFileSync("git", ["init", "-q"], { cwd: repo });
+  for (let i = 0; i < 50; i++) fs.writeFileSync(path.join(repo, `f${i}.txt`), `line ${i}\n`);
+  execFileSync("git", ["add", "."], { cwd: repo });
+  execFileSync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "init"], { cwd: repo });
+  const W = { app: "claude", id: "claude-budget" };
+  const G = { app: "openai", id: "gpt-budget" };
+  await call("auto_set", { endpoint: W, on: true, everyTurn: true, reviewer: G, paths: [{ path: repo, fp: null, head: null }] });
+  process.env.AGENT_REVIEW_BRIDGE_TEST_GIT_DELAY = "700";
+  process.env.AGENT_REVIEW_BRIDGE_TEST_STOP_BUDGET = "1500";
+  let took;
+  try {
+    const t = Date.now();
+    await runHook("claude", "stop", { session_id: W.id, cwd: repo, last_assistant_message: "Slow git." });
+    took = Date.now() - t;
+  } finally {
+    delete process.env.AGENT_REVIEW_BRIDGE_TEST_GIT_DELAY;
+    delete process.env.AGENT_REVIEW_BRIDGE_TEST_STOP_BUDGET;
+  }
+  // without the budget, its git calls alone (700 ms each) take about 5 s
+  assert.ok(took < 4000, `within its budget (${took} ms)`);
+  const req = await until(() => reviewsTo2(G).find((m) => /Slow git\./.test(m.text)), 15000);
+  assert.match(req.text, /This turn's own changes: not available/, "the snapshot not read in time: unknown");
+  await call("auto_set", { endpoint: W, on: false });
+  fs.rmSync(repo, { recursive: true, force: true });
+  console.log(`45 the Stop hook reads the work tree within one budget (slow git: ${took} ms); what isn't read in time is unknown, the turn is still reviewed`);
+}
+
+// 46. an owner from before this version (protocol 22, which ignores
+// `expect`) never serves a client of this one: it steps down, the client takes
+// over, and a setting made from what was read before a change is refused
+// (an older client gets only a ping from it: case 29)
+{
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-proto-"));
+  const env = { ...process.env, AGENT_REVIEW_BRIDGE_DIR: d, AGENT_REVIEW_BRIDGE_PORT: "7482" };
+  delete env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL;
+  const E = { app: "claude", id: "claude-proto" };
+  const old = spawn(process.execPath, ["--input-type=module", "-e", `const b = await import(${JSON.stringify(brokerUrl)}); await b.call("status"); console.log("owner"); setInterval(() => {}, 1000);`], {
+    env: { ...env, AGENT_REVIEW_BRIDGE_TEST_PROTOCOL: "22" },
+  });
+  try {
+    await new Promise((r) => old.stdout.once("data", r));
+    const script =
+      `const b = await import(${JSON.stringify(brokerUrl)}); const E = ${JSON.stringify(E)};` +
+      `const rev = (await b.call("status", { endpoint: E })).autoRev;` +
+      `await b.call("auto_set", { endpoint: E, on: false });` +
+      `const late = await b.call("auto_set", { endpoint: E, on: true, everyTurn: true, expect: rev });` +
+      `console.log(JSON.stringify({ rev, late, owner: (await b.call("ping")).protocol })); process.exit(0);`;
+    const out = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", script], { env, encoding: "utf8", timeout: 20_000 }).trim().split("\n").at(-1));
+    assert.equal(out.rev, 0);
+    assert.deepEqual(out.late, { stale: true }, "the expect check applies: the old owner didn't serve it");
+    assert.equal(out.owner, 23, "the new client owns the broker now");
+    const events = fs.readFileSync(path.join(d, "events.jsonl"), "utf8");
+    assert.match(events, /"op":"broker-step-down","pid":\d+,"protocol":22/, "the old owner stepped down");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(d, "state.json"), "utf8")).auto?.[`claude:${E.id}`]?.on ?? false, false, "auto mode stayed off");
+  } finally {
+    old.kill();
+    fs.rmSync(d, { recursive: true, force: true });
+  }
+  console.log("46 a protocol-22 owner steps down for this version's client, which takes over: the expect check applies");
+}
+
+// 47. an answer after the bridge said none was coming (the reviewer's turn
+// ended without one) is taken while nothing replaced it: a one-off review's
+// answer reaches its requester, marked; a second copy is refused; not once a
+// next round went out, nor after an unlink. A turn's review: taken while its
+// retry is still in line (dropped then, a build of it already running
+// stops), not after auto mode is off
+{
+  const P = { app: "openai", id: "gpt-late-asker" };
+  const R = { app: "claude", id: "claude-late-reviewer" };
+  const silent = async (linkId) => {
+    const m = reqOf(linkId);
+    const t = Date.now();
+    await call("wake_ack", { ids: [m.id], at: t });
+    await call("turn_ok", { endpoint: R, at: t + 10 });
+    await until(() => failedFor(m.id)[0]);
+    return m;
+  };
+  const a = await call("link_create", { primary: P, advisor: R, request: "Late one." });
+  const ma = await silent(a.id);
+  const late = await call("advise", { endpoint: R, requestId: ma.id, decision: "approved" });
+  assert.match(late.text, /This answer came after the bridge told you none was coming/);
+  assert.equal(state().links[a.id].decision, "approved", "taken");
+  await assert.rejects(call("advise", { endpoint: R, requestId: ma.id, decision: "approved" }), /already answered/, "a second copy refused");
+  const b = await call("link_create", { primary: P, advisor: R, request: "Late two." });
+  const mb = await silent(b.id);
+  await call("link_continue", { primary: P, roundOf: b.id, request: "Again." });
+  await assert.rejects(call("advise", { endpoint: R, requestId: mb.id, decision: "approved" }), /belongs to a closed link/, "after a next round: refused");
+  const c = await call("link_create", { primary: P, advisor: R, request: "Late three." });
+  const mc = await silent(c.id);
+  await call("link_close", { endpoint: P });
+  await assert.rejects(call("advise", { endpoint: R, requestId: mc.id, decision: "approved" }), /belongs to a closed link/, "after an unlink: refused");
+  // a late approval doesn't undo the approval of a review asked for after it
+  const AP = { app: "claude", id: "claude-late-approvals" };
+  const lp = path.join(work2, "late-approved.txt");
+  await call("auto_set", { endpoint: AP, on: true, reviewer: R, paths: [{ path: lp, fp: null, head: null }] });
+  const older = await call("link_create", { primary: AP, advisor: R, request: "Older.", reqPaths: [{ path: lp, fp: "older-content", head: null }] });
+  const mo = await silent(older.id);
+  await sleep(5);
+  const newer = await call("link_create", { primary: AP, advisor: R, request: "Newer.", reqPaths: [{ path: lp, fp: "newer-content", head: null }] });
+  await call("advise", { endpoint: R, requestId: reqOf(newer.id).id, decision: "approved" });
+  await call("advise", { endpoint: R, requestId: mo.id, decision: "approved" });
+  assert.equal(state().auto[`claude:${AP.id}`].paths[lp].approved, "newer-content", "the newer review's approval stands");
+  await call("auto_set", { endpoint: AP, on: false });
+  // a turn's review, its retry being put together when the answer comes
+  const W = { app: "openai", id: "gpt-late-worker" };
+  await everyOn(W, R);
+  process.env.AGENT_REVIEW_BRIDGE_TEST_RETRY_MS = "50";
+  process.env.AGENT_REVIEW_BRIDGE_TEST_TURNJOB = "delay:2000";
+  try {
+    await end2(W, "Late turn.");
+    const first = await until(() => reviewsTo2(R).find((m) => /Late turn\./.test(m.text)), 15000);
+    const t = Date.now();
+    await call("wake_ack", { ids: [first.id], at: t });
+    await call("turn_ok", { endpoint: R, at: t + 10 });
+    await until(() => state().auto[`openai:${W.id}`].jobs?.some((j) => j.retry === first.linkId), 8000);
+    await sleep(500); // its retry is being put together now
+    await call("advise", { endpoint: R, requestId: first.id, decision: "approved" });
+    assert.ok(!(state().auto[`openai:${W.id}`].jobs ?? []).some((j) => j.retry === first.linkId), "the retry dropped");
+    await sleep(3000);
+    assert.equal(reviewsTo2(R).filter((m) => /Late turn\./.test(m.text)).length, 1, "and never sent: the build stopped");
+  } finally {
+    delete process.env.AGENT_REVIEW_BRIDGE_TEST_TURNJOB;
+  }
+  // auto mode off before the answer: its retry is gone, the answer refused
+  process.env.AGENT_REVIEW_BRIDGE_TEST_RETRY_MS = "60000";
+  try {
+    await end2(W, "Turned off first.");
+    const second = await until(() => reviewsTo2(R).find((m) => /Turned off first\./.test(m.text)), 15000);
+    const t = Date.now();
+    await call("wake_ack", { ids: [second.id], at: t });
+    await call("turn_ok", { endpoint: R, at: t + 10 });
+    await until(() => state().auto[`openai:${W.id}`].jobs?.some((j) => j.retry === second.linkId), 8000);
+    await call("auto_set", { endpoint: W, on: false });
+    await assert.rejects(call("advise", { endpoint: R, requestId: second.id, decision: "approved" }), /belongs to a closed link/, "after auto mode off: refused");
+  } finally {
+    delete process.env.AGENT_REVIEW_BRIDGE_TEST_RETRY_MS;
+  }
+  console.log("47 a late answer after the no-answer notice is taken while nothing replaced it (one-off, and a turn's review whose retry was still in line: dropped, its build stopped); refused after a next round, an unlink or auto mode off, and as a second copy");
 }
 fs.rmSync(work2, { recursive: true, force: true });
 

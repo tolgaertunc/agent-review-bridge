@@ -28,6 +28,10 @@ export { MAX_TEXT, REVIEWER_ROLE };
 
 export const DATA_DIR = dataDir();
 export const STATE_FILE = path.join(DATA_DIR, "state.json");
+// The state kept beside it while state.json can't be replaced (Windows: another
+// process has it open). Only the broker reads or writes it; hooks only look
+// whether it is there (see hook.mjs), so it is never held open by them.
+export const PENDING_FILE = `${STATE_FILE}.pending`;
 export const EVENTS_FILE = path.join(DATA_DIR, "events.jsonl");
 export const OUTBOX_DIR = path.join(DATA_DIR, "outbox");
 export const LISTENERS_DIR = path.join(DATA_DIR, "listeners");
@@ -36,7 +40,7 @@ const TOKEN_FILE = path.join(DATA_DIR, "token");
 const PORT = Number(process.env.AGENT_REVIEW_BRIDGE_PORT || 7457);
 // Bumped whenever ops change. An owner running older code (a long-lived helper
 // left over from before an update) steps down when a newer client calls.
-export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 22);
+export const PROTOCOL = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_PROTOCOL || 23);
 
 export const SIDES = ["claude", "openai"];
 // Claude Desktop's session ids, as claude://code/continue?session= accepts them
@@ -66,11 +70,15 @@ const PEER_BURST = { count: 60, windowMs: 10 * 60_000 };
 const WATCH_SCALE = Number(process.env.AGENT_REVIEW_BRIDGE_TEST_WATCH_SCALE) || 1;
 const WATCH = Object.fromEntries(
   // (limits: how long ChatGPT's usage limits, once read, are taken as they were)
-  Object.entries({ first: 15_000, second: 60_000, every: 60_000, deadline: 6 * 3600_000, read: 15_000, stuck: 60_000, approval: 60_000, unheard: 10 * 60_000, limits: 30_000 }).map(([k, v]) => [
+  // (closed, closedMax: while ChatGPT is closed, how long a turn's review
+  // waits before it looks again, at first and at most)
+  Object.entries({ first: 15_000, second: 60_000, every: 60_000, deadline: 6 * 3600_000, read: 15_000, stuck: 60_000, approval: 60_000, unheard: 10 * 60_000, limits: 30_000, closed: 15_000, closedMax: 2 * 60_000 }).map(([k, v]) => [
     k,
     Math.max(20, v * WATCH_SCALE),
   ]),
 );
+// the deadline, read when it's used (a test sets its own for one case)
+const deadlineMs = () => Number(process.env.AGENT_REVIEW_BRIDGE_TEST_DEADLINE_MS) || WATCH.deadline;
 // How long putting one turn's review together may take (the work tree is
 // read in a child process, so the broker's own loop never waits on it)
 const jobBudget = () => Number(process.env.AGENT_REVIEW_BRIDGE_TEST_JOB_BUDGET) || 60_000;
@@ -93,11 +101,111 @@ const MAX_WAITING = 10;
 // a failure that only means "not now"
 const UNAVAILABLE = /usage limit|usagelimit|rate.?limit|overload|capacity|too many requests|server.?error|unavailable|couldn't be handed|timed? ?out|network/i;
 
+// Windows refuses to replace a file another process has open (EPERM, EBUSY,
+// EACCES); the hooks and listeners only hold state.json for a moment, so the
+// rename is tried again for about a second
+const SLEEP = new Int32Array(new SharedArrayBuffer(4));
+const saveRetryMs = () => Number(process.env.AGENT_REVIEW_BRIDGE_TEST_SAVE_RETRY_MS) || 50;
+function renameRetry(from, to, tries = 20) {
+  for (let i = 0; ; i++) {
+    try {
+      renameFault(to);
+      return fs.renameSync(from, to);
+    } catch (e) {
+      if (!["EPERM", "EBUSY", "EACCES"].includes(e.code) || i >= tries) throw e;
+      Atomics.wait(SLEEP, 0, 0, saveRetryMs());
+    }
+  }
+}
+// a whole file written beside, then put in place: true, or what failed
+function writeReplace(file, text, tries) {
+  try {
+    fs.writeFileSync(`${file}.tmp`, text);
+    renameRetry(`${file}.tmp`, file, tries);
+    return true;
+  } catch (e) {
+    return e;
+  }
+}
+// (tests: AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL for state.json and
+// AGENT_REVIEW_BRIDGE_TEST_PENDING_FAIL for the image beside it make the next
+// N renames, or "always" every rename, fail as Windows does; "after:K:" lets K
+// go through first)
+const faults = {};
+function renameFault(to) {
+  const name = to === STATE_FILE ? "AGENT_REVIEW_BRIDGE_TEST_SAVE_FAIL" : to === PENDING_FILE ? "AGENT_REVIEW_BRIDGE_TEST_PENDING_FAIL" : null;
+  const v = name && process.env[name];
+  if (!v) return;
+  if (faults[name]?.v !== v) {
+    const after = /^after:(\d+):(.*)$/.exec(v);
+    const spec = after ? after[2] : v;
+    faults[name] = { v, skip: after ? Number(after[1]) : 0, left: spec === "always" ? Infinity : Number(spec) || 0 };
+  }
+  const f = faults[name];
+  if (f.skip > 0) f.skip--;
+  else if (f.left-- > 0) throw Object.assign(new Error("rename refused (test)"), { code: "EPERM" });
+}
+// (tests: AGENT_REVIEW_BRIDGE_TEST_RM_PENDING_FAIL refuses the next N removals
+// of the image beside state.json)
+function pendingRmFault() {
+  const name = "AGENT_REVIEW_BRIDGE_TEST_RM_PENDING_FAIL";
+  const v = process.env[name];
+  if (!v) return;
+  if (faults[name]?.v !== v) faults[name] = { v, left: Number(v) || 0 };
+  if (faults[name].left-- > 0) throw Object.assign(new Error("removal refused (test)"), { code: "EPERM" });
+}
+// (tests: AGENT_REVIEW_BRIDGE_TEST_READ_FAIL, a list of file names such as
+// "state.json.pending", makes reading them fail as if another program had
+// them open)
+function readFault(file) {
+  const v = process.env.AGENT_REVIEW_BRIDGE_TEST_READ_FAIL;
+  if (v && v.split(",").includes(path.basename(file))) throw Object.assign(new Error("read refused (test)"), { code: "EBUSY" });
+}
+// The state as last kept: state.json, or the image a save wrote beside it
+// when state.json couldn't be replaced; whichever has the higher saveSeq (a
+// count of saves, kept in the state: later is higher whatever the clock).
+// Reading only: the owner that holds the port tidies (see adopt).
+// What a file holds: { img } (a state), { missing }, { busy } (it can't be
+// read for now: in use, or no access; it may hold the latest state) or
+// { damaged } (read, but not a state)
+const imageOf = (file) => {
+  let text;
+  try {
+    readFault(file);
+    text = fs.readFileSync(file, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") return { missing: true };
+    if (e.code === "EISDIR") return { damaged: true };
+    return { busy: String(e.code || e.message || e) };
+  }
+  try {
+    const img = JSON.parse(text);
+    return img && typeof img === "object" && !Array.isArray(img) ? { img } : { damaged: true };
+  } catch {
+    return { damaged: true };
+  }
+};
+const readImage = (file) => imageOf(file).img ?? null;
+function newestImage() {
+  const main = readImage(STATE_FILE);
+  const pending = readImage(PENDING_FILE);
+  return pending && (pending.saveSeq ?? 0) > (main?.saveSeq ?? 0) ? pending : main;
+}
+// what only reads the state: answered whether or not it can be saved
+const READ_OPS = new Set(["status", "ping", "report", "read_chat_allowed", "reach", "round_info", "send_target"]);
+// what's answered while the state as kept can't be read: only what shows the
+// bridge's own state, never a decision taken from an older one (whether a
+// chat may be read, where a message goes)
+const WAIT_OPS = new Set(["status", "ping", "report"]);
+const CANT_WRITE = "The bridge can't write its state right now (another program has its files open), so nothing was done. Try again in a moment.";
+const CANT_READ =
+  "The bridge can't read its saved state right now (another program has its files open, or it has no access to them), so nothing was done. Try again in a moment; bridge_status shows which file.";
+
 for (const d of [DATA_DIR, OUTBOX_DIR, LISTENERS_DIR, TURNS_DIR]) fs.mkdirSync(d, { recursive: true });
 
 const sameEndpoint = (a, b) => !!a && !!b && a.app === b.app && a.id === b.id;
 // an auto mode entry as tools show it: without the turns' own texts
-const autoView = ({ jobs, turn, facts, parked, told, ...e }) => ({ ...e, ...(e.everyTurn && { waiting: (jobs ?? []).length, ...(parked?.length && { setAside: parked.length }) }) });
+const autoView = ({ jobs, turn, facts, parked, told, closedLooks, ...e }) => ({ ...e, ...(e.everyTurn && { waiting: (jobs ?? []).length, ...(parked?.length && { setAside: parked.length }) }) });
 
 // a chat as the bridge names it to agents
 export const chatName = (e) => (e.app === "openai" ? `ChatGPT chat ${e.id}` : `Claude Code session ${e.id}`);
@@ -153,8 +261,13 @@ function freshState() {
   return { seq: 0, messages: [], links: {}, linkSeq: 0, notes: [], auto: {}, endpoints: {} };
 }
 
+// (never throws: a log that can't be written mustn't stop the owner)
 function logEvent(event) {
-  fs.appendFileSync(EVENTS_FILE, JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n");
+  try {
+    fs.appendFileSync(EVENTS_FILE, JSON.stringify({ ts: new Date().toISOString(), ...event }) + "\n");
+  } catch {
+    // the log is only a record
+  }
 }
 
 function listenerAlive(endpoint) {
@@ -349,11 +462,12 @@ function buildTurn(input) {
 
 class BrokerState {
   constructor() {
-    try {
-      this.s = { ...freshState(), ...JSON.parse(fs.readFileSync(STATE_FILE, "utf8")) };
-    } catch {
-      this.s = freshState();
-    }
+    this.load(newestImage());
+  }
+
+  // (the state as kept, from either file; reading only)
+  load(img) {
+    this.s = { ...freshState(), ...(img ?? {}) };
     delete this.s.widgets; // left over from the MCP Apps panel spike
     // auto mode's reviewer was a ChatGPT thread id before it could be a chat
     // in either app
@@ -415,15 +529,16 @@ class BrokerState {
 
   // Bounded state: read messages and delivered notes go after a day, anything
   // after a week; closed links after a week; a link keeps its last 50
-  // advisories. Unread messages, and review requests still waiting for their
-  // answer (read, or already handed to a ChatGPT thread), are only ever
-  // dropped by age, never by count.
+  // advisories. Unread messages are only ever dropped by age, never by count;
+  // a review request still waiting for its answer on an open link isn't
+  // dropped at all (its link closes when it's answered, fails or is closed):
+  // the reviews of a chat's turns wait for it
   prune() {
     const s = this.s;
     const now = Date.now();
     const open = (m) => m.kind === "review-request" && !m.answeredAt && s.links[m.linkId]?.active;
     const done = (m) => m.readAt && !open(m);
-    const fresh = s.messages.filter((m) => !(done(m) && now - m.readAt > DAY) && now - m.ts < 7 * DAY);
+    const fresh = s.messages.filter((m) => open(m) || (!(done(m) && now - m.readAt > DAY) && now - m.ts < 7 * DAY));
     const keepRead = new Set(fresh.filter(done).slice(-500));
     s.messages = fresh.filter((m) => !done(m) || keepRead.has(m));
     s.notes = s.notes.filter((n) => !(n.deliveredAt && now - n.deliveredAt > DAY) && now - n.at < 7 * DAY);
@@ -434,24 +549,155 @@ class BrokerState {
     }
   }
 
+  // Never throws: the owner mustn't die of a refused rename. true once the
+  // state is in state.json; "pending" when only the image beside it could be
+  // written (kept exactly as it is, but the hooks don't act on it yet: they
+  // read state.json); false when neither could (nothing kept). Until a
+  // state.json save works, `unsaved` says which, and each save makes one
+  // attempt (not a second of retries each tick).
   save() {
+    // (never from an older state while the state as kept can't be read)
+    if (this.stateWait) return false;
     this.prune();
     // which version wrote it: an older one that knows this doesn't take it over
     this.s.protocol = PROTOCOL;
-    const tmp = STATE_FILE + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(this.s, null, 2));
-    fs.renameSync(tmp, STATE_FILE);
+    this.s.saveSeq = (this.s.saveSeq ?? 0) + 1;
+    this.s.savedAt = Date.now();
+    const text = JSON.stringify(this.s, null, 2);
+    const tries = this.unsaved ? 0 : 20;
+    const main = writeReplace(STATE_FILE, text, tries);
+    if (main === true) {
+      if (this.unsaved) logEvent({ op: "saved-again", after: Date.now() - this.unsaved.at });
+      this.unsaved = null;
+      this.dropPending();
+      return true;
+    }
+    // (the image written now is the newer: not one to remove. One that
+    // couldn't be read at takeover is never written over: it's moved aside
+    // first, here too, whatever state.json does; while it can't be, nothing
+    // is kept)
+    if (this.pendingUnread) this.dropPending();
+    if (!this.pendingUnread) this.pendingLeft = false;
+    const durable = !this.pendingUnread && writeReplace(PENDING_FILE, text, tries) === true;
+    if (this.unsaved?.durable !== durable) logEvent({ op: "save-failed", error: String(main.code || main.message || main), kept: durable ? "pending" : "no" });
+    this.unsaved = { at: this.unsaved?.at ?? Date.now(), durable };
+    return durable ? "pending" : false;
+  }
+
+  // The image beside state.json goes once state.json has caught up with it.
+  // One that can't be removed now (in use) is tried again each tick: while it
+  // is there the hooks act on nothing (see hook.mjs)
+  dropPending() {
+    try {
+      pendingRmFault();
+      // one that couldn't be read at takeover is never removed: moved aside
+      // (kept) once it can be
+      if (this.pendingUnread) {
+        const aside = `${PENDING_FILE}.unread-${Date.now()}`;
+        try {
+          fs.renameSync(PENDING_FILE, aside);
+          logEvent({ op: "pending-unreadable", kept: aside });
+        } catch (e) {
+          // (gone meanwhile, say removed by hand: nothing left to keep)
+          if (e.code !== "ENOENT") throw e;
+        }
+        this.pendingUnread = false;
+      } else fs.rmSync(PENDING_FILE, { force: true });
+      this.pendingLeft = false;
+    } catch {
+      this.pendingLeft = true;
+    }
+  }
+
+  // Taking the state over (only the owner that holds the port changes the
+  // state's files): the state as kept now (an owner may have saved since it
+  // was read); an image beside state.json that state.json has caught up with
+  // goes, a newer one is written to state.json at once, for the hooks. A
+  // file that can't be read for now (in use, or no access) may hold the
+  // latest state: nothing is taken on, sent or watched from an older one
+  // until it can be read ("waiting" until then; each tick reads again). A
+  // state a newer version wrote, found once it could be read, isn't taken
+  // over and nothing of it is touched ("newer"; see listen). An image that
+  // can be read but isn't a state (damaged) is moved aside, kept, and said:
+  // never taken for gone, and the hooks don't wait on it for good.
+  adopt() {
+    const main = imageOf(STATE_FILE);
+    const pend = imageOf(PENDING_FILE);
+    const busy = main.busy ? { file: "state.json", error: main.busy } : pend.busy ? { file: "state.json.pending", error: pend.busy } : null;
+    if (busy) {
+      if (!this.stateWait) logEvent({ op: "state-unread", ...busy });
+      this.stateWait = { since: this.stateWait?.since ?? Date.now(), ...busy };
+      return "waiting";
+    }
+    const pending = pend.img ?? null;
+    const newer = !!pending && (pending.saveSeq ?? 0) > (main.img?.saveSeq ?? 0);
+    const img = newer ? pending : (main.img ?? null);
+    if ((img?.protocol ?? 0) > PROTOCOL) {
+      this.newerProtocol = img.protocol;
+      return "newer";
+    }
+    if (this.stateWait) logEvent({ op: "state-read", after: Date.now() - this.stateWait.since });
+    this.stateWait = null;
+    if (pend.damaged) {
+      // (if it can't be moved now either, each tick and each save try again;
+      // nothing writes over it meanwhile)
+      this.pendingUnread = true;
+      this.dropPending();
+      if (this.pendingLeft) logEvent({ op: "pending-unreadable", error: "can't be moved aside yet" });
+    }
+    this.load(img);
+    if (pending && !newer) this.dropPending();
+    else if (pending) this.save();
+    // the state is this process's now: what advisor mode left is retired
+    // before anything else can send or read it
+    if (this.retireAdvisor()) this.save();
+    return "adopted";
   }
 
   handle(op, a, outboxFile) {
     const fn = this["op_" + op];
     if (!fn) throw new Error(`unknown op: ${op}`);
+    // the state as kept can't be read for now (a file in use when this owner
+    // took over): only the bridge's own state is shown (bridge_status says
+    // why), and nothing is taken on, sent or decided from an older state
+    // meanwhile
+    if (this.stateWait && !WAIT_OPS.has(op)) throw new Error(CANT_READ);
+    // what only reads has nothing to keep (the apps' keep-alive pings don't
+    // rewrite the state every few seconds); deliveries due still go, as with
+    // any op
+    if (READ_OPS.has(op)) {
+      const result = fn.call(this, a);
+      this.dispatch();
+      return result;
+    }
+    // nothing can be kept: a change an app asks for isn't made at all (so
+    // asking again can't make it twice); a hook's waits in the outbox
+    if (!outboxFile && this.unsaved && !this.unsaved.durable && this.save() === false) throw new Error(CANT_WRITE);
+    // a receive whose save keeps nothing is undone and refused: what it took
+    // stays unread, here and in state.json, so it's neither lost nor handed
+    // over twice (a Claude listener reads state.json)
+    const before = op === "receive" && { messages: this.s.messages.slice(), marks: this.s.messages.map((m) => [m, m.readAt, m.wokenAt]) };
     const result = fn.call(this, a);
     // saved with the change it made, so an owner that dies before removing
     // the file doesn't apply it twice after a takeover
     if (outboxFile) this.s.outboxDone = [...(this.s.outboxDone ?? []), outboxFile].slice(-500);
-    this.save();
-    this.dispatch();
+    // nothing goes out before the change that sends it is in state.json: an
+    // owner lost meanwhile leaves nothing sent that a new one sends again,
+    // and the hooks know the bridge's prompts
+    const saved = this.save();
+    if (saved === true) this.dispatch();
+    else if (saved === false && before) {
+      this.s.messages = before.messages;
+      for (const [m, readAt, wokenAt] of before.marks) {
+        if (readAt === undefined) delete m.readAt;
+        else m.readAt = readAt;
+        if (wokenAt === undefined) delete m.wokenAt;
+        else m.wokenAt = wokenAt;
+      }
+      logEvent({ op: "receive-undone" });
+      throw new Error(CANT_WRITE);
+    } else if (saved === false && !outboxFile)
+      throw new Error("The bridge did this but couldn't save it (its state can't be written right now): it may be lost if the bridge stops. Check bridge_status before trying it again.");
     return result;
   }
 
@@ -464,6 +710,15 @@ class BrokerState {
       return;
     }
     for (const f of files) {
+      // nothing more is taken in while what was applied can't be kept: a file
+      // goes only once a kept state (state.json, or the image beside it)
+      // records it (a new owner then applies a file it still finds, once),
+      // and outboxDone can't overflow
+      if (this.unsaved && !this.unsaved.durable) {
+        const saved = this.save();
+        if (saved === false) return;
+        if (saved === true) this.dispatch();
+      }
       const file = path.join(OUTBOX_DIR, f);
       try {
         const { op, args } = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -473,6 +728,7 @@ class BrokerState {
       } catch (e) {
         logEvent({ op: "outbox-error", file: f, error: String(e.message || e) });
       }
+      if (this.unsaved && !this.unsaved.durable) return;
       fs.rmSync(file, { force: true });
     }
   }
@@ -480,7 +736,13 @@ class BrokerState {
   // Codex endpoints are woken through the app's thread queue; Claude endpoints
   // by their listener hook, which watches state.json itself
   dispatch() {
+    // nothing is sent while state.json isn't current (the image beside it
+    // keeps the state, but the hooks read state.json): a save is tried again
+    // each tick, and dispatches once it works; nor while the state as kept
+    // can't be read (see adopt)
+    if (this.unsaved || this.stateWait) return;
     const due = [];
+    const before = [];
     for (const m of this.s.messages) {
       // a "sending" left behind by an owner that died mid-send is retried,
       // unless its turn already ran (the thread had it after all)
@@ -500,6 +762,7 @@ class BrokerState {
       // prompt is queued: the turn can fail before queueing even returns. A
       // resend keeps the id, so the turn is still found.
       const clientId = m.dispatch?.clientId ?? crypto.randomUUID();
+      before.push([m, m.dispatch, m.watch && { ...m.watch }]);
       m.dispatch = { state: "sending", at: Date.now(), clientId, attempt: (m.dispatch?.attempt ?? 0) + 1 };
       if (watched(m) && !m.watch) m.watch = { clientId, since: Date.now(), next: Date.now() + WATCH.first, checks: 0 };
       else if (m.watch) Object.assign(m.watch, { clientId, next: Date.now() + WATCH.first });
@@ -507,8 +770,17 @@ class BrokerState {
     }
     if (!due.length) return;
     // on disk before the thread can run it, so an owner that takes over still
-    // knows the prompt is the bridge's
-    this.save();
+    // knows the prompt is the bridge's; if it can't be written, nothing is
+    // sent, and the records are as they were
+    if (this.save() !== true) {
+      for (const [m, d, w] of before) {
+        if (d === undefined) delete m.dispatch;
+        else m.dispatch = d;
+        if (w === undefined) delete m.watch;
+        else m.watch = w;
+      }
+      return;
+    }
     for (const m of due) {
       // an answer counts only for the attempt it belongs to, on a live owner:
       // a late one from an earlier attempt can't undo what the thread confirmed
@@ -586,25 +858,49 @@ class BrokerState {
   // state.json, so a new owner picks it up; a read never blocks the deadline,
   // and a read started by an owner that has since stepped down is dropped.
   watchTick() {
+    // a state that couldn't be written: saved again, then what waited goes;
+    // an image beside state.json that couldn't be removed: tried again (one
+    // that couldn't be read at takeover: each save moves it aside first)
+    if (this.unsaved && this.save() === true) this.dispatch();
+    else if (this.pendingLeft && !this.unsaved) this.dropPending();
     const now = Date.now();
     let changed = false;
     // turn reviews held back (no reviewer yet, a usage limit) go once they can
     this.runJobs();
-    // a turn review that waits on a Claude reviewer that isn't listening: told
-    // once, as a note (it may only be busy with a long review)
+    // a review whose request is gone (an older version dropped it by age)
+    // can't be answered: closed and said, so it holds nothing for good (the
+    // next review of a turn, the key-moments Stop check)
+    for (const l of Object.values(this.s.links)) {
+      if (!l.active || l.mode !== "review" || !l.advisor) continue;
+      if (this.s.messages.some((m) => m.linkId === l.id && m.kind === "review-request")) continue;
+      Object.assign(l, { active: false, closedAt: now, decision: "failed" });
+      delete l.turn;
+      logEvent({ op: "review_lost", link: l.id });
+      this.note(
+        l.primary,
+        `lost:${l.id}`,
+        l.everyTurn
+          ? `Review ${l.id} of one of your turns can no longer be answered (its request is gone); the next review covers its changes.`
+          : `Review ${l.id} can no longer be answered (its request is gone); ask again if it's still needed.`,
+      );
+      changed = true;
+    }
     for (const m of this.s.messages) {
       const link = this.s.links[m.linkId];
-      if (!link?.everyTurn || !link.active || m.kind !== "review-request" || m.toEndpoint?.app !== "claude") continue;
-      // woken with it, then neither answered nor ended its turn (the user
-      // stopped that turn: no Stop runs) for as long as a ChatGPT reviewer
-      // gets: no answer is coming, it is sent again (the next turn's review
-      // waits for this one)
-      if (m.wokenAt && !m.answeredAt && !m.settledAt && now - m.wokenAt > WATCH.deadline) {
-        this.fail(m, `it was woken with it and gave no answer within ${Math.round(WATCH.deadline / 3600_000)} hours`);
+      if (!link?.active || m.kind !== "review-request" || m.toEndpoint?.app !== "claude") continue;
+      // a Claude reviewer woken with a review, of any kind, that neither
+      // answered nor ended its turn (the user stopped that turn: no Stop runs)
+      // for as long as a ChatGPT reviewer gets: no answer is coming. Whoever
+      // waits is told as for any failed review (a turn's review is sent again;
+      // the next one waits for it)
+      if (m.wokenAt && !m.answeredAt && !m.settledAt && now - m.wokenAt > deadlineMs()) {
+        this.fail(m, `it was woken with it and gave no answer within ${Math.round(deadlineMs() / 3600_000)} hours`, { lateOk: true });
         changed = true;
         continue;
       }
-      if (m.readAt || m.unheardTold) continue;
+      // a turn review that waits on a Claude reviewer that isn't listening:
+      // told once, as a note (it may only be busy with a long review)
+      if (!link.everyTurn || m.readAt || m.unheardTold) continue;
       if (now - m.ts > WATCH.unheard && !listenerAlive(m.toEndpoint)) {
         m.unheardTold = now;
         const before = this.s.notes.length;
@@ -623,7 +919,7 @@ class BrokerState {
       if (this.settled(m)) {
         w.done = true;
         changed = true;
-      } else if (now - Math.max(w.since, w.queuedAt ?? 0) > WATCH.deadline) {
+      } else if (now - Math.max(w.since, w.queuedAt ?? 0) > deadlineMs()) {
         // past the deadline, counted from when it was last seen still in the
         // thread's queue: one more read decides, never the clock alone (a
         // machine that slept, an owner that was down)
@@ -660,7 +956,7 @@ class BrokerState {
     const final = w.final;
     w.final = false;
     if (!error && r?.state === "queued") w.queuedAt = Date.now();
-    const pastDeadline = () => this.fail(m, `no answer was confirmed within ${Math.round(WATCH.deadline / 3600_000)} hours`);
+    const pastDeadline = () => this.fail(m, `no answer was confirmed within ${Math.round(deadlineMs() / 3600_000)} hours`);
     // a turn still running in the desktop app reads as "interrupted" from
     // another process; only a turn with an end time is over
     // a send whose outcome wasn't known: a trace of it confirms it, none
@@ -709,12 +1005,14 @@ class BrokerState {
   // for an answered review, a replied message or the bridge's own notices (two
   // unavailable sides can't bounce them); a review's link closes, a plain
   // message's link stays as it is.
-  fail(m, why, { unavailable = false } = {}) {
+  // (lateOk: the reviewer may still answer; see takeLate)
+  fail(m, why, { unavailable = false, lateOk = false } = {}) {
     const link = this.s.links[m.linkId];
     if (!watched(m) || this.settled(m)) return;
     let to = m.fromEndpoint;
     if (m.kind === "review-request") {
       Object.assign(link, { active: false, closedAt: Date.now(), decision: "failed" });
+      if (lateOk) link.lateOk = true;
       to = link.primary;
     }
     m.failure = { at: Date.now(), why };
@@ -854,7 +1152,24 @@ class BrokerState {
         s.auto?.[autoKey(endpoint)] && {
           auto: autoView(s.auto[autoKey(endpoint)]),
         }),
+      // how often its auto mode setting has changed (see bumpAuto)
+      ...(endpoint && { autoRev: s.autoRev?.[autoKey(endpoint)] ?? 0 }),
+      // state.json couldn't be replaced lately: since when, and whether the
+      // state is kept beside it (nothing is sent, and the hooks act on
+      // nothing, until it's written)
+      ...(this.unsaved && { unsaved: { since: this.unsaved.at, kept: this.unsaved.durable ? "beside state.json" : "not at all" } }),
+      // the state as kept couldn't be read when this owner took over (a file
+      // in use): since when, which, and why. Nothing is taken on or sent, and
+      // what this shows is older, until it can be read
+      ...(this.stateWait && { stateUnread: this.stateWait }),
     };
+  }
+
+  // Each change to a chat's auto mode setting (on, off, its reviewer) counts,
+  // even with no entry or one that is off: a setting made from what was read
+  // before a slow step (making the reviewer chat) is refused if it moved
+  bumpAuto(key) {
+    this.s.autoRev = { ...(this.s.autoRev ?? {}), [key]: (this.s.autoRev?.[key] ?? 0) + 1 };
   }
 
   // ------------------------------------------------------------ auto mode
@@ -863,9 +1178,12 @@ class BrokerState {
   // path enters when auto mode is turned on (the chat's folder, as it is then)
   // or when a review names it.
 
-  op_auto_set({ endpoint, on, reviewer, model, effort, paths, everyTurn, joinReviewer }) {
+  op_auto_set({ endpoint, on, reviewer, model, effort, paths, everyTurn, joinReviewer, expect }) {
     if (!endpoint?.app || !endpoint?.id) throw new Error("this chat is unknown");
     const key = autoKey(endpoint);
+    // made from a setting read before: refused if it changed since
+    if (expect !== undefined && (this.s.autoRev?.[key] ?? 0) !== expect) return { stale: true };
+    this.bumpAuto(key);
     if (!on) {
       // turns still waiting for their review go with it, and the reviews of
       // its turns still open close: one not handed to the reviewer yet is
@@ -923,6 +1241,7 @@ class BrokerState {
     const entry = this.s.auto?.[autoKey(endpoint)];
     if (!entry?.on) return { ok: true };
     entry.reviewer = reviewer;
+    this.bumpAuto(autoKey(endpoint));
     this.unpark(entry);
     if (model && entry.model == null) entry.model = model;
     if (effort && entry.effort == null) entry.effort = effort;
@@ -945,7 +1264,12 @@ class BrokerState {
     for (const p of link.reqPaths ?? []) {
       // content changed while the review ran, or couldn't be read: nothing new is approved
       if (!p.fp) continue;
-      entry.paths[p.path] = { approved: p.fp, base: p.head ?? entry.paths[p.path]?.base ?? null };
+      // an approval that comes late (see takeLate) doesn't undo one of a
+      // review asked for after it
+      // (by the link's number, which only grows, whatever the clock does)
+      const asked = Number(String(link.id).replace(/\D/g, "")) || 0;
+      if ((entry.paths[p.path]?.approvedBy ?? 0) > asked) continue;
+      entry.paths[p.path] = { approved: p.fp, base: p.head ?? entry.paths[p.path]?.base ?? null, approvedBy: asked };
     }
   }
 
@@ -1049,6 +1373,12 @@ class BrokerState {
     }
     (entry.jobs ??= []).push(job);
     logEvent({ op: "turn_queued", job: job.id, endpoint });
+    // a new turn: ChatGPT may be open now, looked at again at once
+    delete entry.closedLooks;
+    if (entry.jobs[0].waitWhy === "closed") {
+      delete entry.jobs[0].waitUntil;
+      delete entry.jobs[0].waitWhy;
+    }
     this.capWaiting(entry, endpoint);
     setImmediate(() => this.runJobs());
     return job;
@@ -1172,14 +1502,6 @@ class BrokerState {
     }
     if (job.waitUntil && Date.now() < job.waitUntil) return false;
     if (job.factsDue && Date.now() < job.factsDue) return false;
-    // ChatGPT closed: delivering would open it, so the review waits unless
-    // the user said to open closed apps (a Claude reviewer that isn't
-    // listening isn't opened either: it gets the request once it's open)
-    if (reviewer.app === "openai" && readConfig().openClosedApps !== "always" && (await this.chatgptOpen()) === false) {
-      if (!this.liveJob(key, entry, job, since, reviewer)) return false;
-      this.tellWaitOnce(entry, to, "closed", "The reviews of your turns wait: ChatGPT Desktop is closed. They are sent once it's open (or tell the bridge to always open closed apps).");
-      return false;
-    }
     // one review of this chat's turns out to its reviewer at a time: the next
     // waits for its answer, so that reviewer's queue never holds more than one
     // of them (one still out to a reviewer it no longer has doesn't count).
@@ -1187,8 +1509,15 @@ class BrokerState {
     // it yet isn't listening: that has a note of its own; one that read it
     // and stopped is told here)
     const out = Object.values(this.s.links).find((l) => l.active && l.everyTurn && !l.bind && sameEndpoint(l.primary, to) && sameEndpoint(l.advisor, reviewer));
-    if (out) {
-      const asked = this.s.messages.find((m) => m.linkId === out.id && m.kind === "review-request");
+    const asked = out && this.s.messages.find((m) => m.linkId === out.id && m.kind === "review-request");
+    if (out && !asked) {
+      // its request is gone (an older version dropped it by age): no answer
+      // can come, so it doesn't hold the next ones; they cover its changes
+      Object.assign(out, { active: false, closedAt: Date.now(), decision: "failed" });
+      delete out.turn;
+      logEvent({ op: "turn_review_lost", link: out.id });
+      this.note(to, `auto:${key}:lost:${out.id}`, `Review ${out.id} of one of your turns can no longer be answered (its request is gone); the next review covers its changes.`);
+    } else if (out) {
       if (!out.heldTold && Date.now() - out.createdAt > WATCH.unheard && (reviewer.app !== "claude" || asked?.readAt)) {
         out.heldTold = Date.now();
         this.note(
@@ -1199,12 +1528,33 @@ class BrokerState {
       }
       return false;
     }
+    // ChatGPT closed: delivering would open it, so the review waits unless
+    // the user said to open closed apps (a Claude reviewer that isn't
+    // listening isn't opened either: it gets the request once it's open).
+    // Looked at again later each time, until a new turn or it's open.
+    if (reviewer.app === "openai" && readConfig().openClosedApps !== "always") {
+      const open = await this.chatgptOpen();
+      if (!this.liveJob(key, entry, job, since, reviewer)) return false;
+      if (open === false) {
+        entry.closedLooks = (entry.closedLooks ?? 0) + 1;
+        const wait = Math.min(WATCH.closedMax, WATCH.closed * 2 ** (entry.closedLooks - 1));
+        job.waitUntil = Date.now() + wait;
+        job.waitWhy = "closed";
+        logEvent({ op: "turn_wait_closed", job: job.id, ms: wait });
+        this.tellWaitOnce(entry, to, "closed", "The reviews of your turns wait: ChatGPT Desktop is closed. They are sent within a couple of minutes once it's open, or with your next turn (or tell the bridge to always open closed apps).");
+        return false;
+      }
+      if (open) delete entry.closedLooks;
+    }
+    // (past the closed check, or none applies: its wait, if any, was another's)
+    delete job.waitWhy;
     if (reviewer.app === "openai") {
       // unknown limits don't hold it back
       const limits = await this.chatgptLimits();
       if (!this.liveJob(key, entry, job, since, reviewer)) return false;
       if (limits?.blocked) {
         job.waitUntil = limits.resetsAt ?? Date.now() + 5 * WATCH.every;
+        delete job.waitWhy;
         const until = limits.resetsAt ? ` until ${new Date(limits.resetsAt).toLocaleString()}` : "";
         this.tellWaitOnce(entry, to, "limit", `The reviews of your turns wait: ChatGPT's usage limit is reached${until}. They are sent once it opens again.`);
         this.save();
@@ -1289,7 +1639,7 @@ class BrokerState {
       ...(built.reqPaths?.length && { reqPaths: built.reqPaths }),
       request: built.text,
       // what it was put together from, to send it again if it gets no answer
-      turn: (({ id, retry, waitUntil, factsDue, ...t }) => t)(job),
+      turn: (({ id, retry, waitUntil, waitWhy, factsDue, ...t }) => t)(job),
     };
     if (prev) prev.continuedBy = id;
     if (failed) failed.continuedBy = id;
@@ -1500,6 +1850,7 @@ class BrokerState {
     const adopted = link.mode === "review" && !!link.autoReviewer && link.autoSince === this.autoSession(link.primary) && !reviewerOf(auto);
     if (adopted) {
       auto.reviewer = endpoint;
+      this.bumpAuto(autoKey(link.primary));
       this.unpark(auto);
       // codes from earlier tries at that first review aren't needed any more
       for (const l of Object.values(this.s.links))
@@ -1598,13 +1949,30 @@ class BrokerState {
 
   op_link_close({ endpoint, linkId }) {
     const closed = [];
+    const requeued = [];
     for (const l of Object.values(this.s.links)) {
       if (!l.active) continue;
       if (linkId ? l.id === linkId : sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint)) {
         Object.assign(l, { active: false, closedAt: Date.now() });
         closed.push(l.id);
+        // what it closed is taken back: a request not handed to the reviewer
+        // yet is never sent (one that was can't be; its answer is refused)
+        for (const m of this.s.messages) if (m.linkId === l.id && m.kind === "review-request") this.dropUndelivered(m, "the review was closed");
+        // the reviewer left a turn's review: that turn goes back in line, as
+        // it was (no try used up), for the reviewer auto mode gets next. The
+        // working chat stopping its own review cancels it.
+        const entry = l.everyTurn && !linkId && sameEndpoint(l.advisor, endpoint) ? this.s.auto?.[autoKey(l.primary)] : null;
+        if (l.turn && !l.bind && entry?.on && entry.everyTurn && entry.since === l.autoSince) {
+          (entry.jobs ??= []).unshift({ ...l.turn, id: "j" + ++this.s.seq, retry: l.id });
+          this.capWaiting(entry, l.primary);
+          requeued.push(l.id);
+        }
+        delete l.turn;
       }
     }
+    // a late answer to a review it already heard had none isn't taken either
+    for (const l of Object.values(this.s.links))
+      if (l.lateOk && (linkId ? l.id === linkId : sameEndpoint(l.primary, endpoint) || sameEndpoint(l.advisor, endpoint))) delete l.lateOk;
     // a chat that stops its reviews is no longer an auto mode's reviewer
     // either: that auto mode's next review asks for a new one
     const released = [];
@@ -1613,10 +1981,14 @@ class BrokerState {
         const r = e?.on && reviewerOf(e);
         if (r && sameEndpoint(r, endpoint)) {
           e.reviewer = null;
+          this.bumpAuto(key);
+          this.unpark(e); // set-aside turns wait for the next reviewer
           released.push(key);
         }
       }
-    logEvent({ op: "link_close", closed, ...(released.length && { released }) });
+    // the chats left without a reviewer are told how to get one at once
+    if (requeued.length) setImmediate(() => this.runJobs());
+    logEvent({ op: "link_close", closed, ...(released.length && { released }), ...(requeued.length && { requeued }) });
     return { closed, ...(released.length && { released }) };
   }
 
@@ -1687,10 +2059,13 @@ class BrokerState {
     if (req.kind !== "review-request") throw new Error(`${requestId} is a ${req.kind}, not a review request; reply to it with bridge_send and reply_to "${requestId}"`);
     if (req.answeredAt) throw new Error(`review request ${requestId} is already answered`);
     const link = this.s.links[req.linkId];
+    const late = !link?.active && this.takeLate(link, req);
     if (!link?.active) throw new Error(`review request ${requestId} belongs to a closed link`);
     req.answeredAt = Date.now();
     this.answered(req.id);
-    const text = renderAnswer({ decision, note: withoutCitations(note), blocking, nits });
+    const text =
+      (late ? `(This answer came after the bridge told you none was coming for ${link.id}; it replaces that notice.)\n\n` : "") +
+      renderAnswer({ decision, note: withoutCitations(note), blocking, nits });
     link.advisories.push({ at: Date.now(), decision, text });
     if (link.everyTurn) return this.everyTurnAnswer(link, endpoint, { decision, text, nits });
     const lastRound = decision === "changes_requested" && (link.round ?? 1) >= MAX_ROUNDS();
@@ -1698,6 +2073,27 @@ class BrokerState {
     if (decision === "approved" && !link.plan) this.approvePaths(link);
     const r = this.post({ from: endpoint.app, toEndpoint: link.primary, kind: "review-result", linkId: link.id, text, decision, lastRound });
     return { delivered: "now", text, ...r };
+  }
+
+  // An answer after the bridge told the requester none was coming (the
+  // reviewer's turn ended without one, or it stayed silent past the
+  // deadline): taken while nothing replaced it, and the link is open again
+  // for it. Not after a next round or a retry went out, an unlink, or (for a
+  // turn's review) auto mode off: then its retry is gone. A turn's queued
+  // retry is dropped; one being put together stops at its liveJob check.
+  takeLate(link, req) {
+    if (!link?.lateOk || link.decision !== "failed" || link.continuedBy || req.answeredAt) return false;
+    if (link.everyTurn) {
+      const entry = this.s.auto?.[autoKey(link.primary)];
+      const i = entry?.on && entry.since === link.autoSince ? (entry.jobs ?? []).findIndex((j) => j.retry === link.id) : -1;
+      if (i < 0) return false;
+      const [job] = entry.jobs.splice(i, 1);
+      link.turn = (({ id, retry, waitUntil, waitWhy, factsDue, ...t }) => t)(job);
+    }
+    Object.assign(link, { active: true, closedAt: null, decision: null, late: true });
+    delete link.lateOk;
+    logEvent({ op: "late-answer", link: link.id, id: req.id });
+    return true;
   }
 
   op_notes_ack({ ids }) {
@@ -1714,8 +2110,20 @@ class BrokerState {
         m.wakes = (m.wakes ?? 0) + 1;
         m.readAt ??= when;
         m.wokenAt = Math.max(m.wokenAt ?? 0, when);
+        // the end of the turn it woke was taken in first: settled now
+        const ended = this.s.endpoints?.[autoKey(m.toEndpoint)]?.lastOkAt;
+        if (!m.settledAt && ended >= m.wokenAt) this.settleWoken(m, ended);
       }
     return { ok: true };
+  }
+
+  // A woken message whose turn ended: settled. A review it woke, of any kind,
+  // that the turn didn't answer gets no answer from it, as when a ChatGPT
+  // reviewer's turn completes without one: whoever waits is told (a turn's
+  // review is sent again; it mustn't hold the next ones for good)
+  settleWoken(m, at) {
+    m.settledAt = at;
+    if (m.kind === "review-request" && !m.answeredAt && this.s.links[m.linkId]?.active) this.fail(m, "the reviewer's turn ended without an answer", { lateOk: true });
   }
 
   // A Claude turn ended (Stop, turn_ok) or an API error ended it (StopFailure,
@@ -1730,15 +2138,7 @@ class BrokerState {
 
   op_turn_ok({ endpoint, at }) {
     if (!endpoint?.id || !at) return { skipped: true };
-    for (const m of this.s.messages) {
-      if (!sameEndpoint(m.toEndpoint, endpoint) || !m.wokenAt || m.wokenAt > at || m.settledAt) continue;
-      m.settledAt = at;
-      // a Claude reviewer's turn that ended without answering the review of
-      // a turn: no answer is coming from it, as when a ChatGPT reviewer's turn
-      // completes without one; it is sent again (the next turn's review waits
-      // for this one's answer, so it mustn't stay open for good)
-      if (m.kind === "review-request" && !m.answeredAt && this.s.links[m.linkId]?.everyTurn) this.fail(m, "the reviewer's turn ended without an answer");
-    }
+    for (const m of this.s.messages) if (sameEndpoint(m.toEndpoint, endpoint) && m.wokenAt && m.wokenAt <= at && !m.settledAt) this.settleWoken(m, at);
     const ep = this.endpointState(endpoint);
     ep.lastOkAt = Math.max(ep.lastOkAt ?? 0, at);
     if (ep.lastFailure && ep.lastFailure.at < at) delete ep.lastFailure;
@@ -2036,27 +2436,55 @@ function listen() {
           out = { ok: false, error: String(e.message || e) };
         }
         res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(out));
-        if (stepDown) {
-          logEvent({ op: "broker-step-down", pid: process.pid, protocol: PROTOCOL });
-          clearInterval(state.ingestTimer);
-          state.retired = true; // reads still running are dropped
-          srv.close();
-          srv.closeAllConnections?.();
-          if (owner === state) owner = null;
-        }
+        if (stepDown) stepDownNow();
       });
     });
+    const stepDownNow = () => {
+      logEvent({ op: "broker-step-down", pid: process.pid, protocol: PROTOCOL });
+      clearInterval(state.ingestTimer);
+      state.retired = true; // reads still running are dropped
+      srv.close();
+      srv.closeAllConnections?.();
+      if (owner === state) owner = null;
+    };
+    // the state as kept turned out to be a newer version's once it could be
+    // read (it couldn't be when this process started): not taken over, as
+    // above, and nothing of it touched
+    const newerFound = () => {
+      newerState = state.newerProtocol;
+      logEvent({ op: "state-newer", protocol: newerState });
+      stepDownNow();
+    };
     srv.once("error", () => resolve(null));
     srv.listen(PORT, "127.0.0.1", () => {
       srv.unref();
       logEvent({ op: "broker-start", pid: process.pid });
-      // the state is this process's now: what advisor mode left is retired
-      // before anything else can send or read it
-      if (state.retireAdvisor()) state.save();
-      state.ingestOutbox();
-      state.dispatch(); // messages left undelivered by a previous owner
+      // only the owner that holds the port changes the state's files (see
+      // adopt); a file that can't be read is read again for a moment first
+      const unsettled = () => {
+        const pend = imageOf(PENDING_FILE);
+        return !!(imageOf(STATE_FILE).busy || pend.busy || pend.damaged);
+      };
+      for (let i = 0; i < 20 && unsettled(); i++) Atomics.wait(SLEEP, 0, 0, 50);
+      const took = state.adopt();
+      if (took === "newer") {
+        newerFound();
+        return resolve(null);
+      }
+      if (took === "adopted") {
+        state.ingestOutbox();
+        state.dispatch(); // messages left undelivered by a previous owner
+      }
       let lastWatch = 0;
       state.ingestTimer = setInterval(() => {
+        // (the state as kept couldn't be read: read again; nothing else runs
+        // until it is)
+        if (state.stateWait) {
+          const now = state.adopt();
+          if (now === "newer") return newerFound();
+          if (now !== "adopted") return;
+          state.dispatch();
+        }
         state.ingestOutbox();
         if (Date.now() - lastWatch >= Math.min(2000, WATCH.first)) {
           lastWatch = Date.now();

@@ -5,8 +5,29 @@
 // those commands.
 
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 
-export const runPosix = (cmd) => execFileSync("bash", ["-c", cmd], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+// Git's own bash. On Windows, `bash` from PATH can be WSL's (from PowerShell,
+// for one), so it is looked for next to git: `git --exec-path` is
+// ...\Git\mingw64\libexec\git-core, bash is in ...\Git\bin or ...\Git\usr\bin.
+// Elsewhere, bash.
+export function gitBash({ platform = process.platform, execPath = () => execFileSync("git", ["--exec-path"], { encoding: "utf8" }).trim(), exists = fs.existsSync } = {}) {
+  if (platform !== "win32") return "bash";
+  try {
+    const base = execPath();
+    for (const rel of ["../../../bin/bash.exe", "../../../usr/bin/bash.exe"]) {
+      const p = path.win32.resolve(base, rel);
+      if (exists(p)) return p;
+    }
+  } catch {
+    // no git to ask: PATH's bash
+  }
+  return "bash";
+}
+
+const BASH = gitBash();
+export const runPosix = (cmd) => execFileSync(BASH, ["-c", cmd], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
 
 // the PowerShell there is, if any
 export const powershell =

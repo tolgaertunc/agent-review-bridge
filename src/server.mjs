@@ -138,6 +138,13 @@ async function newThread({ model, effort, name, seed }) {
   // (=fail: ChatGPT can't be reached)
   if (process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX) {
     if (process.env.AGENT_REVIEW_BRIDGE_FAKE_CODEX === "fail") throw new Error("ChatGPT Desktop not reachable (test)");
+    // (<data dir>/fake-thread-delay: the next chat takes that many ms to make)
+    const slow = path.join(dataDir(), "fake-thread-delay");
+    if (fs.existsSync(slow)) {
+      const ms = Number(fs.readFileSync(slow, "utf8")) || 0;
+      fs.rmSync(slow, { force: true });
+      await new Promise((r) => setTimeout(r, ms));
+    }
     const file = path.join(dataDir(), "fake-threads.json");
     let made = [];
     try {
@@ -181,14 +188,17 @@ server.registerTool(
     annotations: LOCAL,
   },
   async ({ text: t, reply_to, open, remember }, extra) => {
+    // the user's "always" is kept even when the message only waits
+    if (open && remember) writeConfig({ openClosedApps: "always" });
     const endpoint = await self(extra);
     // sent to the chat that was checked, even if a newer link appears meanwhile
     const target = await call("send_target", { endpoint, replyTo: reply_to });
     // through auto mode's pairing, a Claude chat that isn't listening gets the
-    // message when its next turn ends (or once it's open): nothing is opened
-    // for it, unless asked or the user said to always open closed apps
-    const waits =
-      !target.linkId && target.to.app === "claude" && !open && readConfig().openClosedApps !== "always" && !(await call("reach", { endpoint: target.to })).listening;
+    // message when its turn ends (or once it's open): nothing is opened for
+    // it, unless asked or the user said to always open closed apps, and then
+    // only if the bridge knows how (else it waits all the same)
+    const peer = !target.linkId && target.to.app === "claude" ? await call("reach", { endpoint: target.to }) : null;
+    const waits = !!peer && !peer.listening && ((!open && readConfig().openClosedApps !== "always") || !peer.hostId);
     if (!waits) {
       const stop = await reach(target.to, { open, remember });
       if (stop) return stop;
@@ -198,7 +208,7 @@ server.registerTool(
     const f = r.lastFailure;
     return text(
       `Sent ${r.id} to ${r.to.app} chat ${r.to.id} (${r.linkId ? `link ${r.linkId}` : "auto mode"}). The user can't see tool calls: write what you sent in your reply.` +
-        (waits ? " That chat isn't listening right now: it gets the message when its next turn ends, or once it's open in Claude Desktop." : "") +
+        (waits ? " That chat isn't listening right now (it's in the middle of a turn, or not open in Claude Desktop): it gets the message when that turn ends, or once it's open again." : "") +
         (f ? ` Note: that chat's last turn, at ${when(f.at)}, ended with an error (${f.error}${f.details ? `: ${f.details}` : ""}); it may not answer until it recovers.` : ""),
       r,
     );
@@ -281,17 +291,18 @@ server.registerTool(
       "For a plan (before implementing), use kind='plan': no paths unless you name some, and once it's reviewed you show the user the plan and verdict and wait for their approval (in auto mode, a plan you consult on by your own choice goes on once approved: own_initiative). " +
       "After [CHANGES REQUESTED], ask for the next round with round_of (the previous review's link id): same reviewer and kind, and say what you changed and where you disagree; " +
       "after a review that got no answer, round_of asks the same reviewer again. " +
+      `reviewer='openai' opens a new ChatGPT thread for it (pick the model and effort; ${MODEL_CHOICE}), or continues in an earlier one (thread_id), which keeps that chat's context. ` +
+      "Use thread_id only to go on with the same work (a later round, or a follow-up of it); for other work open a new thread, even with the same model. " +
+      "A reviewer the user names by model (\"ask Astra\") means a new thread with that model, unless they point to an earlier chat. " +
       (SIDE === "claude"
-        ? `reviewer='openai' opens a new ChatGPT thread for it (pick the model and effort; ${MODEL_CHOICE}), or continues in an earlier one (thread_id), which keeps that chat's context. ` +
-          "Use thread_id only to go on with the same work (a later round, or a follow-up of it); for other work open a new thread, even with the same model. " +
-          "A reviewer the user names by model (\"ask Astra\") means a new thread with that model, unless they point to an earlier chat. " +
-          "In auto mode a review without thread_id goes to auto mode's reviewer chat, unless you give another model or a name: then it gets a chat of its own. "
-        : "In auto mode a review without round_of goes to auto mode's reviewer, a Claude Code chat; before there is one, the review gives a join code, and the chat that joins stays the reviewer. " +
-          "reviewer='join' while there is one asks a reviewer of its own. ") +
+        ? "In auto mode a review without thread_id goes to auto mode's reviewer chat, unless you give another model or a name: then it gets a chat of its own " +
+          "(when auto mode takes its reviewer by code, reviewer='join', only reviewer='openai' or thread_id ask for another). "
+        : "In auto mode a review without round_of goes to auto mode's reviewer, by default a Claude Code chat; before there is one, the review gives a join code, and the chat that joins stays the reviewer " +
+          "(reviewer='join' while there is one asks a reviewer of its own). If auto mode was turned on with a ChatGPT reviewer (reviewer='openai' or thread_id), reviews go to that chat, as from Claude. ") +
       "reviewer='join' returns a code for an existing chat, which then calls bridge_link_join. The answer arrives as a new turn.",
     inputSchema: {
       request: z.string().describe("What to review and what you want to know"),
-      reviewer: z.enum(SIDE === "claude" ? ["openai", "join"] : ["join"]).optional().describe("Where the reviewer runs (not needed with round_of, or in auto mode)"),
+      reviewer: z.enum(["openai", "join"]).optional().describe("Where the reviewer runs (not needed with round_of, or in auto mode)"),
       round_of: z.string().optional().describe("Link id of the previous round (e.g. L7) to ask the same reviewer for the next round, or again after it got no answer"),
       model: z.string().optional().describe("Model for a new ChatGPT reviewer thread, as ChatGPT lists it (id or name)"),
       effort: z.string().optional().describe("Reasoning effort for a new ChatGPT reviewer thread, e.g. low, medium, high"),
@@ -301,18 +312,17 @@ server.registerTool(
       own_initiative: z.boolean().optional().describe("Auto mode, plan reviews you start by your own choice: once approved, go on without waiting for the user. Leave it out if the user asked for the review or you're not sure"),
       name: z.string().optional().describe("Name for a new reviewer thread"),
       ...OPEN_ARGS,
-      ...(SIDE === "claude" && {
-        thread_id: z
-          .string()
-          .optional()
-          .describe("Existing ChatGPT thread to review in, for the same work only (an earlier reviewer of it); it keeps its own model and permissions (model/effort/name are ignored)"),
-      }),
+      thread_id: z
+        .string()
+        .optional()
+        .describe("Existing ChatGPT thread to review in, for the same work only (an earlier reviewer of it, not this chat itself); it keeps its own model and permissions (model/effort/name are ignored)"),
     },
     annotations: LOCAL,
   },
   async ({ request, reviewer, round_of, model, effort, kind, paths, include_diff = false, own_initiative, name, thread_id, open, remember }, extra) => {
     const primary = await self(extra);
     if (!primary) return text("Can't tell which chat this is, so the review can't be routed back.");
+    if (thread_id && primary.app === "openai" && thread_id === primary.id) return text("Nothing was sent: thread_id names this chat itself, and a chat can't review its own work.");
     const auto = await autoOf(primary);
     if (!name?.trim()) name = undefined;
     // 1. Where it goes, with no side effects: the earlier round's reviewer,
@@ -328,12 +338,18 @@ server.registerTool(
     if (round_of) round = await call("round_info", { primary, roundOf: round_of });
     else {
       // auto mode's reviewer isn't a ChatGPT thread (a chat that joined with a
-      // code, in either app): a review goes to it, as on the ChatGPT side,
-      // unless another reviewer is asked for; while there is none and auto
-      // mode was told to take one by code, the first review gives the code
-      const keptChat = auto && SIDE === "claude" && kept && kept.app !== "openai";
-      const byCode = auto && SIDE === "claude" && !kept && auto.joinReviewer && reviewer !== "openai" && !thread_id && model === undefined && name === undefined;
-      if (keptChat && reviewer === undefined && !thread_id && model === undefined && name === undefined) standing = kept;
+      // code, in either app): a review goes to it unless another reviewer is
+      // asked for; while there is none and auto mode takes one by code (from
+      // ChatGPT, unless told otherwise: the bridge can't make a Claude chat),
+      // the first review gives the code, and the chat that joins stays it
+      // When auto mode takes its reviewer by code, only reviewer 'openai' or
+      // thread_id asks for another: a model or a name alone doesn't (there is
+      // no chat to make with them)
+      const keptChat = auto && kept && kept.app !== "openai";
+      const asked = reviewer === "openai";
+      const plain = !thread_id && (joins(auto) || (model === undefined && name === undefined));
+      const byCode = auto && !kept && joins(auto) && !asked && !thread_id;
+      if (keptChat && reviewer === undefined && plain) standing = kept;
       else if (byCode) {
         reviewer = "join";
         autoJoin = true;
@@ -341,28 +357,22 @@ server.registerTool(
         // a reviewer of its own, outside auto mode's
         reviewer ??= "openai";
         separate = reviewer === "openai";
-      } else if (auto && SIDE === "claude" && reviewer !== "join") {
+      } else if (auto && reviewer !== "join") {
         reviewer = "openai";
         // a chat asked for by another model or by name is a chat of its own;
         // auto mode's reviewer chat stays as it is. The first review makes
         // auto mode's chat with what it asks for, unless that is another
-        // model than the one auto mode was turned on with.
+        // model than the one auto mode was turned on with. (By code, its
+        // ChatGPT reviewer only gives way when another is asked for.)
         const other = model !== undefined && !sameModel(model, auto.model);
-        separate = !thread_id && (keptThread ? name !== undefined || other : other && auto.model != null);
+        separate = !thread_id && (joins(auto) && !asked ? false : keptThread ? name !== undefined || other : other && auto.model != null);
         if (!separate) {
           thread_id ??= keptThread;
           model ??= auto.model;
           effort ??= auto.effort;
         }
-      } else if (auto && SIDE === "openai") {
-        // the bridge can't make a Claude chat: auto mode's first review is
-        // joined by one, which then stays the reviewer. A join asked for while
-        // there is one is a reviewer of its own.
-        if (!kept) {
-          reviewer = "join";
-          autoJoin = true;
-        } else if (reviewer === undefined) standing = kept;
       }
+      // (a join asked for while auto mode has a reviewer is a reviewer of its own)
       if (!reviewer && !standing) return text("Say where the reviewer runs (reviewer), or continue an earlier review with round_of.");
     }
     if (round) target = round.advisor;
@@ -445,11 +455,16 @@ const AUTO_REVIEWER_CHAT =
     ? `The reviewer is a ChatGPT chat, made on the first review (model and effort as given here; ${MODEL_CHOICE}), or an existing one (thread_id); ` +
       "or, with reviewer='join', the chat that joins with a code, in either app (for example another Claude Code chat, for a second model of the same app)."
     : "The reviewer is a Claude Code chat: the bridge can't make one, so the first review gives a join code for the user to paste into the Claude chat that should review, and auto mode keeps that chat as the reviewer. " +
-      "Another ChatGPT chat can join with the code too.";
+      "Another ChatGPT chat can join with the code too. Or, with reviewer='openai', a ChatGPT chat the bridge makes on the first review (model and effort as given here; " +
+      `${MODEL_CHOICE}), or an existing one (thread_id).`;
 
 // Where a join code for auto mode's reviewer goes: from ChatGPT a Claude
 // chat by default; from Claude only when asked for (reviewer='join'), any chat
 const JOIN_WHERE = SIDE === "claude" ? "the chat that should review (either app)" : "the Claude Code chat that should review";
+// auto mode's reviewer, until one is named: from Claude a ChatGPT chat the
+// bridge makes, from ChatGPT the chat that joins with a code
+const JOIN_DEFAULT = SIDE === "openai";
+const joins = (entry) => entry?.joinReviewer ?? JOIN_DEFAULT;
 
 server.registerTool(
   "bridge_auto",
@@ -462,19 +477,21 @@ server.registerTool(
       AUTO_REVIEWER_CHAT,
     inputSchema: {
       on: z.boolean().describe("true to turn auto mode on, false to turn it off"),
-      ...(SIDE === "claude" && {
-        model: z.string().optional().describe("Model for the reviewer chat, as ChatGPT lists it (id or name)"),
-        effort: z.string().optional().describe("Reasoning effort for the reviewer chat, e.g. low, medium, high"),
-        thread_id: z.string().optional().describe("An existing ChatGPT chat to use as the reviewer"),
-        reviewer: z
-          .enum(["openai", "join"])
-          .optional()
-          .describe("Who the reviewer is: 'openai' (default) a ChatGPT chat the bridge makes; 'join' the chat that joins with a code, in either app (for example another Claude Code chat). With new_reviewer it replaces the current one"),
-      }),
+      model: z.string().optional().describe("Model for a ChatGPT reviewer chat the bridge makes, as ChatGPT lists it (id or name)"),
+      effort: z.string().optional().describe("Reasoning effort for a ChatGPT reviewer chat the bridge makes, e.g. low, medium, high"),
+      thread_id: z.string().optional().describe("An existing ChatGPT chat to use as the reviewer (not this chat itself)"),
+      reviewer: z
+        .enum(["openai", "join"])
+        .optional()
+        .describe(
+          SIDE === "claude"
+            ? "Who the reviewer is: 'openai' (default) a ChatGPT chat the bridge makes; 'join' the chat that joins with a code, in either app (for example another Claude Code chat). With new_reviewer it replaces the current one"
+            : "Who the reviewer is: 'join' (default) the chat that joins with a code (a Claude Code chat, or another ChatGPT chat); 'openai' a ChatGPT chat the bridge makes. With new_reviewer it replaces the current one",
+        ),
       new_reviewer: z
         .boolean()
         .optional()
-        .describe(`While on: drop auto mode's reviewer chat (gone, or the user wants another), keeping what was approved; the next review gets a new one (${SIDE === "claude" ? "a new ChatGPT chat" : "a new join code"})`),
+        .describe("While on: drop auto mode's reviewer chat (gone, or the user wants another), keeping what was approved; the next review gets a new one (a chat the bridge makes, or a new join code)"),
       every_turn: z
         .boolean()
         .optional()
@@ -508,31 +525,44 @@ server.registerTool(
     // matter: as this call says, else as it is while on, else the user's setting
     const everyTurn = every_turn ?? (before ? !!before.everyTurn : readConfig().autoReviews === "every-turn");
     const pick = thread_id ? { app: "openai", id: thread_id } : new_reviewer ? null : undefined;
+    if (pick && pick.app === endpoint.app && pick.id === endpoint.id) return text("Nothing changed: thread_id names this chat itself, and a chat can't review its own work.");
     const joinReviewer = reviewer === "join" ? true : reviewer === "openai" || thread_id ? false : undefined;
-    const entry = await call("auto_set", { endpoint, on: true, reviewer: pick, model, effort, paths: start, everyTurn, joinReviewer });
-    let kept = reviewerOf(entry);
-    let joinCode = null;
-    // reviewing every turn needs its reviewer from the start: made by the
-    // bridge, or the chat that joins with the code given now
-    if (everyTurn && !kept && SIDE === "claude" && !entry.joinReviewer) {
-      let t;
+    // reviewing every turn needs its reviewer from the start. A ChatGPT chat
+    // the bridge makes is made first, from the setting as it is now, and
+    // nothing is saved if that fails; the setting is then saved only if it
+    // hasn't changed meanwhile (turned off, on again, another reviewer)
+    const keeps = pick !== undefined ? pick : before ? reviewerOf(before) : null;
+    const joining = joinReviewer ?? (before ? joins(before) : JOIN_DEFAULT);
+    let made = null;
+    if (everyTurn && !keeps && !joining) {
       try {
-        t = await newThread({ model: entry.model ?? undefined, effort: entry.effort ?? undefined, name: "Auto mode: every turn", seed: EVERY_TURN_BRIEF });
+        made = await newThread({ model: model ?? before?.model ?? undefined, effort: effort ?? before?.effort ?? undefined, name: "Auto mode: every turn", seed: EVERY_TURN_BRIEF });
       } catch (e) {
-        // made nothing: as it was before this call (on, the reviews of its turns wait for a reviewer)
-        if (!before) await call("auto_set", { endpoint, on: false });
         return text(
-          `Couldn't make the reviewer chat in ChatGPT (${e.message || e}). ` +
-            (before ? "Auto mode stays on, and the reviews of your turns wait for a reviewer: call this again to try once more." : "Auto mode is off: try again, or turn it on without every_turn."),
+          `Nothing changed: couldn't make the reviewer chat in ChatGPT (${e.message || e}). ` +
+            (before ? "Auto mode stays as it was." : "Auto mode is still off: try again, or turn it on without every_turn."),
         );
       }
-      if (t.refused) {
-        if (!before) await call("auto_set", { endpoint, on: false });
-        return text(t.refused);
-      }
-      await call("auto_reviewer", { endpoint, reviewer: { app: "openai", id: t.threadId }, model: t.model ?? undefined, effort: entry.effort ?? undefined });
-      kept = { app: "openai", id: t.threadId };
-    } else if (everyTurn && !kept) {
+      if (made.refused) return text(`${made.refused} Nothing changed.`);
+    }
+    const entry = await call("auto_set", {
+      endpoint,
+      on: true,
+      reviewer: made ? { app: "openai", id: made.threadId } : pick,
+      model: made?.model ?? model,
+      effort,
+      paths: start,
+      everyTurn,
+      joinReviewer,
+      ...(made && { expect: status.autoRev ?? 0 }),
+    });
+    if (entry.stale)
+      return text(
+        "Nothing changed: auto mode's setting changed while its reviewer chat was being made (it was turned off, turned on again, or given another reviewer). The ChatGPT chat made for it isn't used.",
+      );
+    const kept = reviewerOf(entry);
+    let joinCode = null;
+    if (everyTurn && !kept) {
       // a chat joins with a code, given now; one already waiting isn't made again
       const waiting = (await call("status", { endpoint })).links.find(
         (l) => l.active && l.mode === "review" && l.autoReviewer && !l.advisor && l.joinCode && l.autoSince === entry.since,
@@ -543,7 +573,7 @@ server.registerTool(
       `Auto mode is on${kept ? `, with ${chatName(kept)} as the reviewer` : ""}.${everyTurn ? " Every turn is reviewed on its own." : ""} Tracked: ${Object.keys(entry.paths).join(", ") || "(no folder yet)"}.` +
         (joinCode
           ? ` It needs a reviewer: ask the user to paste this into ${JOIN_WHERE}: "join the agent-review-bridge link with code ${joinCode}". Until one joins, the reviews of your turns wait.`
-          : !kept && (SIDE === "openai" || entry.joinReviewer)
+          : !kept && joins(entry)
             ? ` The first review gives a join code: ask the user to paste it into ${JOIN_WHERE}; that chat then stays the reviewer.`
             : "") +
         `\n\n${everyTurn ? AUTO_RULES_EVERY : AUTO_RULES}`,

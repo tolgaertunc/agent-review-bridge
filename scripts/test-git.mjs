@@ -7,9 +7,9 @@ import fs from "node:fs";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { baseline, snapshotSummary, snapshotCommand, pathInfo, reviewSummary, pathCommand, shellArg, fingerprint, usableBase } from "../src/git.mjs";
+import { baseline, snapshotSummary, snapshotCommand, pathInfo, reviewSummary, pathCommand, shellArg, fingerprint, usableBase, withinBudget } from "../src/git.mjs";
 import { commandBlocks } from "../src/request.mjs";
-import { runPosix, powershell, runPowershell } from "./reviewer-shell.mjs";
+import { runPosix, powershell, runPowershell, gitBash } from "./reviewer-shell.mjs";
 
 // the fingerprint keeps a small cache in the bridge's data folder: a throwaway one here
 process.env.AGENT_REVIEW_BRIDGE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-gitdata-"));
@@ -207,6 +207,14 @@ const shown = (d, base, end) => runPosix(snapshotCommand(d, base, end));
   assert.equal(fingerprint(plain).hash, p1, "secrets don't count outside git either");
   fs.writeFileSync(path.join(plain, "x.txt"), "2");
   assert.notEqual(fingerprint(plain).hash, p1, "an edit outside git counts");
+  // within a hook's budget: a folder whose files can't all be hashed in time
+  // is unknown (checked between files), not a hash of part of it
+  const many = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-many-"));
+  for (let i = 0; i < 3000; i++) fs.writeFileSync(path.join(many, `f${i}.txt`), "x".repeat(2000) + i);
+  assert.equal(withinBudget(Date.now() + 5, () => fingerprint(many, { fresh: true })).error, "out of time");
+  assert.equal(withinBudget(Date.now() - 1, () => fingerprint(r.d, { fresh: true })).error, "out of time", "in git: no call starts once it's up");
+  assert.match(fingerprint(many, { fresh: true }).hash ?? "", /^[0-9a-f]{64}$/, "outside the budget: hashed");
+  fs.rmSync(many, { recursive: true, force: true });
   // a path named through a link to a folder is that folder, in git or not
   const links = fs.mkdtempSync(path.join(os.tmpdir(), "agent-review-bridge-links-"));
   const kind = process.platform === "win32" ? "junction" : "dir";
@@ -350,7 +358,23 @@ const shown = (d, base, end) => runPosix(snapshotCommand(d, base, end));
     }
   }
   fs.rmSync(parent, { recursive: true, force: true });
-  console.log(`git 9 commands quoted per shell (space, apostrophe, $, backtick, curly apostrophe): bash runs them${powershell ? `, and ${powershell} too` : "; no PowerShell here, its form checked by text only"}; on Windows both forms, labeled`);
+  // the bash that runs them on Windows is Git's (PATH's can be WSL's), found
+  // next to git, also in a folder with spaces
+  const git = () => "C:/Program Files/Git/mingw64/libexec/git-core";
+  assert.equal(gitBash({ platform: "win32", execPath: git, exists: (p) => p === "C:\\Program Files\\Git\\bin\\bash.exe" }), "C:\\Program Files\\Git\\bin\\bash.exe");
+  assert.equal(gitBash({ platform: "win32", execPath: git, exists: (p) => p === "C:\\Program Files\\Git\\usr\\bin\\bash.exe" }), "C:\\Program Files\\Git\\usr\\bin\\bash.exe", "else usr\\bin");
+  assert.equal(gitBash({ platform: "win32", execPath: git, exists: () => false }), "bash", "none there: PATH's");
+  assert.equal(
+    gitBash({
+      platform: "win32",
+      execPath: () => {
+        throw new Error("no git");
+      },
+    }),
+    "bash",
+  );
+  assert.equal(gitBash({ platform: "darwin" }), "bash");
+  console.log(`git 9 commands quoted per shell (space, apostrophe, $, backtick, curly apostrophe): bash runs them${powershell ? `, and ${powershell} too` : "; no PowerShell here, its form checked by text only"}; on Windows both forms, labeled; Git's bash on Windows`);
 }
 
 // git stash create runs on a copy of the index: a stat-dirty index isn't
@@ -388,10 +412,24 @@ const shown = (d, base, end) => runPosix(snapshotCommand(d, base, end));
   assert.match(runPosix(snapshotCommand(wt, { ref: pathInfo(wt).head }, side)), /^\+side$/m);
   assert.ok(fs.readFileSync(path.resolve(wt, wtIndex)).equals(wtBefore), "its index never written either");
   assert.deepEqual(fs.readdirSync(path.join(process.env.AGENT_REVIEW_BRIDGE_DIR, "tmp")), [], "no copy left behind");
+  // copies a killed hook left are swept once they were made over ten minutes
+  // ago (in their names); another snapshot's copy in use is kept, though it
+  // carries the index's own, older file time
+  const tmp = path.join(process.env.AGENT_REVIEW_BRIDGE_DIR, "tmp");
+  const hoursAgo = new Date(Date.now() - 3 * 3600_000);
+  const inUse = path.join(tmp, `index-1-${Date.now()}-aaaaaaaa`);
+  const left = path.join(tmp, `index-2-${Date.now() - 11 * 60_000}-bbbbbbbb`);
+  for (const f of [inUse, `${inUse}.lock`, left, `${left}.lock`]) {
+    fs.writeFileSync(f, "x");
+    fs.utimesSync(f, hoursAgo, hoursAgo);
+  }
+  assert.ok(baseline(wt)?.ref);
+  assert.deepEqual(fs.readdirSync(tmp).sort(), [path.basename(inUse), `${path.basename(inUse)}.lock`], "the one in use kept, the one left swept");
+  for (const f of fs.readdirSync(tmp)) fs.rmSync(path.join(tmp, f));
   r.git("worktree", "remove", "--force", wt);
   fs.rmSync(r.d, { recursive: true, force: true });
   fs.rmSync(wtParent, { recursive: true, force: true });
-  console.log("git 10 stash create on a copy of the index: the real one (a linked worktree's too) never written, another git's lock no obstacle, nothing left behind");
+  console.log("git 10 stash create on a copy of the index: the real one (a linked worktree's too) never written, another git's lock no obstacle, nothing left behind; old copies swept by when they were made, one in use kept");
 }
 
 // before the first commit: staged files count as the turn's changes, and a
