@@ -198,14 +198,21 @@ export async function createThreadOn(s, { model, effort, cwd, name, seed, sandbo
 
 // Queue a prompt for the desktop app and make sure it picks it up. clientId
 // comes back on the turn's user message, so the turn can be found later.
-export async function sendToThread(threadId, prompt, { wake = true, clientId = crypto.randomUUID(), ...opts } = {}) {
+// `wanted()`, asked once the app-server is up and right before queueing:
+// false sends nothing (the prompt was called off meanwhile). Once queued, it
+// is sent: it can't be called back.
+export async function sendToThread(threadId, prompt, { wake = true, clientId = crypto.randomUUID(), wanted, ...opts } = {}) {
   const queued = await withServer(async (s) => {
+    if (wanted && !wanted()) throw new Error(NOT_WANTED);
     const r = await s.rpc("thread/queue/add", { threadId, input: [{ type: "text", text: prompt }], clientUserMessageId: clientId });
     return r.queuedSubmission.id;
   }, opts);
   if (wake) openUrl(`codex://threads/wake/${threadId}`);
   return { queued, clientId };
 }
+
+// what a send called off before it was queued fails with
+export const NOT_WANTED = "not sent: called off before it was queued";
 
 // Tests stand in for ChatGPT with <data dir>/fake-codex.json:
 // { limits: <account/rateLimits/read answer>, turns: { <clientId>: {state, error} }, hang: true }

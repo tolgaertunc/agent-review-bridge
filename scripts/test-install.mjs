@@ -19,8 +19,11 @@ const otherClaudeHook = { type: "command", command: "echo other" };
 const otherCodexHook = { type: "command", command: "echo keep" };
 const legacyCodexHook = { type: "command", command: "node C:\\x\\codex-stop-hook.mjs", timeout: 330 };
 const otherNotification = { matcher: "idle_prompt", hooks: [{ type: "command", command: "echo idle" }] };
-fs.writeFileSync(path.join(claudeDir, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(ls:*)"] }, hooks: { Stop: [{ hooks: [otherClaudeHook] }], Notification: [otherNotification] } }));
-fs.writeFileSync(path.join(codexDir, "hooks.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [legacyCodexHook] }], PreToolUse: [{ matcher: "Bash", hooks: [otherCodexHook] }] } }));
+// the bridge's hooks from a checkout that was somewhere else (moved, or a second one)
+const movedClaudeHook = { type: "command", command: '"/usr/bin/node" "/old/place/agent-review-bridge/src/hook.mjs" --app claude --event stop', timeout: 10 };
+const movedCodexHook = { type: "command", command: '"/usr/bin/node" "/old/place/agent-review-bridge/src/hook.mjs" --app openai --event prompt', timeout: 10 };
+fs.writeFileSync(path.join(claudeDir, "settings.json"), JSON.stringify({ permissions: { allow: ["Bash(ls:*)"] }, hooks: { Stop: [{ hooks: [otherClaudeHook, movedClaudeHook] }], Notification: [otherNotification] } }));
+fs.writeFileSync(path.join(codexDir, "hooks.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [legacyCodexHook] }], UserPromptSubmit: [{ hooks: [movedCodexHook] }], PreToolUse: [{ matcher: "Bash", hooks: [otherCodexHook] }] } }));
 fs.writeFileSync(path.join(codexDir, "config.toml"), 'model = "x"\n');
 
 const env = { ...process.env, CLAUDE_CONFIG_DIR: claudeDir, CODEX_HOME: codexDir };
@@ -51,6 +54,7 @@ assert.equal(codex.Stop.length, 1, "legacy blocking hook replaced");
 assert.ok(codex.Stop[0].command.includes("--event stop"));
 assert.ok(!codex.Stop[0].asyncRewake && codex.Stop[0].timeout === 10);
 assert.equal(codex.UserPromptSubmit.length, 1);
+assert.ok(![...Object.values(claude), ...Object.values(codex)].flat().some((h) => h.command.includes("/old/place/")), "hooks from a checkout that was elsewhere are replaced, not kept beside the new ones");
 assert.ok(codex.SessionStart.length === 1 && codex.SessionStart[0].command.includes("--app openai --event start"), "ChatGPT gets auto mode's rules again too");
 if (process.platform === "win32") {
   // PowerShell can't start a command line with a quoted path

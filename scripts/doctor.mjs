@@ -287,7 +287,8 @@ function runs(cmd, shell) {
     const ends = `${l.primary.app} ${l.primary.id.slice(0, 8)}… → ${l.advisor ? `${l.advisor.app} ${l.advisor.id.slice(0, 8)}…` : "(waiting for join)"}`;
     const problems = [];
     if (l.health && !l.health.ok) problems.push(`last delivery failed: ${l.health.error}`);
-    for (const role of ["primary", "advisor"]) if (l[role]?.app === "claude" && !listening(l[role])) problems.push(`Claude ${role} not listening${state?.hosts?.[l[role].id] ? "" : ", and the bridge can't open it (no Claude Desktop id)"}`);
+    for (const [role, label] of [["primary", "requester"], ["advisor", "reviewer"]])
+      if (l[role]?.app === "claude" && !listening(l[role])) problems.push(`Claude ${label} not listening${state?.hosts?.[l[role].id] ? "" : ", and the bridge can't open it (no Claude Desktop id)"}`);
     problems.length
       ? warn(A, `${l.id} (${l.mode})`, `${ends}; ${problems.join("; ")}`, "Open the Claude Code session in Claude Desktop (it re-arms on its next turn or start); check ChatGPT Desktop is installed and signed in.")
       : ok(A, `${l.id} (${l.mode})`, ends);

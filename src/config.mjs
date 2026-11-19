@@ -6,7 +6,10 @@ import path from "node:path";
 import { configDir } from "./platform.mjs";
 
 const OPEN = ["ask", "always"];
-const DEFAULTS = { openClosedApps: "ask" };
+// auto mode: the agent asks at the moments that matter, or every turn is
+// reviewed on its own
+const AUTO_REVIEWS = ["key-moments", "every-turn"];
+const DEFAULTS = { openClosedApps: "ask", autoReviews: "key-moments" };
 
 export const configFile = () => path.join(configDir(), "config.json");
 
@@ -17,7 +20,11 @@ export function readConfig() {
   } catch {
     // no file, or not JSON: defaults
   }
-  return { ...raw, openClosedApps: OPEN.includes(raw?.openClosedApps) ? raw.openClosedApps : DEFAULTS.openClosedApps };
+  return {
+    ...raw,
+    openClosedApps: OPEN.includes(raw?.openClosedApps) ? raw.openClosedApps : DEFAULTS.openClosedApps,
+    autoReviews: AUTO_REVIEWS.includes(raw?.autoReviews) ? raw.autoReviews : DEFAULTS.autoReviews,
+  };
 }
 
 // Keeps whatever else the user put in the file
