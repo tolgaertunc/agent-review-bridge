@@ -1507,5 +1507,39 @@ console.log("25 host ids: only Claude Desktop's local_… ids, only for Claude c
   console.log("44 a message sent on a review since closed: its sender, paired with that chat, listens for the answer and is woken by it");
 }
 
+// 45. A Claude chat without a listener is busy, not closed, while it is still
+// in a turn the bridge handed a message to (woken with it, or read with
+// bridge_receive), until its Stop or an error ends that turn, and for at most
+// 30 minutes after it was last active in it (handed one, or answered)
+{
+  const P = { app: "openai", id: "gpt-reach-busy" };
+  const R = { app: "claude", id: "claude-reach-busy" };
+  const reach = () => call("reach", { endpoint: R });
+  const first = await call("link_create", { primary: P, advisor: R, request: "Review it." });
+  const req = await until(() => state().messages.find((m) => m.linkId === first.id && m.kind === "review-request"));
+  assert.deepEqual(await reach(), { listening: false, busy: false, hostId: null }, "handed nothing yet: closed");
+  await call("wake_ack", { ids: [req.id], at: Date.now() - 31 * 60_000 });
+  assert.equal((await reach()).busy, false, "woken over 30 minutes ago and quiet since: no longer busy");
+  await call("receive", { side: "claude", endpoint: R, id: req.id }); // read in a turn
+  assert.equal((await reach()).busy, true, "handed one in a turn that hasn't ended");
+  await call("advise", { endpoint: R, requestId: req.id, decision: "approved" });
+  assert.equal((await reach()).busy, true, "answered, and the turn goes on");
+  await call("turn_ok", { endpoint: R, at: Date.now() });
+  assert.equal((await reach()).busy, false, "its Stop ended the turn");
+  // an error ends the turn as well
+  await call("link_create", { primary: P, advisor: R, request: "Review it again." });
+  await call("receive", { side: "claude", endpoint: R });
+  assert.equal((await reach()).busy, true);
+  await call("turn_failed", { endpoint: R, at: Date.now(), error: "overloaded" });
+  assert.equal((await reach()).busy, false, "an error ended the turn");
+  // listening: reachable as before
+  const listener = path.join(dir, "listeners", "claude-claude-reach-busy.json");
+  fs.mkdirSync(path.dirname(listener), { recursive: true });
+  fs.writeFileSync(listener, JSON.stringify({ pid: process.pid, startedAt: Date.now(), beat: Date.now() }));
+  assert.deepEqual(await reach(), { listening: true, busy: false, hostId: null });
+  fs.rmSync(listener);
+  console.log("45 a Claude chat without a listener is busy, not closed, from being handed a message in a turn until that turn ends (Stop or an error), for at most 30 minutes after it was last active");
+}
+
 console.log("\nhooks log:\n" + fs.readFileSync(path.join(dir, "hooks.jsonl"), "utf8"));
 process.exit(0);

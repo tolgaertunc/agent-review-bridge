@@ -72,6 +72,15 @@ async function receiveUntil(c, meta, re) {
   }
   throw new Error(`no message matching ${re}`);
 }
+// a Claude chat's turn end (its Stop hook's turn_ok), once the bridge took it in
+async function turnEnded(sessionId) {
+  for (let i = 0; i < 40; i++) {
+    const s = JSON.parse(fs.readFileSync(path.join(dir, "state.json"), "utf8"));
+    if (s.endpoints?.[`claude:${sessionId}`]?.lastOkAt) return;
+    await sleep(100);
+  }
+  throw new Error(`${sessionId}'s turn end wasn't taken in`);
+}
 
 const claude = await connect("claude", { CLAUDE_CODE_SESSION_ID: SESSION, CLAUDE_PROJECT_DIR: repo });
 const openai = await connect("openai");
@@ -406,8 +415,17 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   const st = JSON.parse(textOf(await call(openai, "bridge_status", {}, meta))).auto;
   assert.deepEqual(st.reviewer, { app: "claude", id: "claude-auto-reviewer" });
   assert.ok(Object.values(st.paths)[0].approved, "the approval recorded the content");
-  // the next review goes to it; while it isn't listening, nothing is sent
-  // unless the user agrees to open it, which Claude Desktop does by its id
+  // the next review goes to it. Right after its answer it is still in that
+  // turn (no Stop yet): busy, not closed, so the review is sent and waits for
+  // that turn's end; nothing is opened
+  const busy = await call(openai, "bridge_review", { request: "Goal: trim fields. Step: busy." }, meta);
+  assert.match(textOf(busy), /^Review L\d+ sent to auto mode's reviewer, the Claude Code session claude-auto-reviewer\. That chat is still busy with a turn: it gets this when that turn ends\./);
+  assert.ok(!events().some((e) => e.op === "report" && e.event === "opened" && e.data.target.id === "claude-auto-reviewer"), "nothing opened for a busy chat");
+  await call(reviewer, "bridge_advise", { request_id: idIn(await receiveUntil(reviewer, undefined, /Step: busy/)), decision: "approved" });
+  // once its turn ended (Stop) and it isn't listening, nothing is sent unless
+  // the user agrees to open it, which Claude Desktop does by its id
+  await runHook("claude", "stop", { session_id: "claude-auto-reviewer", last_assistant_message: "Approved." });
+  await turnEnded("claude-auto-reviewer");
   const closed = await openai.callTool({ name: "bridge_review", arguments: { request: "Goal: trim fields. Step: next." }, _meta: meta });
   assert.match(textOf(closed), /^Nothing was sent: the Claude Code session claude-auto-reviewer isn't open/);
   const next = await call(openai, "bridge_review", { request: "Goal: trim fields. Step: next.", open: true }, meta);
@@ -441,7 +459,7 @@ console.log("5c ChatGPT-side review without a known project folder attaches no d
   fs.rmSync(path.join(dir, "listeners", "claude-claude-auto-reviewer.json"), { force: true });
   await second.close();
   await reviewer.close();
-  console.log("5e3 auto mode from ChatGPT: the first review's Claude chat stays the reviewer; later reviews and rounds go to it (opened by its Claude Desktop id when closed); an explicit join gets one of its own; new_reviewer drops it and keeps the approvals");
+  console.log("5e3 auto mode from ChatGPT: the first review's Claude chat stays the reviewer; later reviews and rounds go to it (waiting for the end of a turn it's busy with; opened by its Claude Desktop id when closed); an explicit join gets one of its own; new_reviewer drops it and keeps the approvals");
 }
 
 // 5e4. auto mode reviewing every turn, from the tools: on the Claude side the
