@@ -64,6 +64,11 @@ const DAY = 24 * 3600_000;
 const STATUS_RECENT = { ms: 3600_000, count: 5 };
 // free-form peer messages (bridge_send) can ping-pong; links can't
 const PEER_BURST = { count: 60, windowMs: 10 * 60_000 };
+// A Claude turn the bridge handed a message to (woken with it, or read with
+// bridge_receive) counts as still going, until its Stop, for this long after
+// the chat was last active in it (handed one, or answered): a turn the user
+// stopped runs no Stop
+const BUSY_MS = 30 * 60_000;
 // How long the bridge follows a prompt queued for a ChatGPT thread, to tell
 // the waiting side if its turn fails: first checks, then a slower pace, then a
 // deadline. Each read has its own time limit. (Tests scale it down.)
@@ -2323,9 +2328,19 @@ class BrokerState {
   }
 
   // Can a Claude endpoint be reached now (its listener is up), and can it be
-  // opened (its host id is known)?
+  // opened (its host id is known)? Without a listener it may be busy rather
+  // than closed: still in a turn the bridge handed a message to (see
+  // BUSY_MS). Its Stop arms the listener, so what's sent meanwhile reaches it
+  // when that turn ends.
   op_reach({ endpoint }) {
-    return { listening: !!listenerAlive(endpoint), hostId: this.s.hosts?.[endpoint?.id] ?? null };
+    const listening = !!listenerAlive(endpoint);
+    const ep = this.s.endpoints?.[autoKey(endpoint)];
+    const ended = Math.max(ep?.lastOkAt ?? 0, ep?.lastFailure?.at ?? 0);
+    const now = Date.now();
+    const busy =
+      !listening &&
+      this.s.messages.some((m) => sameEndpoint(m.toEndpoint, endpoint) && m.wokenAt > ended && now - Math.max(m.wokenAt, m.answeredAt ?? 0) < BUSY_MS);
+    return { listening, busy, hostId: this.s.hosts?.[endpoint?.id] ?? null };
   }
 
   // Free-form message (bridge_send) to the chat on the other end of this

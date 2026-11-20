@@ -67,11 +67,13 @@ async function self(extra) {
 
 // Before a call that reaches the other side: if it's closed, nothing is sent
 // unless the user agreed (open=true, or openClosedApps "always"); then it is
-// opened first. Returns a tool result to stop with, or null to go on.
+// opened first. A Claude chat still busy with a turn the bridge handed a
+// message to is open: what's sent reaches it when that turn ends. Returns a
+// tool result to stop with, or null to go on.
 async function reach(target, { open, remember }) {
   if (open && remember) writeConfig({ openClosedApps: "always" });
   if (!target) return null;
-  const isOpen = target.app === "openai" ? chatgptRunning() === true : (await call("reach", { endpoint: target })).listening;
+  const isOpen = target.app === "openai" ? chatgptRunning() === true : await call("reach", { endpoint: target }).then((r) => r.listening || r.busy);
   if (isOpen) return null;
   const what = target.app === "openai" ? "ChatGPT Desktop" : `the Claude Code session ${target.id}`;
   if (!open && readConfig().openClosedApps !== "always")
@@ -92,6 +94,10 @@ async function reach(target, { open, remember }) {
   await call("report", { side: SIDE, event: "opened", data: { target } });
   return null;
 }
+
+// Said after sending to a Claude chat that is busy with a turn (see reach)
+const busyNote = async (target) =>
+  target?.app === "claude" && (await call("reach", { endpoint: target })).busy ? " That chat is still busy with a turn: it gets this when that turn ends." : "";
 
 const OPEN_ARGS = {
   open: z.boolean().optional().describe("Open the other app or chat first if it's closed; pass only after the user agreed"),
@@ -199,16 +205,18 @@ server.registerTool(
     // only if the bridge knows how (else it waits all the same)
     const peer = !target.linkId && target.to.app === "claude" ? await call("reach", { endpoint: target.to }) : null;
     const waits = !!peer && !peer.listening && ((!open && readConfig().openClosedApps !== "always") || !peer.hostId);
+    let busy = "";
     if (!waits) {
       const stop = await reach(target.to, { open, remember });
       if (stop) return stop;
+      busy = await busyNote(target.to);
     }
     // no link: auto mode's pairing, to the chat checked here
     const r = await call("send", { endpoint, text: t, replyTo: reply_to, ...(target.linkId ? { linkId: target.linkId } : { channel: true, to: target.to }) });
     const f = r.lastFailure;
     return text(
       `Sent ${r.id} to ${r.to.app} chat ${r.to.id} (${r.linkId ? `link ${r.linkId}` : "auto mode"}). The user can't see tool calls: write what you sent in your reply.` +
-        (waits ? " That chat isn't listening right now (it's in the middle of a turn, or not open in Claude Desktop): it gets the message when that turn ends, or once it's open again." : "") +
+        (waits ? " That chat isn't listening right now (it's in the middle of a turn, or not open in Claude Desktop): it gets the message when that turn ends, or once it's open again." : busy) +
         (f ? ` Note: that chat's last turn, at ${when(f.at)}, ended with an error (${f.error}${f.details ? `: ${f.details}` : ""}); it may not answer until it recovers.` : ""),
       r,
     );
@@ -384,15 +392,17 @@ server.registerTool(
     const req = reviewRequest({ side: SIDE, request, plan, paths, folder: projectDir(extra), includeDiff: include_diff, auto, previous: round?.previous });
     if (req.error) return text(req.error);
     // 3. The reviewer's app open and able to answer; checked before a round is used up
+    let busy = "";
     if (target) {
       const stop = (await reach(target, { open, remember })) ?? (target.app === "openai" ? await chatgptBlocked() : null);
       if (stop) return stop;
+      busy = await busyNote(target);
     }
     // 4. Sent
     if (round) {
       const r = await call("link_continue", { primary, roundOf: round_of, request: req.text, plan: kind ? plan : undefined, threadId: thread_id, reqPaths: req.reqPaths });
       return withRules(
-        `${r.retry ? `Retry of round ${r.round}` : `Round ${r.round}`} (${r.id}) sent to the reviewer of ${round_of} (${r.advisor.app} chat ${r.advisor.id}). The answer arrives as a new turn when it's ready. ${WAIT}`,
+        `${r.retry ? `Retry of round ${r.round}` : `Round ${r.round}`} (${r.id}) sent to the reviewer of ${round_of} (${r.advisor.app} chat ${r.advisor.id}).${busy} The answer arrives as a new turn when it's ready. ${WAIT}`,
         r,
       );
     }
@@ -411,7 +421,7 @@ server.registerTool(
     }
     if (standing) {
       const r = await call("link_create", { primary, advisor: standing, request: req.text, plan, noGate, reqPaths: req.reqPaths });
-      return withRules(`${what} ${r.id} sent to auto mode's reviewer, the ${chatName(standing)}. The answer arrives as a new turn when it's ready. ${WAIT}`, { ...r, reviewer: standing });
+      return withRules(`${what} ${r.id} sent to auto mode's reviewer, the ${chatName(standing)}.${busy} The answer arrives as a new turn when it's ready. ${WAIT}`, { ...r, reviewer: standing });
     }
     let threadId = thread_id;
     if (!threadId) {

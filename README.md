@@ -180,6 +180,8 @@ The whole file, up to 8,000 characters, reaches every chat that is linked or has
 
 If your agent starts something with the other side and that side is closed (ChatGPT Desktop isn't running, or the Claude Code session isn't listening, usually because it isn't open), nothing is sent. The agent asks you whether to open it; if you agree, the bridge opens ChatGPT Desktop, or the exact Claude Code session in Claude Desktop, and sends.
 
+A Claude Code session that is only busy isn't closed: still in a turn the bridge handed it a message in (say, a reviewer finishing up right after its answer), it gets what's sent when that turn ends, without asking you.
+
 Say "always" and it won't ask again: that sets `"openClosedApps": "always"` in `config.json`, next to `rules.md`. Delete the line to be asked again.
 
 Messages the bridge sends on its own don't ask. A closed Claude session's message waits until you open it. Auto mode's review of a turn waits while ChatGPT is closed and goes once it's open (unless you said to always open closed apps). The bridge's other messages to ChatGPT start it with its wake link.
